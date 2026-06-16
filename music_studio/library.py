@@ -52,6 +52,11 @@ def init_db():
             play_count    integer default 0,
             collection    text default 'All Tracks',
             synced        integer default 0,
+            project_id    integer default 0,
+            version       integer default 1,
+            parent_id     integer default 0,
+            edit_label    text default '',
+            stems_json    text default '',
             created_at    text not null
         )
         """)
@@ -61,16 +66,24 @@ def init_db():
         # idempotent migrations for columns added after first release
         existing = {r["name"] for r in c.execute("pragma table_info(tracks)")}
         for col, decl in [("waveform_path", "text default ''"),
-                          ("cover_path", "text default ''")]:
+                          ("cover_path", "text default ''"),
+                          ("project_id", "integer default 0"),
+                          ("version", "integer default 1"),
+                          ("parent_id", "integer default 0"),
+                          ("edit_label", "text default ''"),
+                          ("stems_json", "text default ''")]:
             if col not in existing:
                 c.execute(f"alter table tracks add column {col} {decl}")
+        # index after the column is guaranteed to exist
+        c.execute("create index if not exists idx_project on tracks(project_id)")
 
 
 def add_track(**kw) -> int:
     cols = ["title", "prompt", "negative", "duration", "model", "guidance",
             "temperature", "seed", "filepath", "waveform_path", "cover_path",
             "sample_rate", "bpm", "musical_key", "tags", "favorite", "rating",
-            "play_count", "collection", "created_at"]
+            "play_count", "collection", "project_id", "version", "parent_id",
+            "edit_label", "stems_json", "created_at"]
     kw.setdefault("created_at", datetime.now(timezone.utc).isoformat())
     kw.setdefault("favorite", 0)
     kw.setdefault("rating", 0)
@@ -78,12 +91,47 @@ def add_track(**kw) -> int:
     kw.setdefault("collection", "All Tracks")
     kw.setdefault("negative", "")
     kw.setdefault("tags", "")
+    kw.setdefault("project_id", 0)
+    kw.setdefault("version", 1)
+    kw.setdefault("parent_id", 0)
+    kw.setdefault("edit_label", "")
+    kw.setdefault("stems_json", "")
     vals = [kw.get(c) for c in cols]
     placeholders = ",".join("?" * len(cols))
     with _lock, _conn() as c:
         cur = c.execute(
             f"insert into tracks ({','.join(cols)}) values ({placeholders})", vals)
-        return cur.lastrowid
+        new_id = cur.lastrowid
+        # a brand-new track with no project becomes its own project (project_id = its id)
+        if not kw.get("project_id"):
+            c.execute("update tracks set project_id=? where id=?", (new_id, new_id))
+    return new_id
+
+
+def next_version(project_id: int) -> int:
+    with _lock, _conn() as c:
+        row = c.execute("select max(version) m from tracks where project_id=?",
+                        (project_id,)).fetchone()
+    return (row["m"] or 0) + 1
+
+
+def add_version(parent_id: int, edit_label: str, **kw) -> int:
+    """Add a new version to the SAME project as parent_id (an edit/derivative)."""
+    parent = get_track(parent_id)
+    pid = (parent or {}).get("project_id") or parent_id
+    kw["project_id"] = pid
+    kw["parent_id"] = parent_id
+    kw["version"] = next_version(pid)
+    kw["edit_label"] = edit_label
+    return add_track(**kw)
+
+
+def list_versions(project_id: int) -> list[dict]:
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "select * from tracks where project_id=? order by version asc",
+            (project_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def update_track(track_id: int, **fields):

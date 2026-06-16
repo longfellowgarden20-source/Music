@@ -176,23 +176,27 @@ def stems_mix(layers: list[dict], duration: float = 8, model_size: str = "small"
     """[#7] Generate several layers (e.g. drums / bass / melody) and mix them
     at per-layer volumes into one track.
     `layers` = [{"prompt": str, "volume": 0..1}, ...]
-    Returns (sample_rate, mixed_audio, [seeds])."""
-    rendered, seeds, sr = [], [], None
+    Returns (sample_rate, mixed_audio, [seeds], stems) where stems is a list of
+    {"name", "audio", "volume"} so the individual layers can be saved & re-mixed."""
+    rendered, seeds, sr, stems = [], [], None, []
     for layer in layers:
         if not layer.get("prompt", "").strip():
             continue
         s, a, seed = generate(layer["prompt"], duration=duration,
                               model_size=model_size, guidance=guidance)
         sr = s
-        rendered.append((a, float(layer.get("volume", 1.0))))
+        vol = float(layer.get("volume", 1.0))
+        rendered.append((a, vol))
         seeds.append(seed)
+        stems.append({"name": layer.get("name", layer["prompt"][:20]),
+                      "audio": a, "volume": vol})
     if not rendered:
-        return None, None, []
+        return None, None, [], []
     length = min(len(a) for a, _ in rendered)
     mix = np.zeros(length, dtype=np.float32)
     for a, vol in rendered:
         mix += a[:length] * vol
-    return sr, normalize(mix), seeds
+    return sr, normalize(mix), seeds, stems
 
 
 def reference_generate(ref_audio: np.ndarray, ref_sr: int, prompt: str = "",

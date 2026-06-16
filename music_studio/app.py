@@ -362,8 +362,10 @@ def _theme_accent(pal):
       --accent-2:{pal[1]}!important;--glow:{pal[0]}55!important;}}</style>"""
 
 
-def _save_simple(audio, sr, prompt, collection, model="small", guidance=3, seed=None):
-    """Shared save path for variation/extend/stems results (with art)."""
+def _save_simple(audio, sr, prompt, collection, model="small", guidance=3, seed=None,
+                 parent_id=None, edit_label="", stems_json=""):
+    """Shared save path for variation/extend/stems results (with art).
+    If parent_id is given, this is saved as a NEW VERSION of that track's project."""
     audio = engine.normalize(audio)
     an = engine.analyze(audio, sr)
     path = engine.save_wav(audio, sr, prompt)
@@ -376,11 +378,15 @@ def _save_simple(audio, sr, prompt, collection, model="small", guidance=3, seed=
                               key=an["key"], palette=pal)
     except Exception as e:
         print(f"[ui] art failed: {e}")
-    tid = library.add_track(title=prompt[:60], prompt=prompt,
+    common = dict(title=prompt[:60], prompt=prompt,
         duration=len(audio) / sr, model=model, guidance=guidance, seed=seed,
         filepath=path, waveform_path=wf or "", cover_path=cv or "",
         sample_rate=sr, bpm=an["bpm"], musical_key=an["key"],
-        collection=collection or "All Tracks")
+        collection=collection or "All Tracks", stems_json=stems_json)
+    if parent_id:
+        tid = library.add_version(int(parent_id), edit_label, **common)
+    else:
+        tid = library.add_track(**common)
     try:
         library.sync_to_supabase(tid)
     except Exception:
@@ -423,8 +429,9 @@ def do_extend(track_id, prompt, add_dur, model_size, guidance, collection,
                                        add_duration=add_dur, model_size=model_size,
                                        guidance=guidance)
     tid, path, an = _save_simple(combined, sr, use_prompt + " (extended)",
-                                 collection, model_size, guidance, seed)
-    return (sr, combined), f"✅ Extended → new track #{tid} ({len(combined)/sr:.0f}s)", \
+                                 collection, model_size, guidance, seed,
+                                 parent_id=int(track_id), edit_label="extended")
+    return (sr, combined), f"✅ Extended → v{library.get_track(tid)['version']} of project (#{tid}, {len(combined)/sr:.0f}s)", \
            refresh_library(), _stats_html()
 
 
@@ -432,19 +439,26 @@ def do_extend(track_id, prompt, add_dur, model_size, guidance, collection,
 def do_stems(p_drums, p_bass, p_melody, v_drums, v_bass, v_melody,
              duration, model_size, guidance, collection, progress=gr.Progress()):
     layers = [
-        {"prompt": p_drums, "volume": v_drums},
-        {"prompt": p_bass, "volume": v_bass},
-        {"prompt": p_melody, "volume": v_melody},
+        {"prompt": p_drums, "volume": v_drums, "name": "drums"},
+        {"prompt": p_bass, "volume": v_bass, "name": "bass"},
+        {"prompt": p_melody, "volume": v_melody, "name": "melody"},
     ]
     progress(0.2, desc="Rendering layers…")
-    sr, mix, seeds = engine.stems_mix(layers, duration=duration,
-                                      model_size=model_size, guidance=guidance)
+    sr, mix, seeds, stems = engine.stems_mix(layers, duration=duration,
+                                             model_size=model_size, guidance=guidance)
     if mix is None:
         return None, "Add at least one layer prompt.", refresh_library(), _stats_html()
+    # save each stem WAV so they can be re-mixed later
+    import json
+    stem_paths = {}
+    for st in stems:
+        sp = engine.save_wav(st["audio"], sr, f"stem_{st['name']}")
+        stem_paths[st["name"]] = {"path": sp, "volume": st["volume"]}
     name = "stem mix: " + ", ".join(
         l["prompt"] for l in layers if l["prompt"].strip())[:50]
-    tid, path, an = _save_simple(mix, sr, name, collection, model_size, guidance)
-    return (sr, mix), f"✅ Mixed {len(seeds)} layers → track #{tid}", \
+    tid, path, an = _save_simple(mix, sr, name, collection, model_size, guidance,
+                                 stems_json=json.dumps(stem_paths))
+    return (sr, mix), f"✅ Mixed {len(seeds)} layers (stems saved) → #{tid}", \
            refresh_library(), _stats_html()
 
 
@@ -468,6 +482,56 @@ def do_melody(melody_file, prompt, duration, model_size, guidance, collection,
     tid, path, an = _save_simple(out, sr, prompt + " (from melody)",
                                  collection, model_size, guidance, seed)
     return (sr, out), f"✅ Melody restyled → track #{tid}", \
+           refresh_library(), _stats_html()
+
+
+# [NEW] Remix saved stems with new volumes
+def load_stems_info(track_id):
+    """Show what stems a track has, for the Remix tab."""
+    import json
+    if not track_id:
+        return "Enter a track ID that was made in the Stems tab."
+    t = library.get_track(int(track_id))
+    if not t or not t.get("stems_json"):
+        return "⚠️ That track has no saved stems. Only tracks made in the **Stems** tab have re-mixable layers."
+    stems = json.loads(t["stems_json"])
+    lines = [f"**Stems in #{track_id}:**"]
+    for name, info in stems.items():
+        ok = os.path.exists(info["path"])
+        lines.append(f"- {name} (vol {info['volume']}) {'✓' if ok else '✗ missing'}")
+    return "\n".join(lines)
+
+
+def do_remix(track_id, v_drums, v_bass, v_melody, collection):
+    """Re-mix a stem track's saved layers at new volumes -> new version."""
+    import json, numpy as np, soundfile as sf
+    if not track_id:
+        return None, "Enter a stem track ID.", refresh_library(), _stats_html()
+    t = library.get_track(int(track_id))
+    if not t or not t.get("stems_json"):
+        return None, "That track has no saved stems.", refresh_library(), _stats_html()
+    stems = json.loads(t["stems_json"])
+    vol_map = {"drums": v_drums, "bass": v_bass, "melody": v_melody}
+    loaded, sr = [], None
+    for name, info in stems.items():
+        if not os.path.exists(info["path"]):
+            continue
+        a, s = sf.read(info["path"])
+        if a.ndim > 1:
+            a = a.mean(axis=1)
+        sr = s
+        loaded.append((a.astype("float32"), float(vol_map.get(name, info["volume"]))))
+    if not loaded:
+        return None, "Stem files missing.", refresh_library(), _stats_html()
+    length = min(len(a) for a, _ in loaded)
+    mix = np.zeros(length, dtype="float32")
+    for a, vol in loaded:
+        mix += a[:length] * vol
+    mix = engine.normalize(mix)
+    tid, path, an = _save_simple(mix, sr, (t["title"] or "remix") + " (remix)",
+                                 collection, parent_id=int(track_id),
+                                 edit_label="remix", stems_json=t["stems_json"])
+    return (sr, mix), f"✅ Re-mixed → v{library.get_track(tid)['version']} (#{tid})", \
            refresh_library(), _stats_html()
 
 
@@ -537,8 +601,9 @@ def do_add_layer(track_id, instrument, blend, volume, model_size, guidance,
                                      blend=blend, volume=volume,
                                      model_size=model_size, guidance=guidance)
     name = f"{t['title'] or t['prompt']} + {instrument}"
-    tid, path, an = _save_simple(mix, sr, name[:60], collection, model_size, guidance, seed)
-    return (sr, mix), f"✅ Added {instrument} → new track #{tid}", \
+    tid, path, an = _save_simple(mix, sr, name[:60], collection, model_size, guidance, seed,
+                                 parent_id=int(track_id), edit_label=f"+{instrument[:20]}")
+    return (sr, mix), f"✅ Added {instrument} → v{library.get_track(tid)['version']} (#{tid})", \
            refresh_library(), _stats_html()
 
 
@@ -584,14 +649,39 @@ def load_track_audio(track_id):
     return t["filepath"], detail
 
 
+def _version_history_md(track: dict) -> str:
+    """Markdown showing all versions of this track's project + stems if any."""
+    import json
+    pid = track.get("project_id") or track["id"]
+    vers = library.list_versions(pid)
+    if len(vers) <= 1 and not track.get("stems_json"):
+        lines = ["*This is a single track (no edits yet). Extend it or add layers "
+                 "to build versions.*"]
+    else:
+        lines = [f"**📜 Version history** ({len(vers)} versions):"]
+        for v in vers:
+            mark = "▶ " if v["id"] == track["id"] else "  "
+            label = v["edit_label"] or "original"
+            lines.append(f"{mark}**v{v['version']}** · {label} · #{v['id']} "
+                         f"· {v['duration']:.0f}s")
+    if track.get("stems_json"):
+        try:
+            stems = json.loads(track["stems_json"])
+            lines.append("\n**🎚 Stems available:** " + ", ".join(stems.keys())
+                         + " — go to the Remix tab to re-balance them.")
+        except Exception:
+            pass
+    return "\n\n".join(lines)
+
+
 def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
-    """Click a row in the library table -> select it, load audio + details.
-    Returns (track_id, audio_path, detail_md)."""
+    """Click a row -> select it, load audio, details, and version history.
+    Returns (track_id, audio_path, detail_md, versions_md)."""
     rows = library.list_tracks(search=search, favorites_only=favs,
                                collection=collection, sort=sort)
     ridx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if ridx is None or ridx >= len(rows):
-        return gr.update(), None, ""
+        return gr.update(), None, "", ""
     t = rows[ridx]
     library.update_track(t["id"], play_count=(t["play_count"] or 0) + 1)
     detail = (f"**{t['title'] or t['prompt']}**\n\n"
@@ -600,7 +690,7 @@ def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
               f"seed `{t['seed']}`"
               + (f" · {t['bpm']} BPM / {t['musical_key']}" if t['bpm'] else ""))
     path = t["filepath"] if os.path.exists(t["filepath"]) else None
-    return t["id"], path, detail
+    return t["id"], path, detail, _version_history_md(t)
 
 
 def toggle_fav(track_id):
@@ -886,7 +976,9 @@ def build():
                     tag_btn = gr.Button("Add tag", scale=1)
 
                 sel_audio = gr.Audio(label="Now playing", type="filepath")
-                sel_detail = gr.Markdown()
+                with gr.Row():
+                    sel_detail = gr.Markdown()
+                    sel_versions = gr.Markdown()
 
                 def _refresh(s, f, c, so): return refresh_library(s, f, c, so)
                 refresh_btn.click(_refresh, [search, favs, coll_filter, sort], lib)
@@ -895,9 +987,9 @@ def build():
                 coll_filter.change(_refresh, [search, favs, coll_filter, sort], lib)
                 sort.change(_refresh, [search, favs, coll_filter, sort], lib)
 
-                # click a row -> auto-select + play
+                # click a row -> auto-select + play + show version history
                 lib.select(on_row_select, [search, favs, coll_filter, sort],
-                           [sel_id, sel_audio, sel_detail])
+                           [sel_id, sel_audio, sel_detail, sel_versions])
 
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
                 fav_btn.click(toggle_fav, sel_id, lib)
@@ -991,6 +1083,23 @@ def build():
                 al_btn = gr.Button("➕ Add layer", variant="primary", size="lg")
                 al_audio = gr.Audio(label="Output", type="numpy")
                 al_status = gr.Markdown()
+
+            # ───────────────── REMIX [NEW] ─────────────────
+            with gr.Tab("🎚  Remix"):
+                gr.Markdown("Re-balance the **stems** of a track made in the Stems tab. "
+                            "Adjust each layer's volume and save a new version.")
+                with gr.Row():
+                    rmx_id = gr.Number(label="Stem track ID", precision=0)
+                    rmx_load = gr.Button("Load stems")
+                rmx_info = gr.Markdown()
+                with gr.Row():
+                    rmx_drums = gr.Slider(0, 1.5, 0.8, step=0.05, label="🥁 Drums vol")
+                    rmx_bass = gr.Slider(0, 1.5, 0.7, step=0.05, label="🎸 Bass vol")
+                    rmx_melody = gr.Slider(0, 1.5, 0.65, step=0.05, label="🎹 Melody vol")
+                rmx_coll = gr.Textbox(label="Collection", value="Remixes")
+                rmx_btn = gr.Button("🎚 Re-mix stems", variant="primary", size="lg")
+                rmx_audio = gr.Audio(label="Re-mixed output", type="numpy")
+                rmx_status = gr.Markdown()
 
             # ───────────────── EXPORT [#6] ─────────────────
             with gr.Tab("📦  Export"):
@@ -1091,6 +1200,12 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
             [last_tid, model_size, guidance], [audio_out, info])
         add_hats.click(lambda tid, m, g: quick_add(tid, "crisp hi-hats, percussion", m, g),
             [last_tid, model_size, guidance], [audio_out, info])
+
+        # [NEW] Remix tab
+        rmx_load.click(load_stems_info, rmx_id, rmx_info)
+        rmx_btn.click(do_remix,
+            [rmx_id, rmx_drums, rmx_bass, rmx_melody, rmx_coll],
+            [rmx_audio, rmx_status, lib, stats])
 
     return app
 
