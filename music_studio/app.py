@@ -483,11 +483,43 @@ def load_track_audio(track_id):
     return t["filepath"], detail
 
 
+def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
+    """Click a row in the library table -> select it, load audio + details.
+    Returns (track_id, audio_path, detail_md)."""
+    rows = library.list_tracks(search=search, favorites_only=favs,
+                               collection=collection, sort=sort)
+    ridx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if ridx is None or ridx >= len(rows):
+        return gr.update(), None, ""
+    t = rows[ridx]
+    library.update_track(t["id"], play_count=(t["play_count"] or 0) + 1)
+    detail = (f"**{t['title'] or t['prompt']}**\n\n"
+              f"Prompt: {t['prompt']}\n\n"
+              f"Model: {t['model']} · {t['duration']:.0f}s · "
+              f"seed `{t['seed']}`"
+              + (f" · {t['bpm']} BPM / {t['musical_key']}" if t['bpm'] else ""))
+    path = t["filepath"] if os.path.exists(t["filepath"]) else None
+    return t["id"], path, detail
+
+
 def toggle_fav(track_id):
     t = library.get_track(int(track_id))
     if t:
         library.update_track(int(track_id), favorite=0 if t["favorite"] else 1)
     return refresh_library()
+
+
+def heart_track(track_id):
+    """Heart a specific track (used by the Studio ♥ button on the last track)."""
+    if not track_id:
+        return "Generate a track first.", refresh_library(), _stats_html()
+    t = library.get_track(int(track_id))
+    if not t:
+        return "Track not found.", refresh_library(), _stats_html()
+    new = 0 if t["favorite"] else 1
+    library.update_track(int(track_id), favorite=new)
+    msg = "♥ Added to favorites" if new else "♡ Removed from favorites"
+    return msg, refresh_library(), _stats_html()
 
 
 def set_rating(track_id, stars):
@@ -673,6 +705,7 @@ def build():
                         info = gr.Markdown("Ready.")
                         last_tid = gr.Number(visible=False, value=0)
                         with gr.Row():
+                            heart_btn = gr.Button("♥ Favorite", size="sm", variant="primary")
                             var_btn = gr.Button("🎲 3 Variations", size="sm")
                             ext_btn = gr.Button("➕ Extend +8s", size="sm")
                             exp_btn = gr.Button("📦 Export", size="sm")
@@ -710,11 +743,12 @@ def build():
                     favs = gr.Checkbox(False, label="★ Favorites only")
                 refresh_btn = gr.Button("↻ Refresh")
 
+                gr.HTML("<div class='preset-label'>👆 Click any track below to select &amp; play it</div>")
                 lib = gr.Dataframe(headers=LIB_HEADERS, datatype="str",
                     value=refresh_library(), interactive=False, wrap=True, row_count=(8, "dynamic"))
 
                 with gr.Row():
-                    sel_id = gr.Number(label="Track ID", precision=0)
+                    sel_id = gr.Number(label="Selected track ID", precision=0)
                     play_btn = gr.Button("▶ Play")
                     fav_btn = gr.Button("♥ Favorite")
                     del_btn = gr.Button("🗑 Delete", variant="stop")
@@ -733,6 +767,10 @@ def build():
                 favs.change(_refresh, [search, favs, coll_filter, sort], lib)
                 coll_filter.change(_refresh, [search, favs, coll_filter, sort], lib)
                 sort.change(_refresh, [search, favs, coll_filter, sort], lib)
+
+                # click a row -> auto-select + play
+                lib.select(on_row_select, [search, favs, coll_filter, sort],
+                           [sel_id, sel_audio, sel_detail])
 
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
                 fav_btn.click(toggle_fav, sel_id, lib)
@@ -870,6 +908,9 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
              do_normalize, fade_in, fade_out, do_loop, do_trim, pitch, speed, mp3,
              auto_analyze, collection],
             [audio_out, info, stats, lib, cover_out, theme_holder, last_tid])
+
+        # ♥ Favorite the just-generated track from the Studio
+        heart_btn.click(heart_track, last_tid, [info, lib, stats])
 
         batch_btn.click(batch_generate,
             [batch_prompts, b_duration, b_model, b_guidance],

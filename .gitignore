@@ -31,3 +31,4 @@ music_output/
 *.swp
 .idea/
 .vscode/
+nohup.out
