@@ -223,6 +223,39 @@ input[type=range]{ accent-color:var(--accent)!important; }
 ::-webkit-scrollbar-thumb { background:var(--line-2); border-radius:6px; }
 ::-webkit-scrollbar-thumb:hover { background:var(--accent); }
 
+/* ════ KILL ALL WHITE — catch every light-default Gradio 6 component ════ */
+/* dropdowns (the .wrap.default white boxes) + their option lists */
+.wrap, .wrap.default, [class*="wrap"] {
+  background:var(--bg-2)!important; color:var(--text)!important; }
+ul.options, .options, [class*="dropdown"] ul, li.item {
+  background:var(--bg-2)!important; color:var(--text)!important;
+  border-color:var(--line)!important; }
+ul.options li:hover, li.item:hover, li.item.selected {
+  background:rgba(139,92,255,.18)!important; color:#fff!important; }
+/* dataframe rows */
+.virtual-row, .virtual-table-viewport, .table-wrap, .table-container,
+.cell-wrap { background:transparent!important; color:var(--text)!important; }
+.virtual-row * { color:var(--text)!important; }
+/* radio + checkbox option labels (these go white when selected) */
+label.selected, fieldset label, .gr-check-radio label,
+[data-testid] label, label[class*="svelte"] {
+  background:var(--bg-2)!important; color:var(--text)!important;
+  border-color:var(--line)!important; }
+label.selected { background:rgba(139,92,255,.25)!important; color:#fff!important;
+  border-color:var(--accent)!important; }
+/* floating field labels that render on a white chip */
+label.float, span.svelte-19djge9, .float {
+  background:transparent!important; color:var(--muted)!important; }
+/* file upload + image drop zones */
+.file-preview, [class*="file"], .upload-container, .image-container,
+.empty, .center { background:var(--bg-2)!important; color:var(--text)!important; }
+/* any leftover pure-white surface anywhere */
+[style*="background: white"], [style*="background:#fff"],
+[style*="background-color: white"], [style*="background-color: rgb(255"] {
+  background:var(--bg-2)!important; }
+/* generic catch: inputs/selects/buttons never light */
+select, option { background:var(--bg-2)!important; color:var(--text)!important; }
+
 footer { display:none!important; }
 """
 
