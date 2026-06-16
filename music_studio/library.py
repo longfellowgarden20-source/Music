@@ -241,10 +241,12 @@ def recover_orphans(audio_dir: str = AUDIO_DIR) -> int:
     with _lock, _conn() as c:
         known = {r["filepath"] for r in c.execute("select filepath from tracks")}
     recovered = 0
+    SKIP = ("stem_",)
+    SKIP_SUBSTR = ("_test", "_copy_", "_wave", "_cover")
     for fn in sorted(os.listdir(audio_dir)):
         if not fn.endswith(".wav"):
             continue
-        if fn.startswith("stem_") or "_test" in fn:
+        if fn.startswith(SKIP) or any(s in fn for s in SKIP_SUBSTR):
             continue
         path = os.path.join(audio_dir, fn)
         if path in known:

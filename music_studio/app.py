@@ -905,17 +905,18 @@ def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
     return t["id"], path, detail, _version_history_md(t)
 
 
-def do_recover():
+def do_recover(search="", favs=False, collection="All Tracks", sort="newest"):
     """Re-import any audio files that lost their library entry."""
-    n = library.recover_orphans()
-    return refresh_library(), _stats_html()
+    library.recover_orphans()
+    return refresh_library(search, favs, collection, sort), _stats_html()
 
 
-def toggle_fav(track_id):
-    t = library.get_track(int(track_id))
-    if t:
-        library.update_track(int(track_id), favorite=0 if t["favorite"] else 1)
-    return refresh_library()
+def toggle_fav(track_id, search="", favs=False, collection="All Tracks", sort="newest"):
+    if track_id:
+        t = library.get_track(int(track_id))
+        if t:
+            library.update_track(int(track_id), favorite=0 if t["favorite"] else 1)
+    return refresh_library(search, favs, collection, sort)
 
 
 def heart_track(track_id):
@@ -931,26 +932,26 @@ def heart_track(track_id):
     return msg, refresh_library(), _stats_html()
 
 
-def set_rating(track_id, stars):
+def set_rating(track_id, stars, search="", favs=False, collection="All Tracks", sort="newest"):
     if track_id:
         library.update_track(int(track_id), rating=int(stars))
-    return refresh_library()
+    return refresh_library(search, favs, collection, sort)
 
 
-def del_track(track_id):
+def del_track(track_id, search="", favs=False, collection="All Tracks", sort="newest"):
     if track_id:
         library.delete_track(int(track_id))
-    return refresh_library(), _stats_html()
+    return refresh_library(search, favs, collection, sort), _stats_html()
 
 
-def add_tag(track_id, tag):
-    if not track_id or not tag.strip():
-        return refresh_library()
-    t = library.get_track(int(track_id))
-    tags = set(filter(None, (t["tags"] or "").split(",")))
-    tags.add(tag.strip())
-    library.update_track(int(track_id), tags=",".join(sorted(tags)))
-    return refresh_library()
+def add_tag(track_id, tag, search="", favs=False, collection="All Tracks", sort="newest"):
+    if track_id and tag and tag.strip():
+        t = library.get_track(int(track_id))
+        if t:
+            tags = set(filter(None, (t["tags"] or "").split(",")))
+            tags.add(tag.strip())
+            library.update_track(int(track_id), tags=",".join(sorted(tags)))
+    return refresh_library(search, favs, collection, sort)
 
 
 # ── Batch ──────────────────────────────────────────────────────────────────────
@@ -1207,23 +1208,32 @@ def build():
                     sel_detail = gr.Markdown()
                     sel_versions = gr.Markdown()
 
+                _filt = [search, favs, coll_filter, sort]
                 def _refresh(s, f, c, so): return refresh_library(s, f, c, so)
-                refresh_btn.click(_refresh, [search, favs, coll_filter, sort], lib)
-                recover_btn.click(do_recover, outputs=[lib, stats])
-                search.submit(_refresh, [search, favs, coll_filter, sort], lib)
-                favs.change(_refresh, [search, favs, coll_filter, sort], lib)
-                coll_filter.change(_refresh, [search, favs, coll_filter, sort], lib)
-                sort.change(_refresh, [search, favs, coll_filter, sort], lib)
+                def _refresh_all(s, f, c, so):
+                    # refresh table AND the collection dropdown choices
+                    cols = library.list_collections()
+                    keep = c if c in cols else "All Tracks"
+                    return (refresh_library(s, f, keep, so),
+                            gr.update(choices=cols, value=keep))
+                refresh_btn.click(_refresh_all, _filt, [lib, coll_filter])
+                recover_btn.click(do_recover, _filt, [lib, stats])
+                search.submit(_refresh, _filt, lib)
+                search.change(_refresh, _filt, lib)
+                favs.change(_refresh, _filt, lib)
+                coll_filter.change(_refresh, _filt, lib)
+                sort.change(_refresh, _filt, lib)
 
                 # click a row -> auto-select + play + show version history
-                lib.select(on_row_select, [search, favs, coll_filter, sort],
+                lib.select(on_row_select, _filt,
                            [sel_id, sel_audio, sel_detail, sel_versions])
 
+                # these all respect the active search/filter so the view doesn't jump
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
-                fav_btn.click(toggle_fav, sel_id, lib)
-                del_btn.click(del_track, sel_id, [lib, stats])
-                rate_btn.click(set_rating, [sel_id, rating_in], lib)
-                tag_btn.click(add_tag, [sel_id, tag_in], lib)
+                fav_btn.click(toggle_fav, [sel_id] + _filt, lib)
+                del_btn.click(del_track, [sel_id] + _filt, [lib, stats])
+                rate_btn.click(set_rating, [sel_id, rating_in] + _filt, lib)
+                tag_btn.click(add_tag, [sel_id, tag_in] + _filt, lib)
 
             # ───────────────── EDIT STUDIO [NEW] ─────────────────
             with gr.Tab("🎹  Edit Studio", id="edit") as edit_tab:
