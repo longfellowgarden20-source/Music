@@ -182,11 +182,25 @@ input[type=range]{ accent-color:var(--accent)!important; }
 /* ── Audio player ────────────────────────────────── */
 .gr-audio, [data-testid='waveform'] { border-radius:14px!important; }
 
-/* ── Dataframe ───────────────────────────────────── */
-.gr-dataframe table { font-size:13px!important; }
-.gr-dataframe thead th { background:var(--bg-3)!important; color:var(--accent-2)!important;
-  text-transform:uppercase; font-size:10.5px!important; letter-spacing:1px; }
-.gr-dataframe tbody tr:hover { background:rgba(139,92,255,.08)!important; }
+/* ── Dataframe (Gradio 6 uses .table-wrap / plain th,td) ── */
+.table-wrap, .table-container { background:var(--bg-1)!important;
+  border:1px solid var(--line)!important; border-radius:12px!important; }
+.table-wrap table { font-size:13px!important; background:transparent!important; }
+/* header cells */
+.table-wrap th, table.header-table th {
+  background:var(--bg-3)!important; color:var(--accent-2)!important;
+  text-transform:uppercase; font-size:10.5px!important; letter-spacing:1px;
+  border-color:var(--line)!important; }
+/* data cells — light text on dark */
+.table-wrap td {
+  background:transparent!important; color:var(--text)!important;
+  border-color:var(--line)!important; }
+.table-wrap td span, .table-wrap td * { color:var(--text)!important; }
+.table-wrap tbody tr:nth-child(even) td { background:rgba(255,255,255,.025)!important; }
+.table-wrap tbody tr:hover td { background:rgba(139,92,255,.12)!important; }
+/* the cell edit input that shows on click */
+.table-wrap input, .table-wrap textarea {
+  background:var(--bg-2)!important; color:var(--text)!important; }
 
 /* ── Preset chips row ────────────────────────────── */
 .preset-label { color:var(--muted); font-size:11px; text-transform:uppercase;
