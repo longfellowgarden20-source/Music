@@ -17,11 +17,11 @@ import gradio as gr
 
 # allow running both as module and as a script
 try:
-    from . import engine, library, extras, effects
+    from . import engine, library, extras, effects, groq_helper
 except ImportError:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from music_studio import engine, library, extras, effects
+    from music_studio import engine, library, extras, effects, groq_helper
 
 # [#10] genre/keyword -> accent palette for dynamic theming
 PALETTES = {
@@ -216,6 +216,9 @@ input[type=range]{ accent-color:var(--accent)!important; }
 /* ── Preset chips row ────────────────────────────── */
 .preset-label { color:var(--muted); font-size:11px; text-transform:uppercase;
   letter-spacing:1.5px; font-weight:600; margin:8px 0 2px; }
+.panel-title { color:var(--accent-2); font-size:12px; text-transform:uppercase;
+  letter-spacing:2px; font-weight:700; margin:2px 0 8px;
+  border-bottom:1px solid var(--line); padding-bottom:6px; }
 
 /* ── Scrollbar ───────────────────────────────────── */
 ::-webkit-scrollbar { width:10px; height:10px; }
@@ -364,7 +367,7 @@ INSTRUMENTS = ["piano", "guitar", "808 bass", "strings", "synth pads", "saxophon
 def do_generate(prompt, negative, duration, model_size, guidance, temperature,
                 seed_in, do_normalize, fade_in, fade_out, do_loop, do_trim,
                 pitch, speed, mp3, auto_analyze, collection,
-                master=True, best_n=1,
+                master=True, best_n=1, song_name="",
                 progress=gr.Progress(track_tqdm=True)):
     def _err(msg):
         # consistent 7-value return so the UI never breaks
@@ -438,7 +441,8 @@ def do_generate(prompt, negative, duration, model_size, guidance, temperature,
         print(f"[ui] cover failed: {e}")
 
     track_id = library.add_track(
-        title=prompt[:60], prompt=prompt, negative=negative, duration=duration,
+        title=(song_name.strip()[:80] if song_name and song_name.strip() else prompt[:60]),
+        prompt=prompt, negative=negative, duration=duration,
         model=model_size, guidance=guidance, temperature=temperature, seed=used_seed,
         filepath=path, waveform_path=wf_path or "", cover_path=cv_path or "",
         sample_rate=sr, bpm=analysis["bpm"],
@@ -499,19 +503,35 @@ def _save_simple(audio, sr, prompt, collection, model="small", guidance=3, seed=
 
 # [#3] Variations — N takes of the same prompt
 def do_variations(prompt, n, duration, model_size, guidance, collection,
-                  progress=gr.Progress()):
+                  song_name="", progress=gr.Progress()):
     if not prompt.strip():
         return None, None, None, "Enter a prompt.", refresh_library(), _stats_html()
+    base_name = (song_name.strip() if song_name and song_name.strip()
+                 else prompt[:40])
     outs = []
     takes = engine.variations(prompt, n=int(n), duration=duration,
                               model_size=model_size, guidance=guidance)
+    first_id = None
     for i, (sr, a, seed) in enumerate(takes):
         progress((i + 1) / len(takes), desc=f"Variation {i+1}/{len(takes)}")
-        _save_simple(a, sr, prompt, collection, model_size, guidance, seed)
+        title = f"{base_name} — take {i+1}"
+        if first_id is None:
+            # first take starts its own project
+            tid, _, _ = _save_simple(a, sr, prompt, collection,
+                                     model_size, guidance, seed)
+            library.update_track(tid, title=title[:80])
+            first_id = tid
+        else:
+            # rest become VERSIONS of the first -> grouped together
+            tid, _, _ = _save_simple(a, sr, prompt, collection,
+                                     model_size, guidance, seed,
+                                     parent_id=first_id, edit_label=f"take {i+1}")
+            library.update_track(tid, title=title[:80])
         outs.append((sr, a))
-    outs += [None] * (3 - len(outs))  # pad to 3 audio slots
+    outs += [None] * (3 - len(outs))
     return (outs[0], outs[1], outs[2],
-            f"✅ {len(takes)} variations saved.", refresh_library(), _stats_html())
+            f"✅ {len(takes)} variations of '{base_name}' grouped together.",
+            refresh_library(), _stats_html())
 
 
 # [#2] Extend an existing track
@@ -874,46 +894,82 @@ def song_clear():
     return "Cleared all sections.", _section_table()
 
 
-def song_build(model_size, guidance, progress=gr.Progress()):
-    """Generate every section (conditioned on the base persona) and stitch them."""
-    if not _song_sections:
-        return None, "Add sections first.", refresh_library(), _stats_html()
+def _build_chain(base, sections, model_size, guidance, progress, label):
+    """Core song builder: each section CONTINUES from the previous one (so it
+    builds off the song and flows), not a fresh take. Returns (sr, full_audio)."""
     import soundfile as sf
-    base = library.get_track(_song_sections[0]["base_id"])
-    if not base or not os.path.exists(base["filepath"]):
-        return None, "Base track missing.", refresh_library(), _stats_html()
     ref, rsr = sf.read(base["filepath"])
     if ref.ndim > 1:
         ref = ref.mean(axis=1)
     ref = ref.astype("float32")
 
-    clips, sr = [], None
-    n = len(_song_sections)
-    for i, sec in enumerate(_song_sections):
-        progress((i + 0.5) / n, desc=f"Building {sec['role']} ({i+1}/{n})…")
-        # prompt = original persona + role feel + optional tweak
+    # the running song — starts as the original track itself
+    full = ref
+    sr = rsr
+    n = len(sections)
+    for i, sec in enumerate(sections):
+        progress((i + 0.5) / (n + 1), desc=f"Building {sec['role']} ({i+1}/{n})…")
         recipe = SECTION_RECIPES.get(sec["role"], "")
-        prompt = merge_tweak(base["prompt"], f"{recipe}"
-                             + (f", {sec['tweak']}" if sec["tweak"] else ""))
-        try:
-            s, audio, _ = engine.reference_generate(
-                ref, rsr, prompt=prompt, mode="restyle", duration=sec["dur"],
-                model_size=model_size, guidance=guidance)
-        except MemoryError as e:
-            return None, f"🛑 {e}", refresh_library(), _stats_html()
+        prompt = merge_tweak(base["prompt"], recipe
+                             + (f", {sec['tweak']}" if sec.get("tweak") else ""))
+        # CONTINUE from the current end of the song -> real flow, not a new intro
+        s, combined, _ = engine.extend(
+            prompt, full, sr, add_duration=sec["dur"],
+            model_size=model_size, guidance=guidance)
         sr = s
-        clips.append(engine.normalize(audio))
+        full = combined          # combined already includes prior audio + new part
+    progress(0.95, desc="Mastering the full song…")
+    return sr, engine.auto_master(full, sr)
 
-    progress(0.95, desc="Stitching the full song…")
-    full = engine.stitch(clips, sr, crossfade=0.4)
-    full = engine.auto_master(full, sr)
-    roles = " → ".join(s["role"] for s in _song_sections)
-    tid, path, an = _save_simple(full, sr, f"{base['title']} (full song)",
-                                 "Full Songs", model_size, guidance,
-                                 parent_id=base["id"], edit_label="full song")
-    dur_total = len(full) / sr
-    return (sr, full), (f"✅ Full song built → #{tid} · {dur_total:.0f}s\n\n"
+
+def song_build(model_size, guidance, progress=gr.Progress()):
+    """Build the queued sections, chained so the song flows and grows."""
+    if not _song_sections:
+        return None, "Add sections first.", refresh_library(), _stats_html()
+    base = library.get_track(_song_sections[0]["base_id"])
+    if not base or not os.path.exists(base["filepath"]):
+        return None, "Base track missing.", refresh_library(), _stats_html()
+    try:
+        sr, full = _build_chain(base, _song_sections, model_size, guidance,
+                                progress, "full song")
+    except MemoryError as e:
+        return None, f"🛑 {e}", refresh_library(), _stats_html()
+    roles = "intro → " + " → ".join(s["role"] for s in _song_sections)
+    tid, _, _ = _save_simple(full, sr, f"{base['title'] or base['prompt']} (full song)",
+                             "Full Songs", model_size, guidance,
+                             parent_id=base["id"], edit_label="full song")
+    dur = len(full) / sr
+    return (sr, full), (f"✅ Full song built → #{tid} · {dur:.0f}s\n\n"
                         f"**Structure:** {roles}"), refresh_library(), _stats_html()
+
+
+# default arrangement used by one-click auto-finish -> ~60s+ song
+AUTO_ARRANGEMENT = [
+    ("Verse", 12), ("Chorus", 14), ("Verse", 12),
+    ("Bridge", 10), ("Chorus", 14), ("Outro", 10),
+]
+
+
+def auto_finish(track_id, model_size, guidance, progress=gr.Progress()):
+    """One click: take a track and build it into a full ~75s song that flows
+    from the original (verse/chorus/bridge/outro), keeping the same persona."""
+    base = library.get_track(int(track_id)) if track_id else None
+    if not base or not os.path.exists(base["filepath"]):
+        return None, "Pick a valid track to finish.", refresh_library(), _stats_html()
+    sections = [{"base_id": base["id"], "role": r, "dur": d, "tweak": ""}
+                for r, d in AUTO_ARRANGEMENT]
+    try:
+        sr, full = _build_chain(base, sections, model_size, guidance,
+                                progress, "auto finish")
+    except MemoryError as e:
+        return None, f"🛑 {e}", refresh_library(), _stats_html()
+    tid, _, _ = _save_simple(full, sr, f"{base['title'] or base['prompt']} (full song)",
+                             "Full Songs", model_size, guidance,
+                             parent_id=base["id"], edit_label="auto-finished")
+    dur = len(full) / sr
+    return (sr, full), (f"✅ Auto-finished → #{tid} · {dur:.0f}s, "
+                        f"built off your original through verse/chorus/bridge/outro."), \
+           refresh_library(), _stats_html()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1034,6 +1090,42 @@ def do_free_memory():
             f"Next generation will reload the model."), _stats_html()
 
 
+# ── Groq: "sounds like" + "revamp" ──────────────────────────────────────────────
+def do_sounds_like(text):
+    """Turn an artist/song/vibe into a MusicGen prompt -> fills the prompt box."""
+    if not text or not text.strip():
+        return gr.update(), "Type an artist, song, or vibe first."
+    prompt = groq_helper.sounds_like(text.strip())
+    return prompt, f"✨ Translated **{text.strip()}** into a prompt — tweak it or hit Generate."
+
+
+def do_revamp(track_id, direction, model_size, guidance, progress=gr.Progress()):
+    """Reinterpret a track into 'our own melody' (Groq writes a fresh prompt),
+    conditioned on the original so it keeps the vibe. Saves as a version."""
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t or not os.path.exists(t["filepath"]):
+        return None, "Pick a valid track to revamp.", refresh_library(), _stats_html()
+    progress(0.2, desc="Writing our own take (Groq)…")
+    new_prompt = groq_helper.revamp(t["prompt"], direction or "")
+    import soundfile as sf
+    ref, rsr = sf.read(t["filepath"])
+    if ref.ndim > 1:
+        ref = ref.mean(axis=1)
+    dur = max(8, min(int(t["duration"] or 8), 16))
+    progress(0.4, desc="Generating our melody…")
+    try:
+        sr, out, seed = engine.reference_generate(
+            ref.astype("float32"), rsr, prompt=new_prompt, mode="restyle",
+            duration=dur, model_size=model_size, guidance=guidance)
+    except MemoryError as e:
+        return None, f"🛑 {e}", refresh_library(), _stats_html()
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "revamp") + " (our melody)",
+                             "Revamped", model_size, guidance, seed,
+                             parent_id=int(track_id), edit_label="revamp")
+    return (sr, out), (f"✅ Revamped → v{library.get_track(tid)['version']} (#{tid})\n\n"
+                       f"**Our prompt:** {new_prompt}"), refresh_library(), _stats_html()
+
+
 # [NEW] Reference a song for inspiration (continue / restyle)
 def do_reference(ref_file, prompt, mode, duration, model_size, guidance, collection,
                  progress=gr.Progress()):
@@ -1147,23 +1239,22 @@ def _version_history_md(track: dict) -> str:
 
 
 def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
-    """Click a row -> select it, load audio, details, version history, and
-    pre-fill the rename box with the current title.
-    Returns (track_id, audio_path, detail_md, versions_md, current_title)."""
+    """Click a row -> select it; returns
+    (track_id, audio, cover, detail, versions, current_title)."""
     rows = library.list_tracks(search=search, favorites_only=favs,
                                collection=collection, sort=sort)
     ridx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if ridx is None or ridx >= len(rows):
-        return gr.update(), None, "", "", ""
+        return gr.update(), None, None, "", "", ""
     t = rows[ridx]
     library.update_track(t["id"], play_count=(t["play_count"] or 0) + 1)
-    detail = (f"**{t['title'] or t['prompt']}**\n\n"
-              f"Prompt: {t['prompt']}\n\n"
-              f"Model: {t['model']} · {t['duration']:.0f}s · "
-              f"seed `{t['seed']}`"
-              + (f" · {t['bpm']} BPM / {t['musical_key']}" if t['bpm'] else ""))
+    detail = (f"### {t['title'] or t['prompt']}\n"
+              f"`#{t['id']}` · {t['model']} · {t['duration']:.0f}s"
+              + (f" · {t['bpm']:.0f} BPM / {t['musical_key']}" if t['bpm'] else "")
+              + f"\n\n_{t['prompt']}_")
     path = t["filepath"] if os.path.exists(t["filepath"]) else None
-    return t["id"], path, detail, _version_history_md(t), (t["title"] or "")
+    cover = t["cover_path"] if t.get("cover_path") and os.path.exists(t["cover_path"]) else None
+    return t["id"], path, cover, detail, _version_history_md(t), (t["title"] or "")
 
 
 def do_recover(search="", favs=False, collection="All Tracks", sort="newest"):
@@ -1338,6 +1429,12 @@ def build():
             with gr.Tab("🎛  Studio"):
                 with gr.Row():
                     with gr.Column(scale=3):
+                        song_name = gr.Textbox(label="🎵 Song name (optional)", lines=1,
+                            placeholder="leave blank to name it from the prompt")
+                        with gr.Row():
+                            sounds_like_in = gr.Textbox(show_label=False, scale=3,
+                                placeholder="🎤 Sounds like… (artist, song, or vibe — AI writes the prompt)")
+                            sounds_like_btn = gr.Button("✨ Translate", scale=1)
                         prompt = gr.Textbox(label="Prompt", lines=3,
                             placeholder="lofi hip hop, warm rhodes, vinyl crackle, rainy mood")
                         negative = gr.Textbox(label="Negative prompt (avoid)", lines=1,
@@ -1446,46 +1543,59 @@ def build():
                     [genre, moods, instruments, bpm_text], prompt)
                 rand_btn.click(random_prompt, outputs=prompt)
                 suggest_btn.click(do_suggest, outputs=suggest_out)
+                # 🎤 Sounds like… -> fills the prompt box
+                sounds_like_btn.click(do_sounds_like, sounds_like_in, [prompt, suggest_out])
+                sounds_like_in.submit(do_sounds_like, sounds_like_in, [prompt, suggest_out])
 
             # ───────────────── LIBRARY ─────────────────
             with gr.Tab("📚  Library"):
+                # Filter bar
                 with gr.Row():
-                    search = gr.Textbox(label="Search", placeholder="prompt, title, tag…", scale=2)
+                    search = gr.Textbox(show_label=False, scale=3,
+                        placeholder="🔍 Search by name, prompt, or tag…")
                     coll_filter = gr.Dropdown(library.list_collections(),
                         value="All Tracks", label="Collection", scale=1)
                     sort = gr.Dropdown(["newest", "oldest", "rating", "plays", "title"],
                         value="newest", label="Sort", scale=1)
-                    favs = gr.Checkbox(False, label="★ Favorites only")
-                with gr.Row():
-                    refresh_btn = gr.Button("↻ Refresh")
-                    recover_btn = gr.Button("🔧 Recover lost tracks")
+                    favs = gr.Checkbox(False, label="★ Favorites")
 
-                gr.HTML("<div class='preset-label'>👆 Click any track below to select &amp; play it · the Prompt column shows exactly what you typed</div>")
-                lib = gr.Dataframe(headers=LIB_HEADERS, datatype="str",
-                    value=refresh_library(), interactive=False, wrap=True,
-                    row_count=(8, "dynamic"),
-                    column_widths=["5%", "4%", "16%", "34%", "9%", "6%", "10%", "9%", "12%"])
+                with gr.Row(equal_height=False):
+                    # LEFT: the track list
+                    with gr.Column(scale=3):
+                        gr.HTML("<div class='preset-label'>👆 Click a track to open it on the right</div>")
+                        lib = gr.Dataframe(headers=LIB_HEADERS, datatype="str",
+                            value=refresh_library(), interactive=False, wrap=True,
+                            row_count=(12, "dynamic"),
+                            column_widths=["5%", "4%", "20%", "32%", "9%", "7%", "11%", "12%"])
+                        with gr.Row():
+                            refresh_btn = gr.Button("↻ Refresh", size="sm")
+                            recover_btn = gr.Button("🔧 Recover lost", size="sm")
 
-                with gr.Row():
-                    sel_id = gr.Number(label="Selected track ID", precision=0)
-                    edit_btn = gr.Button("✏️ Edit", variant="primary")
-                    play_btn = gr.Button("▶ Play")
-                    fav_btn = gr.Button("♥ Favorite")
-                    del_btn = gr.Button("🗑 Delete", variant="stop")
-                with gr.Row():
-                    rename_in = gr.Textbox(label="✏️ Rename song", scale=3,
-                        placeholder="type a new name, then Enter or Rename")
-                    rename_btn = gr.Button("Rename", scale=1)
-                with gr.Row():
-                    rating_in = gr.Slider(0, 5, 0, step=1, label="Set rating", scale=2)
-                    rate_btn = gr.Button("Apply rating", scale=1)
-                    tag_in = gr.Textbox(label="Add tag", scale=2)
-                    tag_btn = gr.Button("Add tag", scale=1)
-
-                sel_audio = gr.Audio(label="Now playing", type="filepath")
-                with gr.Row():
-                    sel_detail = gr.Markdown()
-                    sel_versions = gr.Markdown()
+                    # RIGHT: the selected-track panel (clean, grouped)
+                    with gr.Column(scale=2):
+                        gr.HTML("<div class='panel-title'>NOW SELECTED</div>")
+                        sel_cover = gr.Image(show_label=False, height=170,
+                                             interactive=False)
+                        sel_audio = gr.Audio(show_label=False, type="filepath")
+                        sel_detail = gr.Markdown()
+                        sel_id = gr.Number(label="Track ID", precision=0)
+                        with gr.Row():
+                            edit_btn = gr.Button("✏️ Edit", variant="primary", scale=2)
+                            play_btn = gr.Button("▶ Play", scale=1)
+                            fav_btn = gr.Button("♥", scale=1)
+                            del_btn = gr.Button("🗑", variant="stop", scale=1)
+                        with gr.Row():
+                            rename_in = gr.Textbox(show_label=False, scale=3,
+                                placeholder="rename this song…")
+                            rename_btn = gr.Button("Rename", scale=1)
+                        with gr.Row():
+                            rating_in = gr.Slider(0, 5, 0, step=1, label="★ Rating", scale=2)
+                            rate_btn = gr.Button("Set", scale=1)
+                            tag_in = gr.Textbox(show_label=False, scale=2,
+                                                placeholder="add tag")
+                            tag_btn = gr.Button("Tag", scale=1)
+                        with gr.Accordion("📜 Version history", open=False):
+                            sel_versions = gr.Markdown()
 
                 _filt = [search, favs, coll_filter, sort]
                 def _refresh(s, f, c, so): return refresh_library(s, f, c, so)
@@ -1503,9 +1613,9 @@ def build():
                 coll_filter.change(_refresh, _filt, lib)
                 sort.change(_refresh, _filt, lib)
 
-                # click a row -> auto-select + play + version history + prefill rename
+                # click a row -> auto-select + play + cover + history + prefill rename
                 lib.select(on_row_select, _filt,
-                           [sel_id, sel_audio, sel_detail, sel_versions, rename_in])
+                           [sel_id, sel_audio, sel_cover, sel_detail, sel_versions, rename_in])
 
                 # these all respect the active search/filter so the view doesn't jump
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
@@ -1544,6 +1654,15 @@ def build():
                                 e_tweak_model = gr.Radio(["small", "medium"],
                                     value="small", label="Model")
                             e_tweak_btn = gr.Button("✏️ Apply tweak", variant="primary")
+                        # ── Revamp (Groq writes our own melody) ──
+                        with gr.Accordion("🔄 Revamp into our own melody", open=False):
+                            gr.Markdown("AI reinterprets this song into a fresh original "
+                                        "version — same vibe, new melody. "
+                                        + ("🟢 Groq ready" if groq_helper.available()
+                                           else "⚪ needs GROQ_API_KEY"))
+                            e_revamp_dir = gr.Textbox(show_label=False,
+                                placeholder="optional direction: more emotional · darker · uplifting")
+                            e_revamp_btn = gr.Button("🔄 Revamp it", variant="primary")
                         # ── Effects ──
                         with gr.Accordion("🎛 Effects", open=False):
                             with gr.Row():
@@ -1589,21 +1708,25 @@ def build():
                         # ── Split / Export ──
                         # ── Finish Song (build a full arrangement from this track) ──
                         with gr.Accordion("🎼 Finish Song (build full arrangement)", open=False):
-                            gr.Markdown("Add sections that keep THIS track's vibe, then "
-                                        "build one full song. (Sets this track as the base.)")
-                            with gr.Row():
-                                e_sb_role = gr.Dropdown(list(SECTION_RECIPES.keys()),
-                                    value="Intro", label="Section")
-                                e_sb_dur = gr.Slider(3, 16, 8, step=1, label="Length (s)")
-                            e_sb_tweak = gr.Textbox(label="Extra tweak (optional)",
-                                placeholder="add strings · half-time · brighter")
-                            with gr.Row():
-                                e_sb_add = gr.Button("➕ Add section")
-                                e_sb_clear = gr.Button("🗑 Clear")
-                            e_sb_table = gr.Dataframe(headers=["#", "Section", "Details"],
-                                value=[["—", "no sections yet", "—"]], interactive=False,
-                                row_count=(3, "dynamic"))
-                            e_sb_build = gr.Button("🎼 Build full song", variant="primary")
+                            gr.Markdown("**One click:** extends THIS track into a full ~75s "
+                                        "song — verse → chorus → bridge → chorus → outro — "
+                                        "that flows from your original, same vibe throughout.")
+                            e_autofinish = gr.Button("🎼 Auto-finish into a full song",
+                                                     variant="primary", size="lg")
+                            with gr.Accordion("Advanced: build section-by-section", open=False):
+                                with gr.Row():
+                                    e_sb_role = gr.Dropdown(list(SECTION_RECIPES.keys()),
+                                        value="Verse", label="Section")
+                                    e_sb_dur = gr.Slider(6, 20, 12, step=1, label="Length (s)")
+                                e_sb_tweak = gr.Textbox(label="Extra tweak (optional)",
+                                    placeholder="add strings · half-time · brighter")
+                                with gr.Row():
+                                    e_sb_add = gr.Button("➕ Add section")
+                                    e_sb_clear = gr.Button("🗑 Clear")
+                                e_sb_table = gr.Dataframe(headers=["#", "Section", "Details"],
+                                    value=[["—", "no sections yet", "—"]], interactive=False,
+                                    row_count=(3, "dynamic"))
+                                e_sb_build = gr.Button("🎼 Build these sections", variant="primary")
 
                         with gr.Accordion("🔪 Split & 📦 Export", open=False):
                             e_split_btn = gr.Button("🔪 Split into stems")
@@ -1844,7 +1967,7 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
             do_generate,
             [prompt, negative, duration, model_size, guidance, temperature, seed_in,
              do_normalize, fade_in, fade_out, do_loop, do_trim, pitch, speed, mp3,
-             auto_analyze, collection, master, best_n],
+             auto_analyze, collection, master, best_n, song_name],
             [audio_out, info, stats, lib, cover_out, theme_holder, last_tid])
 
         # ♥ Favorite the just-generated track from the Studio
@@ -1860,12 +1983,12 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
             [batch_prompts, b_duration, b_model, b_guidance],
             [batch_status, lib, stats])
 
-        # [#3] Variations — generate 3, show first in player
-        def _variations_single(p, d, m, g, c):
-            a1, a2, a3, msg, libd, st = do_variations(p, 3, d, m, g, c)
+        # [#3] Variations — generate 3 (grouped as one project), show first
+        def _variations_single(p, d, m, g, c, nm):
+            a1, a2, a3, msg, libd, st = do_variations(p, 3, d, m, g, c, nm)
             return a1, msg, libd, st
         var_btn.click(_variations_single,
-            [prompt, duration, model_size, guidance, collection],
+            [prompt, duration, model_size, guidance, collection, song_name],
             [audio_out, info, lib, stats])
 
         # [#2] Extend last/selected track
@@ -1975,6 +2098,15 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
             [e_id, e_tweak, e_tweak_keep, e_tweak_model],
             [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
 
+        # 🔄 Revamp into our own melody (Groq)
+        def _e_revamp(track_id, direction, model, progress=gr.Progress()):
+            r = do_revamp(track_id, direction, model, 4, progress=progress)
+            new_id = _last_id_from_status(r[1]) or track_id
+            tid, audio, cover, header, vers = edit_load(new_id)
+            return tid, audio, cover, header, vers, r[1], refresh_library(), _stats_html()
+        e_revamp_btn.click(_e_revamp, [e_id, e_revamp_dir, e_tweak_model],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
         # 🎼 Song Builder
         sb_set.click(song_set_base, sb_base, [sb_msg, sb_table])
         sb_add.click(song_add_section, [sb_base, sb_role, sb_dur, sb_tweak],
@@ -2000,6 +2132,15 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
             tid, audio, cover, header, vers = edit_load(new_id)
             return tid, audio, cover, header, vers, r[1], refresh_library(), _stats_html()
         e_sb_build.click(_e_sb_build, [e_id, e_tweak_model],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        # 🎼 one-click auto-finish (the real "finish the song")
+        def _e_autofinish(track_id, model, progress=gr.Progress()):
+            r = auto_finish(track_id, model, 4, progress=progress)
+            new_id = _last_id_from_status(r[1]) or track_id
+            tid, audio, cover, header, vers = edit_load(new_id)
+            return tid, audio, cover, header, vers, r[1], refresh_library(), _stats_html()
+        e_autofinish.click(_e_autofinish, [e_id, e_tweak_model],
             [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
 
     return app
