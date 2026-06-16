@@ -447,6 +447,107 @@ def pitch_shift(audio: np.ndarray, sr: int, semitones: float) -> np.ndarray:
     return librosa.effects.pitch_shift(audio, sr=sr, n_steps=semitones)
 
 
+# ── Arrangement / editing ──────────────────────────────────────────────────────────
+def trim(audio: np.ndarray, sr: int, start_s: float, end_s: float) -> np.ndarray:
+    """Keep only the region between start_s and end_s (seconds)."""
+    a, b = int(max(0, start_s) * sr), int(end_s * sr)
+    b = min(b, len(audio)) if end_s > 0 else len(audio)
+    return audio[a:b] if b > a else audio
+
+
+def reverse(audio: np.ndarray) -> np.ndarray:
+    return audio[::-1].copy()
+
+
+def time_stretch(audio: np.ndarray, sr: int, rate: float) -> np.ndarray:
+    """Change length WITHOUT changing pitch. rate>1 = faster/shorter."""
+    if rate == 1.0:
+        return audio
+    import librosa
+    return librosa.effects.time_stretch(audio, rate=rate)
+
+
+def stitch(clips: list[np.ndarray], sr: int, crossfade: float = 0.1) -> np.ndarray:
+    """Join multiple clips into one, crossfading the seams."""
+    clips = [c for c in clips if c is not None and len(c)]
+    if not clips:
+        return np.zeros(0, np.float32)
+    out = clips[0].astype(np.float32)
+    for c in clips[1:]:
+        out = _seam(out, c.astype(np.float32), sr, crossfade)
+    return out
+
+
+def loop_to_length(audio: np.ndarray, sr: int, target_seconds: float,
+                   crossfade: float = 0.2) -> np.ndarray:
+    """Repeat a clip (seamlessly) until it reaches target length."""
+    loop = make_loop(audio, sr, crossfade)
+    target = int(target_seconds * sr)
+    if len(loop) >= target:
+        return loop[:target]
+    reps = int(np.ceil(target / len(loop)))
+    out = loop
+    for _ in range(reps - 1):
+        out = _seam(out, loop, sr, crossfade)
+    return out[:target]
+
+
+def crossfade_mix(a: np.ndarray, b: np.ndarray, sr: int, seconds: float = 1.0) -> np.ndarray:
+    """DJ-style crossfade transition from clip a into clip b."""
+    return _seam(a.astype(np.float32), b.astype(np.float32), sr, seconds)
+
+
+# ── Stem separation (Demucs) ────────────────────────────────────────────────────────
+_demucs = None
+
+
+def separate_stems(filepath: str, out_dir: str = None) -> dict:
+    """Split any song into drums / bass / vocals / other using Demucs.
+    Returns {stem_name: wav_path}. CPU — slower (~1-2 min per minute of audio)."""
+    global _demucs
+    import ssl
+    try:
+        import certifi
+        ssl._create_default_https_context = lambda: ssl.create_default_context(
+            cafile=certifi.where())
+    except Exception:
+        pass
+    import torch
+    from demucs.pretrained import get_model
+    from demucs.apply import apply_model
+
+    if _demucs is None:
+        print("[engine] loading Demucs (htdemucs) — downloads once …")
+        _demucs = get_model("htdemucs")
+        _demucs.eval()
+
+    # load with soundfile (avoids torchaudio/torchcodec dependency)
+    data, sr = sf.read(filepath, dtype="float32", always_2d=True)  # (frames, ch)
+    wav = torch.from_numpy(data.T)                                  # (ch, frames)
+    if wav.shape[0] == 1:
+        wav = wav.repeat(2, 1)
+    elif wav.shape[0] > 2:
+        wav = wav[:2]
+    ref = wav.mean(0)
+    wav = (wav - ref.mean()) / (ref.std() + 1e-8)
+
+    with torch.no_grad():
+        sources = apply_model(_demucs, wav[None], device="cpu",
+                              progress=True)[0]
+    sources = sources * ref.std() + ref.mean()
+
+    names = _demucs.sources  # ['drums','bass','other','vocals']
+    out_dir = out_dir or OUT_DIR
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    out = {}
+    for name, src in zip(names, sources):
+        mono = src.mean(0).cpu().numpy().astype(np.float32)
+        path = os.path.join(out_dir, f"{base}_{name}.wav")
+        sf.write(path, mono, sr)
+        out[name] = path
+    return out
+
+
 # ── Analysis ────────────────────────────────────────────────────────────────────
 _KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 

@@ -17,11 +17,11 @@ import gradio as gr
 
 # allow running both as module and as a script
 try:
-    from . import engine, library, extras
+    from . import engine, library, extras, effects
 except ImportError:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from music_studio import engine, library, extras
+    from music_studio import engine, library, extras, effects
 
 # [#10] genre/keyword -> accent palette for dynamic theming
 PALETTES = {
@@ -533,6 +533,121 @@ def do_remix(track_id, v_drums, v_bass, v_melody, collection):
                                  edit_label="remix", stems_json=t["stems_json"])
     return (sr, mix), f"✅ Re-mixed → v{library.get_track(tid)['version']} (#{tid})", \
            refresh_library(), _stats_html()
+
+
+def _load_track_audio_arr(track_id):
+    """Load a track's audio as (sr, mono float32) or (None, None)."""
+    import soundfile as sf
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t or not os.path.exists(t["filepath"]):
+        return None, None, None
+    a, sr = sf.read(t["filepath"])
+    if a.ndim > 1:
+        a = a.mean(axis=1)
+    return sr, a.astype("float32"), t
+
+
+# [NEW] Effects rack
+def do_apply_effect(track_id, effect_name, p1, p2, p3, collection):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, "Pick a valid track ID.", refresh_library(), _stats_html()
+    fn, params = effects.EFFECTS[effect_name]
+    keys = list(params.keys())
+    kw = {}
+    for k, val in zip(keys, [p1, p2, p3]):
+        kw[k] = val
+    out = fn(audio, sr, **kw)
+    # stereo widener returns 2D — flatten to mono for storage consistency
+    import numpy as np
+    if out.ndim > 1:
+        out = out.mean(axis=1)
+    tid, path, an = _save_simple(out, sr, f"{t['title']} [{effect_name}]",
+                                 collection, parent_id=int(track_id),
+                                 edit_label=effect_name)
+    return (sr, out), f"✅ {effect_name} applied → v{library.get_track(tid)['version']} (#{tid})", \
+           refresh_library(), _stats_html()
+
+
+def update_effect_params(effect_name):
+    """Show the right sliders for the chosen effect."""
+    fn, params = effects.EFFECTS[effect_name]
+    keys = list(params.keys())
+    ups = []
+    for i in range(3):
+        if i < len(keys):
+            k = keys[i]
+            lo, hi, df = params[k]
+            ups.append(gr.update(visible=True, label=k.replace("_", " "),
+                                 minimum=lo, maximum=hi, value=df))
+        else:
+            ups.append(gr.update(visible=False))
+    return ups
+
+
+# [NEW] Arrangement tools
+def do_arrange(track_id, op, val_a, val_b, collection):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, "Pick a valid track ID.", refresh_library(), _stats_html()
+    label = op
+    if op == "Trim":
+        out = engine.trim(audio, sr, val_a, val_b)
+    elif op == "Reverse":
+        out = engine.reverse(audio)
+    elif op == "Time-stretch (keep pitch)":
+        out = engine.time_stretch(audio, sr, val_a or 1.0)
+        label = f"stretch {val_a}x"
+    elif op == "Loop to length":
+        out = engine.loop_to_length(audio, sr, val_a or 30)
+        label = f"loop {val_a}s"
+    else:
+        return None, "Unknown operation.", refresh_library(), _stats_html()
+    tid, path, an = _save_simple(out, sr, f"{t['title']} [{label}]",
+                                 collection, parent_id=int(track_id),
+                                 edit_label=label)
+    return (sr, out), f"✅ {label} → v{library.get_track(tid)['version']} (#{tid})", \
+           refresh_library(), _stats_html()
+
+
+def do_stitch(id_a, id_b, crossfade, collection):
+    sr_a, a, ta = _load_track_audio_arr(id_a)
+    sr_b, b, tb = _load_track_audio_arr(id_b)
+    if a is None or b is None:
+        return None, "Pick two valid track IDs.", refresh_library(), _stats_html()
+    if sr_a != sr_b:
+        import librosa
+        b = librosa.resample(b, orig_sr=sr_b, target_sr=sr_a)
+    out = engine.stitch([a, b], sr_a, crossfade)
+    tid, path, an = _save_simple(out, sr_a, f"{ta['title']} + {tb['title']}", collection)
+    return (sr_a, out), f"✅ Stitched → #{tid} ({len(out)/sr_a:.0f}s)", \
+           refresh_library(), _stats_html()
+
+
+# [NEW] Stem separation
+def do_split_stems(track_id, collection, progress=gr.Progress()):
+    import json
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t or not os.path.exists(t["filepath"]):
+        return "Pick a valid track ID.", refresh_library(), _stats_html()
+    progress(0.1, desc="Separating stems (this takes a while on CPU)…")
+    try:
+        stems = engine.separate_stems(t["filepath"])
+    except Exception as e:
+        return f"⚠️ Separation failed: {e}", refresh_library(), _stats_html()
+    # save each stem as its own library track, linked as versions
+    import soundfile as sf
+    made = []
+    for name, path in stems.items():
+        info = sf.info(path)
+        tid = library.add_version(int(track_id), f"stem: {name}",
+            title=f"{t['title']} — {name}", prompt=f"{name} stem",
+            duration=info.frames / info.samplerate, model="demucs", guidance=0,
+            seed=0, filepath=path, sample_rate=info.samplerate,
+            collection=collection or "Stems")
+        made.append(name)
+    return (f"✅ Split into {len(made)} stems: {', '.join(made)} "
+            f"(saved as versions of #{track_id})"), refresh_library(), _stats_html()
 
 
 # [#6] Distribution export
@@ -1093,6 +1208,65 @@ def build():
                 al_audio = gr.Audio(label="Output", type="numpy")
                 al_status = gr.Markdown()
 
+            # ───────────────── EFFECTS [NEW] ─────────────────
+            with gr.Tab("🎛  Effects"):
+                gr.Markdown("Apply **studio effects** to any track — EQ, reverb, delay, "
+                            "compression, mastering and more. Saves as a new version.")
+                with gr.Row():
+                    fx_id = gr.Number(label="Track ID", precision=0)
+                    fx_name = gr.Dropdown(list(effects.EFFECTS.keys()),
+                        value=list(effects.EFFECTS.keys())[0], label="Effect")
+                _first = list(effects.EFFECTS.values())[0][1]
+                _fk = list(_first.keys())
+                with gr.Row():
+                    fx_p1 = gr.Slider(_first[_fk[0]][0], _first[_fk[0]][1],
+                        _first[_fk[0]][2], label=_fk[0].replace("_", " "),
+                        visible=len(_fk) > 0)
+                    fx_p2 = gr.Slider(0, 1, 0, label="param 2", visible=len(_fk) > 1)
+                    fx_p3 = gr.Slider(0, 1, 0, label="param 3", visible=len(_fk) > 2)
+                fx_coll = gr.Textbox(label="Collection", value="Effects")
+                fx_btn = gr.Button("🎛 Apply effect", variant="primary", size="lg")
+                fx_audio = gr.Audio(label="Output", type="numpy")
+                fx_status = gr.Markdown()
+
+            # ───────────────── ARRANGE [NEW] ─────────────────
+            with gr.Tab("✂️  Arrange"):
+                gr.Markdown("**Edit & arrange** — trim, reverse, time-stretch, loop to "
+                            "length, or stitch two tracks into a longer song.")
+                with gr.Row():
+                    arr_id = gr.Number(label="Track ID", precision=0)
+                    arr_op = gr.Dropdown(
+                        ["Trim", "Reverse", "Time-stretch (keep pitch)", "Loop to length"],
+                        value="Trim", label="Operation")
+                with gr.Row():
+                    arr_a = gr.Slider(0, 60, 0, step=0.5,
+                        label="Value A (trim start / stretch rate / loop secs)")
+                    arr_b = gr.Slider(0, 60, 8, step=0.5, label="Value B (trim end)")
+                arr_coll = gr.Textbox(label="Collection", value="Arranged")
+                arr_btn = gr.Button("✂️ Apply", variant="primary", size="lg")
+                arr_audio = gr.Audio(label="Output", type="numpy")
+                arr_status = gr.Markdown()
+                gr.Markdown("**Stitch two tracks** into one (crossfaded):")
+                with gr.Row():
+                    st_a = gr.Number(label="First track ID", precision=0)
+                    st_b = gr.Number(label="Second track ID", precision=0)
+                    st_xf = gr.Slider(0, 3, 0.5, step=0.1, label="Crossfade (s)")
+                st_btn = gr.Button("🔗 Stitch", size="lg")
+                st_audio = gr.Audio(label="Stitched output", type="numpy")
+                st_status = gr.Markdown()
+
+            # ───────────────── SPLIT STEMS [NEW] ─────────────────
+            with gr.Tab("🔪  Split Stems"):
+                gr.Markdown("**Separate any track** into drums / bass / vocals / other "
+                            "(powered by Demucs). Each stem saves as a version you can "
+                            "remix, replace, or build on.\n\n"
+                            "⚠️ Slow on CPU — give it a few minutes per track.")
+                with gr.Row():
+                    sp_id = gr.Number(label="Track ID to split", precision=0)
+                    sp_coll = gr.Textbox(label="Collection", value="Stems", scale=1)
+                sp_btn = gr.Button("🔪 Split into stems", variant="primary", size="lg")
+                sp_status = gr.Markdown()
+
             # ───────────────── REMIX [NEW] ─────────────────
             with gr.Tab("🎚  Remix"):
                 gr.Markdown("Re-balance the **stems** of a track made in the Stems tab. "
@@ -1215,6 +1389,23 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         rmx_btn.click(do_remix,
             [rmx_id, rmx_drums, rmx_bass, rmx_melody, rmx_coll],
             [rmx_audio, rmx_status, lib, stats])
+
+        # [NEW] Effects tab
+        fx_name.change(update_effect_params, fx_name, [fx_p1, fx_p2, fx_p3])
+        fx_btn.click(do_apply_effect,
+            [fx_id, fx_name, fx_p1, fx_p2, fx_p3, fx_coll],
+            [fx_audio, fx_status, lib, stats])
+
+        # [NEW] Arrange tab
+        arr_btn.click(do_arrange,
+            [arr_id, arr_op, arr_a, arr_b, arr_coll],
+            [arr_audio, arr_status, lib, stats])
+        st_btn.click(do_stitch,
+            [st_a, st_b, st_xf, arr_coll],
+            [st_audio, st_status, lib, stats])
+
+        # [NEW] Split Stems tab
+        sp_btn.click(do_split_stems, [sp_id, sp_coll], [sp_status, lib, stats])
 
     return app
 
