@@ -27,12 +27,59 @@ _melody_model = None
 _melody_processor = None
 _current = None
 
+# ── Safety guardrails (16GB-friendly) ─────────────────────────────────────────────
+# Approx peak RAM each model needs while generating (model + activations).
+# Tuned a touch optimistic — these run in slightly less once weights are loaded.
+MODEL_RAM_GB = {"small": 1.6, "medium": 3.6, "large": 7.5}
+# Hard duration caps so a long clip on a big model can't blow memory.
+MODEL_MAX_DURATION = {"small": 30, "medium": 18, "large": 10}
+
+
+def free_ram_gb() -> float:
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1e9
+    except Exception:
+        return 99.0  # if psutil missing, don't block
+
+
+def safety_check(model_size: str, duration: float):
+    """Raise a clear error if this generation is likely to crash the machine.
+    Returns the (possibly capped) duration."""
+    need = MODEL_RAM_GB.get(model_size, 3.0)
+    free = free_ram_gb()
+    # if the model isn't loaded yet we need headroom for it; if already loaded, less
+    headroom = need if _current != model_size else need * 0.4
+    if free < headroom + 0.8:   # +0.8GB OS breathing room
+        raise MemoryError(
+            f"Low memory: {free:.1f}GB free, but '{model_size}' needs ~{headroom:.1f}GB. "
+            f"Close some apps, or switch to a smaller model.")
+    cap = MODEL_MAX_DURATION.get(model_size, 20)
+    return min(duration, cap)
+
+
+def free_memory():
+    """Release the loaded model + run GC. Call after heavy work or to switch models."""
+    global _model, _processor, _current
+    _model = None
+    _processor = None
+    _current = None
+    import gc
+    gc.collect()
+    try:
+        torch.mps.empty_cache()
+    except Exception:
+        pass
+
 
 def load_model(size: str = "small"):
     """Standard text->music model (musicgen-small/medium/large)."""
     global _model, _processor, _current
     if _current == size and _model is not None:
         return
+    # switching models? free the old one first so we don't hold two in RAM
+    if _model is not None and _current != size:
+        free_memory()
     from transformers import AutoProcessor, MusicgenForConditionalGeneration
     model_id = f"facebook/musicgen-{size}"
     print(f"[engine] loading {model_id} on {DEVICE} ...")
@@ -54,6 +101,7 @@ def generate(prompt: str, duration: float = 8, model_size: str = "small",
              guidance: float = 3.0, temperature: float = 1.0,
              seed: int | None = None, negative: str = ""):
     """Returns (sample_rate, np.float32 audio[mono], used_seed)."""
+    duration = safety_check(model_size, duration)   # caps duration / blocks if low RAM
     load_model(model_size)
     used_seed = _set_seed(seed)
 

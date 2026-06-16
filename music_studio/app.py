@@ -217,8 +217,12 @@ def do_generate(prompt, negative, duration, model_size, guidance, temperature,
                 seed_in, do_normalize, fade_in, fade_out, do_loop, do_trim,
                 pitch, speed, mp3, auto_analyze, collection,
                 progress=gr.Progress(track_tqdm=True)):
+    def _err(msg):
+        # consistent 7-value return so the UI never breaks
+        return None, msg, _stats_html(), refresh_library(), None, "", 0
+
     if not prompt or not prompt.strip():
-        return None, "⚠️ Enter a prompt.", _stats_html(), gr.update()
+        return _err("⚠️ Enter a prompt.")
 
     progress(0.05, desc="Loading model…")
     try:
@@ -226,10 +230,15 @@ def do_generate(prompt, negative, duration, model_size, guidance, temperature,
     except ValueError:
         seed = None
 
-    progress(0.2, desc="Generating audio…")
-    sr, audio, used_seed = engine.generate(
-        prompt=prompt, negative=negative, duration=duration, model_size=model_size,
-        guidance=guidance, temperature=temperature, seed=seed)
+    progress(0.2, desc=f"Generating ({model_size})…")
+    try:
+        sr, audio, used_seed = engine.generate(
+            prompt=prompt, negative=negative, duration=duration, model_size=model_size,
+            guidance=guidance, temperature=temperature, seed=seed)
+    except MemoryError as e:
+        return _err(f"🛑 {e}")
+    except Exception as e:
+        return _err(f"⚠️ Generation failed: {e}")
 
     progress(0.7, desc="Post-processing…")
     if do_trim:
@@ -419,6 +428,15 @@ def do_suggest():
     if not sugg:
         return "Rate or favorite some tracks (★4+) and I'll learn your taste."
     return "**Based on your favorites:**\n\n" + "\n".join(f"- {s}" for s in sugg)
+
+
+def do_free_memory():
+    """Release the loaded model + GC to reclaim RAM, then report free memory."""
+    before = engine.free_ram_gb()
+    engine.free_memory()
+    after = engine.free_ram_gb()
+    return (f"🧹 Freed model from memory. RAM: {before:.1f} → {after:.1f} GB free. "
+            f"Next generation will reload the model."), _stats_html()
 
 
 # [NEW] Reference a song for inspiration (continue / restyle)
@@ -619,12 +637,16 @@ def random_prompt():
 def _stats_html():
     s = library.stats()
     mins = s["total_seconds"] / 60
+    free = engine.free_ram_gb()
+    # color the RAM card by headroom
+    ram_color = "#5eead4" if free > 6 else "#fbbf24" if free > 3 else "#f87171"
     return f"""
     <div id='statbar'>
       <div class='statcard'><div class='n'>{s['total']}</div><div class='l'>Tracks</div></div>
       <div class='statcard'><div class='n'>{s['favorites']}</div><div class='l'>Favorites</div></div>
       <div class='statcard'><div class='n'>{s['plays']}</div><div class='l'>Plays</div></div>
       <div class='statcard'><div class='n'>{mins:.0f}m</div><div class='l'>Generated</div></div>
+      <div class='statcard'><div class='n' style='color:{ram_color};-webkit-text-fill-color:{ram_color}'>{free:.1f}GB</div><div class='l'>Free RAM</div></div>
     </div>"""
 
 
@@ -720,7 +742,10 @@ def build():
                             mp3 = gr.Checkbox(False, label="Also export MP3")
                             auto_analyze = gr.Checkbox(True, label="Detect BPM/key")
 
-                        gen_btn = gr.Button("🎵  GENERATE", variant="primary", size="lg")
+                        with gr.Row():
+                            gen_btn = gr.Button("🎵  GENERATE", variant="primary",
+                                                size="lg", scale=4)
+                            freemem_btn = gr.Button("🧹 Free RAM", size="lg", scale=1)
 
                     with gr.Column(scale=2):
                         cover_out = gr.Image(label="Cover art", height=240,
@@ -936,6 +961,7 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
 
         # ♥ Favorite the just-generated track from the Studio
         heart_btn.click(heart_track, last_tid, [info, lib, stats])
+        freemem_btn.click(do_free_memory, outputs=[info, stats])
 
         batch_btn.click(batch_generate,
             [batch_prompts, b_duration, b_model, b_guidance],
