@@ -145,12 +145,23 @@ input:focus, textarea:focus { border-color:var(--accent)!important;
   box-shadow:0 0 0 3px rgba(139,92,255,.18)!important; }
 input[type=range]{ accent-color:var(--accent)!important; }
 
-/* ── Tabs ────────────────────────────────────────── */
-.tab-nav button { font-size:14px!important; font-weight:600!important;
-  color:var(--muted)!important; border:none!important; background:transparent!important; }
-.tab-nav button.selected { color:#fff!important;
-  border-bottom:2px solid var(--accent)!important; }
-.tabitem { background:transparent!important; padding-top:14px!important; }
+/* ── Tabs (Gradio 6: .tab-container row, [role=tab] buttons) ── */
+.tab-container, .tab-nav { gap:3px!important; padding:5px!important;
+  border-radius:13px!important; background:rgba(20,20,32,.6)!important;
+  border:1px solid var(--line)!important; margin-bottom:8px!important;
+  flex-wrap:nowrap!important; overflow-x:auto!important; }
+[role=tab], .tab-nav button { font-size:13.5px!important; font-weight:600!important;
+  color:var(--muted)!important; border:none!important; background:transparent!important;
+  padding:8px 14px!important; border-radius:9px!important; white-space:nowrap!important;
+  transition:all .15s ease!important; }
+[role=tab]:hover { color:var(--text)!important;
+  background:rgba(139,92,255,.10)!important; }
+[role=tab].selected, [role=tab][aria-selected=true] {
+  color:#fff!important; border:none!important;
+  background:linear-gradient(95deg,rgba(139,92,255,.40),rgba(34,211,238,.28))!important;
+  box-shadow:inset 0 0 0 1px rgba(139,92,255,.45)!important; }
+.tab-container::-webkit-scrollbar { height:6px; }
+.tabitem { background:transparent!important; padding-top:16px!important; }
 
 /* ── Lock width so content-light tabs don't shrink the layout ── */
 .gradio-container { width:100%!important; }
@@ -227,6 +238,13 @@ GENRE_GROUPS = {
         "Phonk": "phonk beat, 130 BPM, distorted cowbell melody, heavy memphis 808 bass, aggressive crunchy drums, dark vintage vocal chops, drift-night mood, lo-fi grit",
         "Cloud Rap": "cloud rap beat, 130 BPM, dreamy ethereal synth pads, hazy reverb, soft 808s, atmospheric and spacey, melancholic and floaty",
         "Old School": "old school 80s hip hop, 105 BPM, funky breakbeat drums, electro synth bass, vocoder stabs, turntable scratches, fun and bouncy",
+        "Memphis": "memphis rap, 70 BPM, gritty lo-fi 808s, dark cowbell, distorted vocal chops, eerie tape hiss, sinister underground vibe",
+        "Plugg": "plugg beat, 140 BPM, dreamy bell synths, bouncy 808s, airy pluggnb chords, smooth and melodic, spacey and light",
+        "Rage": "rage beat, 160 BPM, distorted aggressive synth lead, hard-hitting 808s, energetic and chaotic, mosh-pit intensity",
+        "Jersey Club": "jersey club, 140 BPM, bouncy triplet kick pattern, bed-squeak samples, chopped vocals, energetic and danceable",
+        "West Coast": "west coast g-funk, 95 BPM, high whiny synth lead, funky bass, laid-back drums, sunny california gangsta vibe",
+        "Trap Soul": "trap soul, 75 BPM, moody electric piano, smooth 808s, soft trap hats, emotional R&B vocals feel, late-night intimate",
+        "Afro-Trap": "afro-trap, 100 BPM, afrobeat percussion, melodic 808s, bright marimba, infectious global groove",
     },
     "Electronic / Dance": {
         "House": "upbeat house track, 124 BPM, punchy four-on-the-floor kick, crisp claps, deep groovy bassline, warm analog synth chords, uplifting piano stabs, energetic club mix",
@@ -239,6 +257,14 @@ GENRE_GROUPS = {
         "Future Bass": "future bass, 150 BPM, lush detuned supersaw chords, pitched vocal chops, punchy drums, emotional and colorful, melodic drop",
         "Synthwave": "retro 80s synthwave, 110 BPM, pulsing analog bass arpeggios, lush gated-reverb drums, bright nostalgic lead synth, neon night-drive mood, vintage chorus",
         "Lo-fi House": "lo-fi house, 120 BPM, dusty filtered chords, bouncy kick, vinyl noise, mellow groovy bassline, warm nostalgic vibe",
+        "UK Garage": "UK garage, 130 BPM, shuffled 2-step drums, chopped soulful vocals, deep sub bass, organ stabs, bouncy and groovy",
+        "Breakbeat": "breakbeat, 130 BPM, chopped funky break drums, rolling bassline, energetic stabs, old-school rave energy",
+        "Hardstyle": "hardstyle, 150 BPM, distorted hard kick, screeching lead, euphoric melody, intense festival rave energy",
+        "Psytrance": "psytrance, 145 BPM, rolling triplet bassline, hypnotic acid arpeggios, psychedelic textures, driving and trippy",
+        "Downtempo": "downtempo electronica, 95 BPM, lush atmospheric pads, deep mellow bass, soft broken beats, chilled and cinematic",
+        "IDM": "intelligent dance music, glitchy intricate drum programming, warm analog synths, complex evolving textures, experimental",
+        "Vaporwave": "vaporwave, 70 BPM, slowed nostalgic 80s samples, lush chorus synths, dreamy reverb, retro mall aesthetic, hazy",
+        "Gabber": "gabber hardcore, 180 BPM, brutal distorted kicks, aggressive hoover stabs, relentless energy, raw rave intensity",
     },
     "Band / Live": {
         "Rock": "energetic rock, 120 BPM, driving distorted electric guitar riffs, punchy live drums, melodic bass, powerful and anthemic, full band mix",
@@ -259,18 +285,36 @@ GENRE_GROUPS = {
         "Soul / R&B": "smooth R&B soul, 90 BPM, warm electric piano, silky bass, soft trap-soul drums, lush chords, romantic and intimate",
         "Meditation": "calming meditation music, soft drones, gentle singing bowls, airy pads, nature ambience, deeply peaceful and slow",
         "Piano": "solo emotional piano, expressive grand piano, gentle dynamics, reflective melody, intimate and cinematic, close-miked",
+        "Trip-Hop": "trip-hop, 85 BPM, dusty downtempo drums, deep moody bass, vinyl crackle, smoky atmosphere, cinematic and dark",
+        "Dream Pop": "dream pop, 110 BPM, washy reverb guitars, ethereal pads, soft dreamy melody, hazy and nostalgic, shoegaze textures",
+        "Neoclassical": "neoclassical, intimate solo piano with delicate string quartet, emotional and minimal, modern classical, reflective",
+        "Study Beats": "study beats, 80 BPM, mellow lo-fi keys, gentle boom-bap drums, soft bass, calm focus mood, unobtrusive and warm",
+        "Sleep / Spa": "sleep and spa music, ultra-slow soft pads, gentle piano, water and nature sounds, deeply relaxing, weightless",
+        "Post-Rock": "post-rock, 120 BPM, building atmospheric guitars, swelling dynamics, emotional crescendo, cinematic and expansive",
     },
-    "Cinematic / World": {
+    "Cinematic / Film": {
         "Cinematic Epic": "epic cinematic orchestral score, sweeping legato strings, powerful brass swells, thunderous taiko drums, soaring theme, building to a climax, trailer quality",
         "Cinematic Sad": "emotional cinematic score, delicate solo piano, soft sustained strings, melancholic and tender, slow and moving, film-score quality",
         "Horror": "dark horror score, dissonant strings, eerie drones, sudden stingers, unsettling atmosphere, tense and creepy",
         "Fantasy": "epic fantasy orchestral, heroic French horns, lush strings, choir, adventurous and majestic, grand and uplifting",
         "Orchestral": "classical orchestral piece, full symphony, elegant strings and woodwinds, dynamic and expressive, refined concert-hall sound",
+        "Action / Hybrid": "hybrid action trailer score, pounding percussion, aggressive brass, electronic pulses, tense and driving, blockbuster energy",
+        "8-Bit Chiptune": "8-bit chiptune, 140 BPM, retro square-wave melodies, arpeggiated bass, NES-style percussion, playful and nostalgic video-game music",
+        "Lo-fi Anime": "lo-fi anime, 80 BPM, dreamy japanese-inspired melody, soft koto and piano, mellow boom-bap drums, nostalgic and emotional",
+    },
+    "World / Global": {
         "Latin": "latin music, 100 BPM, lively brass section, congas and timbales, montuno piano, upbeat and danceable, festive",
         "Afrobeat": "afrobeat, 110 BPM, syncopated percussion, groovy bass, bright guitar, horn stabs, infectious and energetic",
         "Reggaeton": "reggaeton, 95 BPM, dembow rhythm, punchy kick and snare, deep bass, catchy synth melody, club-ready latin groove",
         "K-Pop": "k-pop, 120 BPM, bright punchy synths, energetic drums, catchy hook, polished and colorful, danceable",
-        "8-Bit Chiptune": "8-bit chiptune, 140 BPM, retro square-wave melodies, arpeggiated bass, NES-style percussion, playful and nostalgic video-game music",
+        "Amapiano": "amapiano, 112 BPM, deep log-drum bass, airy piano chords, shaker percussion, smooth south-african groove, hypnotic",
+        "Dancehall": "dancehall, 100 BPM, bouncy riddim drums, deep bass, catchy island melody, energetic caribbean vibe",
+        "Salsa": "salsa, 180 BPM, vibrant horn section, piano montuno, congas and timbales, energetic latin dance groove",
+        "Bachata": "bachata, 130 BPM, romantic nylon guitar, bongos and guira, smooth bass, heartfelt dominican groove",
+        "Bhangra": "bhangra, 140 BPM, energetic dhol drums, punchy bass, bright punjabi melody, festive and celebratory",
+        "Flamenco": "flamenco, 120 BPM, passionate spanish nylon guitar, hand claps, percussive rhythm, fiery and expressive",
+        "Samba": "samba, 100 BPM, lively brazilian percussion, surdo and tamborim, bright cavaquinho, carnival energy",
+        "Highlife": "highlife, 110 BPM, bright interlocking guitars, horn section, groovy bass, joyful west-african groove",
     },
 }
 
