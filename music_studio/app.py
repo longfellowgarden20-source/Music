@@ -718,12 +718,12 @@ def build():
                             placeholder="vocals, distortion")
 
                         with gr.Accordion("✨ Prompt Builder", open=False):
-                            with gr.Row():
-                                genre = gr.Dropdown(
-                                    choices=list(GENRES.keys()),
-                                    value="Lofi Hip Hop", label="Genre",
-                                    filterable=True, interactive=True, allow_custom_value=False)
-                                bpm_text = gr.Textbox(label="BPM", placeholder="120", scale=1)
+                            # Radio instead of Dropdown — always visible, one-click,
+                            # no flaky hidden list to fight with.
+                            genre = gr.Radio(
+                                choices=list(GENRES.keys()),
+                                value="Lofi Hip Hop", label="Genre")
+                            bpm_text = gr.Textbox(label="BPM", placeholder="120")
                             moods = gr.CheckboxGroup(MOODS, label="Moods")
                             instruments = gr.CheckboxGroup(INSTRUMENTS, label="Instruments")
                             with gr.Row():
