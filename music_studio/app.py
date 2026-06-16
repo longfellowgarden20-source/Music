@@ -719,7 +719,10 @@ def build():
 
                         with gr.Accordion("✨ Prompt Builder", open=False):
                             with gr.Row():
-                                genre = gr.Dropdown(list(GENRES.keys()), label="Genre")
+                                genre = gr.Dropdown(
+                                    choices=list(GENRES.keys()),
+                                    value="Lofi Hip Hop", label="Genre",
+                                    filterable=True, interactive=True, allow_custom_value=False)
                                 bpm_text = gr.Textbox(label="BPM", placeholder="120", scale=1)
                             moods = gr.CheckboxGroup(MOODS, label="Moods")
                             instruments = gr.CheckboxGroup(INSTRUMENTS, label="Instruments")
