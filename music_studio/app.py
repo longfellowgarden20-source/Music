@@ -216,6 +216,7 @@ INSTRUMENTS = ["piano", "guitar", "808 bass", "strings", "synth pads", "saxophon
 def do_generate(prompt, negative, duration, model_size, guidance, temperature,
                 seed_in, do_normalize, fade_in, fade_out, do_loop, do_trim,
                 pitch, speed, mp3, auto_analyze, collection,
+                master=True, best_n=1,
                 progress=gr.Progress(track_tqdm=True)):
     def _err(msg):
         # consistent 7-value return so the UI never breaks
@@ -230,11 +231,20 @@ def do_generate(prompt, negative, duration, model_size, guidance, temperature,
     except ValueError:
         seed = None
 
-    progress(0.2, desc=f"Generating ({model_size})…")
+    take_scores = None
     try:
-        sr, audio, used_seed = engine.generate(
-            prompt=prompt, negative=negative, duration=duration, model_size=model_size,
-            guidance=guidance, temperature=temperature, seed=seed)
+        n = int(best_n)
+        if n > 1:
+            progress(0.2, desc=f"Generating {n} takes ({model_size})…")
+            sr, audio, used_seed, _sc, take_scores = engine.best_of(
+                prompt, n=n, master=False,  # master applied below with the rest
+                duration=duration, model_size=model_size,
+                guidance=guidance, temperature=temperature)
+        else:
+            progress(0.2, desc=f"Generating ({model_size})…")
+            sr, audio, used_seed = engine.generate(
+                prompt=prompt, negative=negative, duration=duration, model_size=model_size,
+                guidance=guidance, temperature=temperature, seed=seed)
     except MemoryError as e:
         return _err(f"🛑 {e}")
     except Exception as e:
@@ -249,7 +259,10 @@ def do_generate(prompt, negative, duration, model_size, guidance, temperature,
         sr, audio = engine.change_speed(audio, sr, speed)
     if do_loop:
         audio = engine.make_loop(audio, sr)
-    if do_normalize:
+    if master:
+        progress(0.78, desc="Auto-mastering…")
+        audio = engine.auto_master(audio, sr)   # EQ + compression + loudness
+    elif do_normalize:
         audio = engine.normalize(audio)
     if fade_in or fade_out:
         audio = engine.fade(audio, sr, fade_in, fade_out)
@@ -290,6 +303,8 @@ def do_generate(prompt, negative, duration, model_size, guidance, temperature,
 
     info = (f"✅ **Saved** · #{track_id} · seed `{used_seed}`"
             + (f" · {analysis['bpm']} BPM · key {analysis['key']}" if analysis['bpm'] else "")
+            + (" · 🎚 mastered" if master else "")
+            + (f" · 🏆 best of {len(take_scores)} (scores {take_scores})" if take_scores else "")
             + (f" · MP3 ✓" if mp3_path else ""))
     theme_html = _theme_accent(pal)
     return ((sr, audio), info, _stats_html(), refresh_library(),
@@ -715,7 +730,7 @@ def build():
                         with gr.Row():
                             duration = gr.Slider(3, 30, value=15, step=1,
                                 label="Duration (s) — longer = more structure")
-                            guidance = gr.Slider(1, 10, value=4.5, step=0.5,
+                            guidance = gr.Slider(1, 10, value=5, step=0.5,
                                 label="Guidance — higher follows prompt")
                             temperature = gr.Slider(0.3, 1.5, value=0.95, step=0.05,
                                                     label="Temperature")
@@ -733,7 +748,12 @@ def build():
                                 speed = gr.Slider(0.5, 2.0, 1.0, step=0.05, label="Speed")
 
                         with gr.Row():
-                            model_size = gr.Radio(["small", "medium", "large"], value="medium",
+                            master = gr.Checkbox(True,
+                                label="🎚 Auto-master (EQ + compression — makes it sound produced)")
+                            best_n = gr.Slider(1, 4, value=3, step=1,
+                                label="🏆 Best of N (generate N, keep the best)")
+                        with gr.Row():
+                            model_size = gr.Radio(["small", "medium", "large"], value="small",
                                 label="Model — small=fast · medium=good · large=best (slow)")
                             seed_in = gr.Textbox(label="Seed (-1 = random)", value="-1", scale=1)
                         with gr.Row():
@@ -956,7 +976,7 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
             do_generate,
             [prompt, negative, duration, model_size, guidance, temperature, seed_in,
              do_normalize, fade_in, fade_out, do_loop, do_trim, pitch, speed, mp3,
-             auto_analyze, collection],
+             auto_analyze, collection, master, best_n],
             [audio_out, info, stats, lib, cover_out, theme_holder, last_tid])
 
         # ♥ Favorite the just-generated track from the Studio

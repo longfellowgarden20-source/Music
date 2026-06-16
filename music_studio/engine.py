@@ -298,6 +298,103 @@ def normalize(audio: np.ndarray, target_peak: float = 0.97) -> np.ndarray:
     return (audio / peak) * target_peak
 
 
+def _biquad(audio, sr, kind, freq, q=0.707, gain_db=0.0):
+    """Minimal RBJ biquad filter (no scipy.signal dependency surprises)."""
+    import math
+    a0 = audio
+    w0 = 2 * math.pi * freq / sr
+    cw, sw = math.cos(w0), math.sin(w0)
+    alpha = sw / (2 * q)
+    A = 10 ** (gain_db / 40)
+    if kind == "highpass":
+        b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = (1 + cw) / 2
+        a0c = 1 + alpha; a1 = -2 * cw; a2 = 1 - alpha
+    elif kind == "highshelf":
+        sq = 2 * math.sqrt(A) * alpha
+        b0 = A * ((A + 1) + (A - 1) * cw + sq)
+        b1 = -2 * A * ((A - 1) + (A + 1) * cw)
+        b2 = A * ((A + 1) + (A - 1) * cw - sq)
+        a0c = (A + 1) - (A - 1) * cw + sq
+        a1 = 2 * ((A - 1) - (A + 1) * cw)
+        a2 = (A + 1) - (A - 1) * cw - sq
+    elif kind == "peak":
+        b0 = 1 + alpha * A; b1 = -2 * cw; b2 = 1 - alpha * A
+        a0c = 1 + alpha / A; a1 = -2 * cw; a2 = 1 - alpha / A
+    else:
+        return a0
+    b = np.array([b0, b1, b2]) / a0c
+    a = np.array([1.0, a1 / a0c, a2 / a0c])
+    # direct-form filtering
+    from scipy.signal import lfilter
+    return lfilter(b, a, a0).astype(np.float32)
+
+
+def auto_master(audio: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
+    """Make raw model output sound 'produced':
+      1. high-pass to remove sub-bass mud/rumble
+      2. gentle low-mid cut (clears boxiness)
+      3. presence + air boost (clarity, sheen)
+      4. soft-knee compression (glue + loudness)
+      5. peak normalize
+    strength scales the EQ/compression amount (0..1.5).
+    """
+    a = audio.astype(np.float32)
+    s = float(strength)
+    try:
+        a = _biquad(a, sr, "highpass", 35)                    # kill rumble
+        a = _biquad(a, sr, "peak", 300, q=1.0, gain_db=-2.5 * s)   # de-mud
+        a = _biquad(a, sr, "peak", 3000, q=0.9, gain_db=2.0 * s)   # presence
+        a = _biquad(a, sr, "highshelf", 8000, gain_db=2.5 * s)     # air
+    except Exception as e:
+        print(f"[engine] EQ skipped: {e}")
+    # soft compression: tanh waveshaper acts as a smooth limiter/glue
+    drive = 1.0 + 1.3 * s
+    a = np.tanh(a * drive) / np.tanh(drive)
+    return normalize(a, 0.97)
+
+
+def score_take(audio: np.ndarray, sr: int) -> float:
+    """Heuristic quality score for 'best of N'. Higher = better.
+    Rewards: good dynamic range, fullness, rhythmic energy.
+    Penalizes: near-silence, clipping/harshness, dead mono noise.
+    """
+    a = audio.astype(np.float32)
+    if a.size == 0:
+        return -1e9
+    rms = float(np.sqrt(np.mean(a ** 2)))
+    peak = float(np.max(np.abs(a))) or 1e-6
+    if rms < 0.01:
+        return -100.0                      # basically silent
+    crest = peak / (rms + 1e-9)            # dynamic range
+    clip_ratio = float(np.mean(np.abs(a) > 0.98))   # harsh clipping
+    # spectral energy spread = "fullness" (cheap proxy via diff energy)
+    hf = float(np.mean(np.abs(np.diff(a))))
+    score = 0.0
+    score += min(rms * 10, 4)              # presence, capped
+    score += 2.0 if 2 < crest < 12 else -1.0   # healthy dynamics
+    score += min(hf * 50, 3)              # brightness/detail
+    score -= clip_ratio * 20             # punish clipping
+    return score
+
+
+def best_of(prompt: str, n: int = 3, master: bool = True, **kw):
+    """Generate N takes, score them, return the best one mastered.
+    Returns (sample_rate, audio, seed, score, all_scores)."""
+    kw.pop("seed", None)
+    best = None
+    scores = []
+    for i in range(n):
+        sr, a, seed = generate(prompt, seed=None, **kw)
+        sc = score_take(a, sr)
+        scores.append(round(sc, 2))
+        if best is None or sc > best[3]:
+            best = (sr, a, seed, sc)
+    sr, a, seed, sc = best
+    if master:
+        a = auto_master(a, sr)
+    return sr, a, seed, sc, scores
+
+
 def fade(audio: np.ndarray, sr: int, fade_in: float = 0.0,
          fade_out: float = 0.0) -> np.ndarray:
     a = audio.copy()
