@@ -662,6 +662,90 @@ def do_split_stems(track_id, collection, progress=gr.Progress()):
             f"(saved as versions of #{track_id})"), refresh_library(), _stats_html()
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# EDIT STUDIO — a focused dashboard for working on one loaded track
+# ════════════════════════════════════════════════════════════════════════════════
+def edit_load(track_id):
+    """Load a track into the Edit Studio: header, audio, cover, version history."""
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t:
+        return (gr.update(), None, None,
+                "⚠️ Track not found.", "")
+    audio = t["filepath"] if os.path.exists(t["filepath"]) else None
+    cover = t["cover_path"] if t.get("cover_path") and os.path.exists(t["cover_path"]) else None
+    header = (f"### 🎵 {t['title'] or t['prompt']}\n"
+              f"**#{t['id']}** · {t['model']} · {t['duration']:.0f}s · "
+              f"seed `{t['seed']}`"
+              + (f" · {t['bpm']:.0f} BPM / {t['musical_key']}" if t['bpm'] else "")
+              + f"\n\n*{t['prompt']}*")
+    return int(t["id"]), audio, cover, header, _version_history_md(t)
+
+
+def edit_reload(track_id):
+    """Re-load current track after an edit (to refresh player/header/versions)."""
+    return edit_load(track_id)
+
+
+def _edit_apply(track_id, result_tuple):
+    """Given a (sr,audio)/status result from an op that made a NEW version,
+    switch the Edit Studio to that new version so edits stack."""
+    # result_tuple from handlers is ((sr,audio), status, libdata, stats)
+    return result_tuple
+
+
+# Edit Studio operations — each returns: new loaded id, audio, cover, header,
+# versions, status, library table, stats
+def _edit_result(new_id, status):
+    tid, audio, cover, header, vers = edit_load(new_id)
+    return tid, audio, cover, header, vers, status, refresh_library(), _stats_html()
+
+
+def edit_duplicate(track_id):
+    if not track_id:
+        return _edit_result(track_id, "Load a track first.")
+    new_id = library.duplicate_track(int(track_id))
+    return _edit_result(new_id, f"✅ Duplicated → now editing copy #{new_id} "
+                                f"(original #{int(track_id)} is safe)")
+
+
+def edit_effect(track_id, effect_name, p1, p2, p3):
+    r = do_apply_effect(track_id, effect_name, p1, p2, p3, "Edited")
+    # r = (audio, status, lib, stats) ; find the new id from status text
+    new_id = _last_id_from_status(r[1]) or track_id
+    return _edit_result(new_id, r[1])
+
+
+def edit_arrange(track_id, op, a, b):
+    r = do_arrange(track_id, op, a, b, "Edited")
+    new_id = _last_id_from_status(r[1]) or track_id
+    return _edit_result(new_id, r[1])
+
+
+def edit_extend(track_id, prompt, add_dur, model_size, guidance):
+    r = do_extend(track_id, prompt, add_dur, model_size, guidance, "Edited")
+    new_id = _last_id_from_status(r[1]) or track_id
+    return _edit_result(new_id, r[1])
+
+
+def edit_add_layer(track_id, instrument, blend, vol, model_size, guidance):
+    r = do_add_layer(track_id, instrument, blend, vol, model_size, guidance, "Edited")
+    new_id = _last_id_from_status(r[1]) or track_id
+    return _edit_result(new_id, r[1])
+
+
+def edit_split(track_id, progress=gr.Progress()):
+    msg, libd, st = do_split_stems(track_id, "Stems", progress=progress)
+    tid, audio, cover, header, vers = edit_load(track_id)
+    return tid, audio, cover, header, vers, msg, libd, st
+
+
+def _last_id_from_status(status: str):
+    """Pull a '#123' track id out of a status string."""
+    import re
+    m = re.findall(r"#(\d+)", status or "")
+    return int(m[-1]) if m else None
+
+
 # [#6] Distribution export
 def do_export(track_id, platform):
     if not track_id:
@@ -975,7 +1059,11 @@ def build():
         stats = gr.HTML(_stats_html())
         theme_holder = gr.HTML()   # [#10] dynamic accent injection
 
-        with gr.Tabs():
+        # effect param defaults shared by Effects tab + Edit Studio
+        _first = list(effects.EFFECTS.values())[0][1]
+        _fk = list(_first.keys())
+
+        with gr.Tabs() as main_tabs:
             # ───────────────── STUDIO ─────────────────
             with gr.Tab("🎛  Studio"):
                 with gr.Row():
@@ -1101,6 +1189,7 @@ def build():
 
                 with gr.Row():
                     sel_id = gr.Number(label="Selected track ID", precision=0)
+                    edit_btn = gr.Button("✏️ Edit", variant="primary")
                     play_btn = gr.Button("▶ Play")
                     fav_btn = gr.Button("♥ Favorite")
                     del_btn = gr.Button("🗑 Delete", variant="stop")
@@ -1132,6 +1221,76 @@ def build():
                 del_btn.click(del_track, sel_id, [lib, stats])
                 rate_btn.click(set_rating, [sel_id, rating_in], lib)
                 tag_btn.click(add_tag, [sel_id, tag_in], lib)
+
+            # ───────────────── EDIT STUDIO [NEW] ─────────────────
+            with gr.Tab("🎹  Edit Studio", id="edit") as edit_tab:
+                gr.HTML("<div class='preset-label'>Your focused workspace — "
+                        "load a song from the Library (✏️ Edit) and use every tool here. "
+                        "Every edit saves a NEW version, so your original is always safe.</div>")
+                e_id = gr.Number(label="Editing track ID", precision=0, value=0)
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        e_cover = gr.Image(label="Cover", height=200, interactive=False)
+                        e_audio = gr.Audio(label="Now editing", type="filepath")
+                        e_header = gr.Markdown("*Load a track from the Library.*")
+                        with gr.Row():
+                            e_dupe = gr.Button("🧬 Duplicate (work safely)",
+                                               variant="primary")
+                            e_reload = gr.Button("↻ Reload")
+                        e_versions = gr.Markdown()
+                        e_status = gr.Markdown()
+                    with gr.Column(scale=3):
+                        # ── Effects ──
+                        with gr.Accordion("🎛 Effects", open=True):
+                            with gr.Row():
+                                e_fx_name = gr.Dropdown(list(effects.EFFECTS.keys()),
+                                    value=list(effects.EFFECTS.keys())[0], label="Effect")
+                            with gr.Row():
+                                e_fx1 = gr.Slider(_first[_fk[0]][0], _first[_fk[0]][1],
+                                    _first[_fk[0]][2], label=_fk[0].replace("_", " "))
+                                e_fx2 = gr.Slider(0, 1, 0, label="param 2", visible=len(_fk) > 1)
+                                e_fx3 = gr.Slider(0, 1, 0, label="param 3", visible=len(_fk) > 2)
+                            e_fx_btn = gr.Button("Apply effect")
+                        # ── Arrange ──
+                        with gr.Accordion("✂️ Arrange", open=False):
+                            e_arr_op = gr.Dropdown(
+                                ["Trim", "Reverse", "Time-stretch (keep pitch)", "Loop to length"],
+                                value="Trim", label="Operation")
+                            with gr.Row():
+                                e_arr_a = gr.Slider(0, 60, 0, step=0.5, label="Value A")
+                                e_arr_b = gr.Slider(0, 60, 8, step=0.5, label="Value B (trim end)")
+                            e_arr_btn = gr.Button("Apply arrange")
+                        # ── Extend ──
+                        with gr.Accordion("➕ Extend", open=False):
+                            e_ext_prompt = gr.Textbox(label="Continue with (optional)",
+                                placeholder="keep the same vibe…")
+                            with gr.Row():
+                                e_ext_dur = gr.Slider(4, 16, 8, step=1, label="Add seconds")
+                                e_ext_model = gr.Radio(["small", "medium"], value="small",
+                                    label="Model")
+                            e_ext_btn = gr.Button("Extend track")
+                        # ── Add layer ──
+                        with gr.Accordion("🥁 Add Layer", open=False):
+                            e_lay_inst = gr.Textbox(label="Instrument",
+                                value="punchy drums, crisp hats")
+                            with gr.Row():
+                                e_lay_blend = gr.Radio(["smart", "simple"], value="smart",
+                                    label="Blend")
+                                e_lay_vol = gr.Slider(0, 1, 0.7, step=0.05, label="Volume")
+                            with gr.Row():
+                                e_lay_drums = gr.Button("🥁 Drums")
+                                e_lay_bass = gr.Button("🎸 Bass")
+                                e_lay_keys = gr.Button("🎹 Keys")
+                            e_lay_btn = gr.Button("Add custom layer")
+                        # ── Split / Export ──
+                        with gr.Accordion("🔪 Split & 📦 Export", open=False):
+                            e_split_btn = gr.Button("🔪 Split into stems")
+                            with gr.Row():
+                                e_exp_platform = gr.Dropdown(
+                                    ["all", "youtube", "beatstars", "tiktok"],
+                                    value="all", label="Export platform")
+                                e_exp_btn = gr.Button("📦 Build export pack")
+                            e_exp_file = gr.File(label="Download (.zip)")
 
             # ───────────────── BATCH ─────────────────
             with gr.Tab("⚡  Batch"):
@@ -1228,8 +1387,6 @@ def build():
                     fx_id = gr.Number(label="Track ID", precision=0)
                     fx_name = gr.Dropdown(list(effects.EFFECTS.keys()),
                         value=list(effects.EFFECTS.keys())[0], label="Effect")
-                _first = list(effects.EFFECTS.values())[0][1]
-                _fk = list(_first.keys())
                 with gr.Row():
                     fx_p1 = gr.Slider(_first[_fk[0]][0], _first[_fk[0]][1],
                         _first[_fk[0]][2], label=_fk[0].replace("_", " "),
@@ -1418,6 +1575,45 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
 
         # [NEW] Split Stems tab
         sp_btn.click(do_split_stems, [sp_id, sp_coll], [sp_status, lib, stats])
+
+        # ── EDIT STUDIO wiring ──
+        # ✏️ Edit in Library -> load into Edit Studio + jump to that tab
+        def _open_editor(track_id):
+            tid, audio, cover, header, vers = edit_load(track_id)
+            return (tid, audio, cover, header, vers,
+                    gr.Tabs(selected="edit"))
+        edit_btn.click(_open_editor, sel_id,
+            [e_id, e_audio, e_cover, e_header, e_versions, main_tabs])
+
+        e_dupe.click(edit_duplicate, e_id,
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+        e_reload.click(edit_reload, e_id,
+            [e_id, e_audio, e_cover, e_header, e_versions])
+
+        e_fx_name.change(update_effect_params, e_fx_name, [e_fx1, e_fx2, e_fx3])
+        e_fx_btn.click(edit_effect, [e_id, e_fx_name, e_fx1, e_fx2, e_fx3],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        e_arr_btn.click(edit_arrange, [e_id, e_arr_op, e_arr_a, e_arr_b],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        e_ext_btn.click(edit_extend,
+            [e_id, e_ext_prompt, e_ext_dur, e_ext_model, gr.State(3)],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        e_lay_btn.click(edit_add_layer,
+            [e_id, e_lay_inst, e_lay_blend, e_lay_vol, gr.State("small"), gr.State(3)],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+        e_lay_drums.click(lambda t: edit_add_layer(t, "punchy drums, crisp hi-hats", "smart", 0.7, "small", 3),
+            e_id, [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+        e_lay_bass.click(lambda t: edit_add_layer(t, "deep sub bassline", "smart", 0.7, "small", 3),
+            e_id, [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+        e_lay_keys.click(lambda t: edit_add_layer(t, "warm piano keys, melodic", "smart", 0.7, "small", 3),
+            e_id, [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        e_split_btn.click(edit_split, e_id,
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+        e_exp_btn.click(do_export, [e_id, e_exp_platform], [e_exp_file, e_status])
 
     return app
 

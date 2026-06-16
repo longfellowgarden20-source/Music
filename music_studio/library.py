@@ -165,6 +165,30 @@ def get_track(track_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def duplicate_track(track_id: int) -> Optional[int]:
+    """Copy a track (and its audio file) into a brand-new project so the
+    original is never touched. Returns the new track id."""
+    import shutil
+    t = get_track(track_id)
+    if not t:
+        return None
+    new_path = t["filepath"]
+    if t["filepath"] and os.path.exists(t["filepath"]):
+        root, ext = os.path.splitext(t["filepath"])
+        new_path = f"{root}_copy_{datetime.now().strftime('%H%M%S')}{ext}"
+        try:
+            shutil.copy(t["filepath"], new_path)
+        except OSError:
+            new_path = t["filepath"]
+    return add_track(
+        title=(t["title"] or t["prompt"]) + " (copy)", prompt=t["prompt"],
+        negative=t.get("negative", ""), duration=t["duration"], model=t["model"],
+        guidance=t["guidance"], temperature=t.get("temperature"), seed=t["seed"],
+        filepath=new_path, sample_rate=t["sample_rate"], bpm=t["bpm"],
+        musical_key=t["musical_key"], tags=t.get("tags", ""),
+        collection=t.get("collection", "All Tracks"))  # project_id=0 -> own project
+
+
 def list_tracks(search: str = "", favorites_only: bool = False,
                 collection: str = "", sort: str = "newest") -> list[dict]:
     q = "select * from tracks where 1=1"
