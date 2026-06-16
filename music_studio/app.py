@@ -840,8 +840,9 @@ def refresh_library(search="", favs=False, collection="All Tracks", sort="newest
         if r["musical_key"]:
             meta.append(r["musical_key"])
         data.append([
-            r["id"], star, (r["title"] or r["prompt"])[:48], r["model"],
-            f"{r['duration']:.0f}s" if r["duration"] else "",
+            r["id"], star, (r["title"] or r["prompt"])[:40],
+            r["prompt"] or "",                       # full prompt — what you typed
+            r["model"], f"{r['duration']:.0f}s" if r["duration"] else "",
             " ".join(meta), rating, r["created_at"][:16].replace("T", " "),
         ])
     return data
@@ -1017,7 +1018,7 @@ def _stats_html():
     </div>"""
 
 
-LIB_HEADERS = ["ID", "♥", "Title", "Model", "Len", "BPM/Key", "Rating", "Created"]
+LIB_HEADERS = ["ID", "♥", "Title", "Prompt", "Model", "Len", "BPM/Key", "Rating", "Created"]
 
 
 # ── Build UI ──────────────────────────────────────────────────────────────────────
@@ -1183,9 +1184,11 @@ def build():
                     refresh_btn = gr.Button("↻ Refresh")
                     recover_btn = gr.Button("🔧 Recover lost tracks")
 
-                gr.HTML("<div class='preset-label'>👆 Click any track below to select &amp; play it</div>")
+                gr.HTML("<div class='preset-label'>👆 Click any track below to select &amp; play it · the Prompt column shows exactly what you typed</div>")
                 lib = gr.Dataframe(headers=LIB_HEADERS, datatype="str",
-                    value=refresh_library(), interactive=False, wrap=True, row_count=(8, "dynamic"))
+                    value=refresh_library(), interactive=False, wrap=True,
+                    row_count=(8, "dynamic"),
+                    column_widths=["5%", "4%", "16%", "34%", "9%", "6%", "10%", "9%", "12%"])
 
                 with gr.Row():
                     sel_id = gr.Number(label="Selected track ID", precision=0)
