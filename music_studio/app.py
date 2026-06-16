@@ -677,6 +677,80 @@ def do_split_stems(track_id, collection, progress=gr.Progress()):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# TWEAK WITH A PROMPT — "less drums, more piano, slower" on an existing track
+# ════════════════════════════════════════════════════════════════════════════════
+def merge_tweak(original_prompt: str, tweak: str) -> str:
+    """Fold a natural-language tweak into the original prompt.
+    Handles 'less X', 'more X', 'no X', tempo words, and plain additions."""
+    base = (original_prompt or "").strip().rstrip(".")
+    t = tweak.lower().strip()
+    if not t:
+        return base
+    additions, removals, mods = [], [], []
+    # split the tweak into clauses
+    import re
+    clauses = re.split(r"[,;]| and | but ", t)
+    for c in clauses:
+        c = c.strip()
+        if not c:
+            continue
+        if c.startswith("more ") or c.startswith("add ") or c.startswith("with "):
+            thing = c.split(" ", 1)[1]
+            additions.append(f"more {thing}" if c.startswith("more") else thing)
+        elif c.startswith("less "):
+            removals.append(c.split(" ", 1)[1])
+        elif c.startswith("no ") or c.startswith("remove ") or c.startswith("without "):
+            removals.append(c.split(" ", 1)[1])
+        elif c in ("slower", "faster", "calmer", "harder", "softer", "darker",
+                   "brighter", "happier", "sadder", "heavier", "lighter",
+                   "more upbeat", "more chill", "more aggressive"):
+            mods.append(c)
+        else:
+            additions.append(c)  # freeform -> just add it
+    parts = [base]
+    if additions:
+        parts.append("with " + ", ".join(additions))
+    if mods:
+        parts.append(", ".join(mods))
+    if removals:
+        parts.append("avoid: " + ", ".join(removals))
+    return ", ".join(p for p in parts if p)
+
+
+def do_tweak(track_id, tweak, keep_vibe, model_size, guidance,
+             progress=gr.Progress()):
+    """Regenerate a track with a natural-language change. Saves as a new version."""
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t:
+        return None, "Load/select a track first.", refresh_library(), _stats_html()
+    if not tweak or not tweak.strip():
+        return None, "Describe a change, e.g. 'less drums, more piano, slower'.", \
+               refresh_library(), _stats_html()
+    new_prompt = merge_tweak(t["prompt"], tweak)
+    dur = max(4, min(int(t["duration"] or 8), 20))
+    progress(0.3, desc=f"Tweaking: {tweak[:40]}…")
+    try:
+        if keep_vibe and os.path.exists(t["filepath"]):
+            import soundfile as sf
+            ref, rsr = sf.read(t["filepath"])
+            if ref.ndim > 1:
+                ref = ref.mean(axis=1)
+            sr, out, seed = engine.reference_generate(
+                ref.astype("float32"), rsr, prompt=new_prompt, mode="restyle",
+                duration=dur, model_size=model_size, guidance=guidance)
+        else:
+            sr, out, seed = engine.generate(new_prompt, duration=dur,
+                model_size=model_size, guidance=guidance)
+    except MemoryError as e:
+        return None, f"🛑 {e}", refresh_library(), _stats_html()
+    tid, path, an = _save_simple(out, sr, new_prompt[:60], "Tweaked",
+                                 model_size, guidance, seed,
+                                 parent_id=int(track_id), edit_label=f"tweak: {tweak[:25]}")
+    return (sr, out), (f"✅ Tweaked → v{library.get_track(tid)['version']} (#{tid})\n\n"
+                       f"**New prompt:** {new_prompt}"), refresh_library(), _stats_html()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # EDIT STUDIO — a focused dashboard for working on one loaded track
 # ════════════════════════════════════════════════════════════════════════════════
 def edit_load(track_id):
@@ -751,6 +825,12 @@ def edit_split(track_id, progress=gr.Progress()):
     msg, libd, st = do_split_stems(track_id, "Stems", progress=progress)
     tid, audio, cover, header, vers = edit_load(track_id)
     return tid, audio, cover, header, vers, msg, libd, st
+
+
+def edit_tweak(track_id, tweak, keep_vibe, model_size, progress=gr.Progress()):
+    r = do_tweak(track_id, tweak, keep_vibe, model_size, 3, progress=progress)
+    new_id = _last_id_from_status(r[1]) or track_id
+    return _edit_result(new_id, r[1])
 
 
 def _last_id_from_status(status: str):
@@ -1163,6 +1243,13 @@ def build():
                             var_btn = gr.Button("🎲 3 Variations", size="sm")
                             ext_btn = gr.Button("➕ Extend +8s", size="sm")
                             exp_btn = gr.Button("📦 Export", size="sm")
+                        gr.HTML("<div class='preset-label'>✏️ Tweak this track — describe a change</div>")
+                        tweak_box = gr.Textbox(show_label=False,
+                            placeholder="less drums, more piano, slower, darker…", lines=1)
+                        with gr.Row():
+                            tweak_keep = gr.Checkbox(True, label="Keep original vibe", scale=1)
+                            tweak_btn = gr.Button("✏️ Apply tweak", size="sm",
+                                                  variant="primary", scale=2)
                         gr.HTML("<div class='preset-label'>Add a layer to this track (smart match)</div>")
                         with gr.Row():
                             add_drums = gr.Button("🥁 + Drums", size="sm")
@@ -1267,8 +1354,18 @@ def build():
                         e_versions = gr.Markdown()
                         e_status = gr.Markdown()
                     with gr.Column(scale=3):
+                        # ── Tweak with a prompt ──
+                        with gr.Accordion("✏️ Tweak with a prompt", open=True):
+                            gr.Markdown("Describe a change in plain words.")
+                            e_tweak = gr.Textbox(show_label=False,
+                                placeholder="less drums, more piano, slower, darker…")
+                            with gr.Row():
+                                e_tweak_keep = gr.Checkbox(True, label="Keep original vibe")
+                                e_tweak_model = gr.Radio(["small", "medium"],
+                                    value="small", label="Model")
+                            e_tweak_btn = gr.Button("✏️ Apply tweak", variant="primary")
                         # ── Effects ──
-                        with gr.Accordion("🎛 Effects", open=True):
+                        with gr.Accordion("🎛 Effects", open=False):
                             with gr.Row():
                                 e_fx_name = gr.Dropdown(list(effects.EFFECTS.keys()),
                                     value=list(effects.EFFECTS.keys())[0], label="Effect")
@@ -1528,6 +1625,11 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         heart_btn.click(heart_track, last_tid, [info, lib, stats])
         freemem_btn.click(do_free_memory, outputs=[info, stats])
 
+        # ✏️ Tweak the just-generated track from the Studio
+        tweak_btn.click(do_tweak,
+            [last_tid, tweak_box, tweak_keep, model_size, guidance],
+            [audio_out, info, lib, stats])
+
         batch_btn.click(batch_generate,
             [batch_prompts, b_duration, b_model, b_guidance],
             [batch_status, lib, stats])
@@ -1641,6 +1743,11 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         e_split_btn.click(edit_split, e_id,
             [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
         e_exp_btn.click(do_export, [e_id, e_exp_platform], [e_exp_file, e_status])
+
+        # ✏️ Tweak in Edit Studio
+        e_tweak_btn.click(edit_tweak,
+            [e_id, e_tweak, e_tweak_keep, e_tweak_model],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
 
     return app
 
