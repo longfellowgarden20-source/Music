@@ -795,6 +795,95 @@ def do_tweak(track_id, tweak, keep_vibe, model_size, guidance,
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# SONG BUILDER — assemble a full song section-by-section, same persona throughout
+# ════════════════════════════════════════════════════════════════════════════════
+# Each section role carries a natural energy modifier, like a real song.
+SECTION_RECIPES = {
+    "Intro": "intro section, stripped back, softer, building up gently, fewer drums",
+    "Verse": "verse section, steady groove, moderate energy, room for vocals",
+    "Chorus": "chorus section, fuller and bigger, more energy, catchy and lifted, all elements in",
+    "Bridge": "bridge section, switch-up, different feel, breakdown, more atmospheric",
+    "Drop": "drop section, maximum energy, hard-hitting, full drums and bass",
+    "Outro": "outro section, winding down, stripped back, resolving, fading energy",
+}
+
+# in-memory plan of the current song being built: list of dicts
+_song_sections = []
+
+
+def _section_table():
+    if not _song_sections:
+        return [["—", "no sections yet", "—"]]
+    return [[i + 1, s["role"], f"{s['dur']}s · {s.get('tweak','')}".strip(" ·")]
+            for i, s in enumerate(_song_sections)]
+
+
+def song_set_base(track_id):
+    """Pick the track whose persona every section will follow."""
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t:
+        return "Pick a valid track ID.", _section_table()
+    _song_sections.clear()
+    return (f"🎵 Base persona: **{t['title'] or t['prompt']}** (#{t['id']}). "
+            f"Now add sections below."), _section_table()
+
+
+def song_add_section(track_id, role, dur, tweak):
+    if not track_id:
+        return "Set a base track first.", _section_table()
+    _song_sections.append({"base_id": int(track_id), "role": role,
+                           "dur": int(dur), "tweak": tweak.strip()})
+    return f"➕ Added {role} ({dur}s). {len(_song_sections)} sections queued.", _section_table()
+
+
+def song_clear():
+    _song_sections.clear()
+    return "Cleared all sections.", _section_table()
+
+
+def song_build(model_size, guidance, progress=gr.Progress()):
+    """Generate every section (conditioned on the base persona) and stitch them."""
+    if not _song_sections:
+        return None, "Add sections first.", refresh_library(), _stats_html()
+    import soundfile as sf
+    base = library.get_track(_song_sections[0]["base_id"])
+    if not base or not os.path.exists(base["filepath"]):
+        return None, "Base track missing.", refresh_library(), _stats_html()
+    ref, rsr = sf.read(base["filepath"])
+    if ref.ndim > 1:
+        ref = ref.mean(axis=1)
+    ref = ref.astype("float32")
+
+    clips, sr = [], None
+    n = len(_song_sections)
+    for i, sec in enumerate(_song_sections):
+        progress((i + 0.5) / n, desc=f"Building {sec['role']} ({i+1}/{n})…")
+        # prompt = original persona + role feel + optional tweak
+        recipe = SECTION_RECIPES.get(sec["role"], "")
+        prompt = merge_tweak(base["prompt"], f"{recipe}"
+                             + (f", {sec['tweak']}" if sec["tweak"] else ""))
+        try:
+            s, audio, _ = engine.reference_generate(
+                ref, rsr, prompt=prompt, mode="restyle", duration=sec["dur"],
+                model_size=model_size, guidance=guidance)
+        except MemoryError as e:
+            return None, f"🛑 {e}", refresh_library(), _stats_html()
+        sr = s
+        clips.append(engine.normalize(audio))
+
+    progress(0.95, desc="Stitching the full song…")
+    full = engine.stitch(clips, sr, crossfade=0.4)
+    full = engine.auto_master(full, sr)
+    roles = " → ".join(s["role"] for s in _song_sections)
+    tid, path, an = _save_simple(full, sr, f"{base['title']} (full song)",
+                                 "Full Songs", model_size, guidance,
+                                 parent_id=base["id"], edit_label="full song")
+    dur_total = len(full) / sr
+    return (sr, full), (f"✅ Full song built → #{tid} · {dur_total:.0f}s\n\n"
+                        f"**Structure:** {roles}"), refresh_library(), _stats_html()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # EDIT STUDIO — a focused dashboard for working on one loaded track
 # ════════════════════════════════════════════════════════════════════════════════
 def edit_load(track_id):
@@ -1460,6 +1549,34 @@ def build():
                                 e_exp_btn = gr.Button("📦 Build export pack")
                             e_exp_file = gr.File(label="Download (.zip)")
 
+            # ───────────────── SONG BUILDER [NEW] ─────────────────
+            with gr.Tab("🎼  Song Builder"):
+                gr.Markdown("**Finish a song.** Pick a base track for the persona, then "
+                            "add sections (Intro · Verse · Chorus · Bridge · Drop · Outro). "
+                            "Each section keeps the same vibe but with its own energy — like a "
+                            "real song — then they're stitched into one full track.")
+                with gr.Row():
+                    sb_base = gr.Number(label="Base track ID (the persona)", precision=0)
+                    sb_set = gr.Button("🎵 Set base", variant="primary")
+                sb_msg = gr.Markdown()
+                with gr.Row():
+                    sb_role = gr.Dropdown(list(SECTION_RECIPES.keys()),
+                        value="Intro", label="Section")
+                    sb_dur = gr.Slider(3, 16, 8, step=1, label="Length (s)")
+                    sb_tweak = gr.Textbox(label="Extra tweak (optional)",
+                        placeholder="e.g. add strings · half-time · brighter")
+                    sb_add = gr.Button("➕ Add section")
+                sb_table = gr.Dataframe(headers=["#", "Section", "Details"],
+                    value=[["—", "no sections yet", "—"]], interactive=False,
+                    row_count=(3, "dynamic"))
+                with gr.Row():
+                    sb_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    sb_guid = gr.Slider(1, 10, 4, step=0.5, label="Guidance")
+                    sb_clear = gr.Button("🗑 Clear sections")
+                sb_build = gr.Button("🎼 BUILD FULL SONG", variant="primary", size="lg")
+                sb_audio = gr.Audio(label="Finished song", type="numpy")
+                sb_status = gr.Markdown()
+
             # ───────────────── BATCH ─────────────────
             with gr.Tab("⚡  Batch"):
                 gr.Markdown("Queue many prompts — one per line — and generate them all.")
@@ -1792,6 +1909,14 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         e_tweak_btn.click(edit_tweak,
             [e_id, e_tweak, e_tweak_keep, e_tweak_model],
             [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        # 🎼 Song Builder
+        sb_set.click(song_set_base, sb_base, [sb_msg, sb_table])
+        sb_add.click(song_add_section, [sb_base, sb_role, sb_dur, sb_tweak],
+                     [sb_msg, sb_table])
+        sb_clear.click(song_clear, outputs=[sb_msg, sb_table])
+        sb_build.click(song_build, [sb_model, sb_guid],
+                       [sb_audio, sb_status, lib, stats])
 
     return app
 
