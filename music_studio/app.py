@@ -1573,6 +1573,24 @@ def build():
                                 e_lay_keys = gr.Button("🎹 Keys")
                             e_lay_btn = gr.Button("Add custom layer")
                         # ── Split / Export ──
+                        # ── Finish Song (build a full arrangement from this track) ──
+                        with gr.Accordion("🎼 Finish Song (build full arrangement)", open=False):
+                            gr.Markdown("Add sections that keep THIS track's vibe, then "
+                                        "build one full song. (Sets this track as the base.)")
+                            with gr.Row():
+                                e_sb_role = gr.Dropdown(list(SECTION_RECIPES.keys()),
+                                    value="Intro", label="Section")
+                                e_sb_dur = gr.Slider(3, 16, 8, step=1, label="Length (s)")
+                            e_sb_tweak = gr.Textbox(label="Extra tweak (optional)",
+                                placeholder="add strings · half-time · brighter")
+                            with gr.Row():
+                                e_sb_add = gr.Button("➕ Add section")
+                                e_sb_clear = gr.Button("🗑 Clear")
+                            e_sb_table = gr.Dataframe(headers=["#", "Section", "Details"],
+                                value=[["—", "no sections yet", "—"]], interactive=False,
+                                row_count=(3, "dynamic"))
+                            e_sb_build = gr.Button("🎼 Build full song", variant="primary")
+
                         with gr.Accordion("🔪 Split & 📦 Export", open=False):
                             e_split_btn = gr.Button("🔪 Split into stems")
                             with gr.Row():
@@ -1950,6 +1968,25 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         sb_clear.click(song_clear, outputs=[sb_msg, sb_table])
         sb_build.click(song_build, [sb_model, sb_guid],
                        [sb_audio, sb_status, lib, stats])
+
+        # 🎼 Finish Song inside Edit Studio (uses the currently-edited track)
+        def _e_sb_add(track_id, role, dur, tweak):
+            # ensure base is the track being edited, then add the section
+            if not _song_sections or _song_sections[0]["base_id"] != int(track_id or 0):
+                song_set_base(track_id)
+            msg, table = song_add_section(track_id, role, dur, tweak)
+            return msg, table
+        e_sb_add.click(_e_sb_add, [e_id, e_sb_role, e_sb_dur, e_sb_tweak],
+                       [e_status, e_sb_table])
+        e_sb_clear.click(song_clear, outputs=[e_status, e_sb_table])
+
+        def _e_sb_build(track_id, model):
+            r = song_build(model, 4)
+            new_id = _last_id_from_status(r[1]) or track_id
+            tid, audio, cover, header, vers = edit_load(new_id)
+            return tid, audio, cover, header, vers, r[1], refresh_library(), _stats_html()
+        e_sb_build.click(_e_sb_build, [e_id, e_tweak_model],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
 
     return app
 
