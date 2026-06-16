@@ -1147,13 +1147,14 @@ def _version_history_md(track: dict) -> str:
 
 
 def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
-    """Click a row -> select it, load audio, details, and version history.
-    Returns (track_id, audio_path, detail_md, versions_md)."""
+    """Click a row -> select it, load audio, details, version history, and
+    pre-fill the rename box with the current title.
+    Returns (track_id, audio_path, detail_md, versions_md, current_title)."""
     rows = library.list_tracks(search=search, favorites_only=favs,
                                collection=collection, sort=sort)
     ridx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if ridx is None or ridx >= len(rows):
-        return gr.update(), None, "", ""
+        return gr.update(), None, "", "", ""
     t = rows[ridx]
     library.update_track(t["id"], play_count=(t["play_count"] or 0) + 1)
     detail = (f"**{t['title'] or t['prompt']}**\n\n"
@@ -1162,7 +1163,7 @@ def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
               f"seed `{t['seed']}`"
               + (f" · {t['bpm']} BPM / {t['musical_key']}" if t['bpm'] else ""))
     path = t["filepath"] if os.path.exists(t["filepath"]) else None
-    return t["id"], path, detail, _version_history_md(t)
+    return t["id"], path, detail, _version_history_md(t), (t["title"] or "")
 
 
 def do_recover(search="", favs=False, collection="All Tracks", sort="newest"):
@@ -1211,6 +1212,13 @@ def add_tag(track_id, tag, search="", favs=False, collection="All Tracks", sort=
             tags = set(filter(None, (t["tags"] or "").split(",")))
             tags.add(tag.strip())
             library.update_track(int(track_id), tags=",".join(sorted(tags)))
+    return refresh_library(search, favs, collection, sort)
+
+
+def rename_track(track_id, new_name, search="", favs=False,
+                 collection="All Tracks", sort="newest"):
+    if track_id and new_name and new_name.strip():
+        library.update_track(int(track_id), title=new_name.strip()[:80])
     return refresh_library(search, favs, collection, sort)
 
 
@@ -1465,6 +1473,10 @@ def build():
                     fav_btn = gr.Button("♥ Favorite")
                     del_btn = gr.Button("🗑 Delete", variant="stop")
                 with gr.Row():
+                    rename_in = gr.Textbox(label="✏️ Rename song", scale=3,
+                        placeholder="type a new name, then Enter or Rename")
+                    rename_btn = gr.Button("Rename", scale=1)
+                with gr.Row():
                     rating_in = gr.Slider(0, 5, 0, step=1, label="Set rating", scale=2)
                     rate_btn = gr.Button("Apply rating", scale=1)
                     tag_in = gr.Textbox(label="Add tag", scale=2)
@@ -1491,9 +1503,9 @@ def build():
                 coll_filter.change(_refresh, _filt, lib)
                 sort.change(_refresh, _filt, lib)
 
-                # click a row -> auto-select + play + show version history
+                # click a row -> auto-select + play + version history + prefill rename
                 lib.select(on_row_select, _filt,
-                           [sel_id, sel_audio, sel_detail, sel_versions])
+                           [sel_id, sel_audio, sel_detail, sel_versions, rename_in])
 
                 # these all respect the active search/filter so the view doesn't jump
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
@@ -1501,6 +1513,8 @@ def build():
                 del_btn.click(del_track, [sel_id] + _filt, [lib, stats])
                 rate_btn.click(set_rating, [sel_id, rating_in] + _filt, lib)
                 tag_btn.click(add_tag, [sel_id, tag_in] + _filt, lib)
+                rename_btn.click(rename_track, [sel_id, rename_in] + _filt, lib)
+                rename_in.submit(rename_track, [sel_id, rename_in] + _filt, lib)
 
             # ───────────────── EDIT STUDIO [NEW] ─────────────────
             with gr.Tab("🎹  Edit Studio", id="edit") as edit_tab:
