@@ -152,6 +152,18 @@ input[type=range]{ accent-color:var(--accent)!important; }
   border-bottom:2px solid var(--accent)!important; }
 .tabitem { background:transparent!important; padding-top:14px!important; }
 
+/* ── Lock width so content-light tabs don't shrink the layout ── */
+.gradio-container { width:100%!important; }
+.tabs, .tabitem, .tab-container, [class*="tabitem"] {
+  width:100%!important; box-sizing:border-box!important; }
+/* every tab panel + its direct columns/rows fill the width */
+.tabitem > div, .tabitem .gr-row, .tabitem .gr-column,
+.tabitem > .gr-block, .tabitem .form { width:100%!important; }
+/* the tab nav row scrolls horizontally instead of wrapping/reflowing */
+.tab-nav { flex-wrap:nowrap!important; overflow-x:auto!important;
+  width:100%!important; }
+.tab-nav::-webkit-scrollbar { height:6px; }
+
 /* ── Stat bar ────────────────────────────────────── */
 #statbar { display:flex; gap:12px; margin:4px 0 10px; }
 .statcard { flex:1; position:relative; overflow:hidden;
