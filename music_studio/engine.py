@@ -497,6 +497,139 @@ def crossfade_mix(a: np.ndarray, b: np.ndarray, sr: int, seconds: float = 1.0) -
     return _seam(a.astype(np.float32), b.astype(np.float32), sr, seconds)
 
 
+def region_replace(audio: np.ndarray, sr: int,
+                   start_s: float, end_s: float,
+                   prompt: str,
+                   model_size: str = "small",
+                   guidance: float = 4.0,
+                   temperature: float = 0.95,
+                   xfade: float = 0.15,
+                   seed: int | None = None) -> tuple[np.ndarray, int]:
+    """Replace the audio between start_s and end_s with freshly generated music
+    that is conditioned on the audio just before the region (so it flows
+    naturally).  The joints are crossfaded.
+
+    Returns (new_full_audio, used_seed).
+    """
+    duration = end_s - start_s
+    if duration <= 0:
+        raise ValueError(f"end ({end_s}s) must be after start ({start_s}s)")
+
+    total_s = len(audio) / sr
+    start_s = max(0.0, min(start_s, total_s))
+    end_s   = max(start_s + 0.5, min(end_s, total_s))
+    duration = end_s - start_s
+
+    pre  = audio[:int(start_s * sr)].astype(np.float32)
+    post = audio[int(end_s   * sr):].astype(np.float32)
+
+    # Condition on the tail of the pre-region (up to 4 s) so new audio flows
+    # naturally from what came before.
+    load_model(model_size)
+    used_seed = _set_seed(seed)
+    target_sr = _model.config.audio_encoder.sampling_rate
+
+    prime = pre
+    if sr != target_sr:
+        import librosa
+        prime = librosa.resample(pre, orig_sr=sr, target_sr=target_sr)
+    tail = prime[-int(target_sr * 4):] if len(prime) > 0 else None
+
+    if tail is not None and len(tail) > 0:
+        inputs = _processor(
+            audio=[tail], sampling_rate=target_sr,
+            text=[prompt], padding=True, return_tensors="pt").to(DEVICE)
+    else:
+        inputs = _processor(
+            text=[prompt], padding=True, return_tensors="pt").to(DEVICE)
+
+    max_tokens = int(duration * 50)
+    with torch.no_grad():
+        out = _model.generate(**inputs, max_new_tokens=max_tokens,
+                              guidance_scale=guidance, do_sample=True,
+                              temperature=float(temperature))
+
+    raw = out[0, 0].cpu().numpy().astype(np.float32)
+    # Strip the echoed prime from the head of the output
+    if tail is not None and len(tail) > 0:
+        skip = len(tail)
+        new_region = raw[skip:] if len(raw) > skip else raw
+    else:
+        new_region = raw
+
+    # Resample back to original sr if needed
+    if target_sr != sr:
+        import librosa
+        new_region = librosa.resample(new_region, orig_sr=target_sr, target_sr=sr)
+        if len(pre) > 0:
+            pre = librosa.resample(pre, orig_sr=sr, target_sr=sr)
+        if len(post) > 0:
+            post = librosa.resample(post, orig_sr=sr, target_sr=sr)
+
+    # Crossfade at both joints
+    if len(pre) > 0 and len(new_region) > 0:
+        joined = _seam(pre, new_region, sr, xfade)
+    elif len(pre) > 0:
+        joined = pre
+    else:
+        joined = new_region
+
+    if len(post) > 0 and len(joined) > 0:
+        result = _seam(joined, post, sr, xfade)
+    else:
+        result = joined
+
+    return result, used_seed
+
+
+def region_waveform_png(audio: np.ndarray, sr: int,
+                        start_s: float, end_s: float,
+                        out_path: str,
+                        color: str = "#f472b6",
+                        color_region: str = "#fbbf24") -> str:
+    """Render a waveform PNG highlighting a selected region in a different color."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = 1200
+    step = max(1, len(audio) // n)
+    samples = audio[::step]
+    total = len(audio) / sr
+    xs = np.linspace(0, total, len(samples))
+
+    fig, ax = plt.subplots(figsize=(14, 2.4), dpi=100)
+    fig.patch.set_alpha(0)
+    ax.set_facecolor("none")
+
+    for xi, yi in zip(xs, samples):
+        c = color_region if start_s <= xi <= end_s else color
+        alpha = 1.0 if start_s <= xi <= end_s else 0.45
+        ax.plot([xi, xi], [-abs(yi), abs(yi)], color=c, lw=1.2,
+                alpha=alpha, solid_capstyle="round")
+
+    # region box
+    ax.axvspan(start_s, end_s, alpha=0.12, color=color_region, zorder=0)
+    ax.axvline(start_s, color=color_region, lw=1.5, alpha=0.8)
+    ax.axvline(end_s,   color=color_region, lw=1.5, alpha=0.8)
+
+    # time labels
+    ax.set_xlim(0, total)
+    lim = max(0.05, float(np.max(np.abs(samples))))
+    ax.set_ylim(-lim * 1.1, lim * 1.1)
+    ax.set_xticks(np.arange(0, total + 1, max(1, int(total / 12))))
+    ax.tick_params(colors="#9494b0", labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(left=False)
+    ax.set_yticks([])
+
+    plt.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.2)
+    fig.savefig(out_path, transparent=True, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    return out_path
+
+
 # ── Stem separation (Demucs) ────────────────────────────────────────────────────────
 _demucs = None
 

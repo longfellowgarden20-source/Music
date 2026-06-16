@@ -1178,22 +1178,254 @@ def quick_add(track_id, instrument, model_size, guidance):
     return r[0], r[1]
 
 
+# ── Edit Studio extra tools ────────────────────────────────────────────────────────
+
+def edit_pitch_shift(track_id, semitones):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    import numpy as np
+    out = engine.pitch_shift(audio, sr, float(semitones))
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id),
+                             edit_label=f"pitch {semitones:+.0f}st")
+    return edit_load(tid) + (f"✅ Pitch shifted {semitones:+.0f} semitones → #{tid}",
+                              refresh_library(), _stats_html())
+
+
+def edit_fade(track_id, fade_in_s, fade_out_s):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    out = engine.fade(audio, sr, float(fade_in_s), float(fade_out_s))
+    lbl = f"fade in {fade_in_s}s / out {fade_out_s}s"
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label=lbl)
+    return edit_load(tid) + (f"✅ {lbl} → #{tid}", refresh_library(), _stats_html())
+
+
+def edit_normalize(track_id):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    out = engine.normalize(audio)
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label="normalized")
+    return edit_load(tid) + (f"✅ Normalized → #{tid}", refresh_library(), _stats_html())
+
+
+def edit_stereo_widen(track_id, width):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    stereo = effects.stereo_widen(audio, sr, float(width))
+    import numpy as np
+    mono = stereo.mean(axis=1)
+    tid, _, _ = _save_simple(mono, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id),
+                             edit_label=f"stereo w={width:.1f}")
+    return edit_load(tid) + (f"✅ Stereo widened {width:.1f}x → #{tid}",
+                              refresh_library(), _stats_html())
+
+
+def edit_cut_silence(track_id):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    out = engine.trim_silence(audio)
+    saved = len(audio) / sr - len(out) / sr
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label="cut silence")
+    return edit_load(tid) + (f"✅ Silence trimmed ({saved:.1f}s removed) → #{tid}",
+                              refresh_library(), _stats_html())
+
+
+def edit_bass_boost(track_id):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    out = effects.eq(audio, sr, low_gain=4.0, mid_gain=0.0, high_gain=0.0)
+    out = effects.compressor(out, sr, threshold_db=-20, ratio=3)
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label="bass boost")
+    return edit_load(tid) + (f"✅ Bass boost applied → #{tid}", refresh_library(), _stats_html())
+
+
+def edit_lofi_preset(track_id):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    out = effects.bitcrush(audio, sr, bits=10)
+    out = effects.eq(out, sr, low_gain=2.0, mid_gain=-1.0, high_gain=-2.0)
+    out = effects.reverb(out, sr, amount=0.2, room=0.3)
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label="lo-fi preset")
+    return edit_load(tid) + (f"✅ Lo-fi preset applied → #{tid}", refresh_library(), _stats_html())
+
+
+def edit_stream_master(track_id):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    out = effects.streaming_master(audio, sr, target_lufs=-14.0)
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label="stream master")
+    return edit_load(tid) + (f"✅ Mastered for streaming (-14 LUFS) → #{tid}",
+                              refresh_library(), _stats_html())
+
+
+def edit_speed_change(track_id, speed_pct):
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Load a track first.", None, None
+    factor = float(speed_pct) / 100.0
+    _, out = engine.change_speed(audio, sr, factor)
+    tid, _, _ = _save_simple(out, sr, (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label=f"speed {speed_pct:.0f}%")
+    return edit_load(tid) + (f"✅ Speed set to {speed_pct:.0f}% → #{tid}",
+                              refresh_library(), _stats_html())
+
+
+def _parse_time(s: str) -> float:
+    """Parse '1:23', '1:23.5', or '45' → seconds."""
+    s = (s or "").strip()
+    if not s:
+        return 0.0
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            return int(parts[0]) * 60 + float(parts[1])
+        except Exception:
+            pass
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def region_preview(track_id, start_str, end_str):
+    """Return: (region_audio, waveform_image, info_text)."""
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, "Load a track first."
+    start_s = _parse_time(start_str)
+    end_s   = _parse_time(end_str)
+    total_s = len(audio) / sr
+    if end_s <= 0:
+        end_s = total_s
+    if start_s >= end_s:
+        return None, None, f"⚠️ Start must be before end (track is {total_s:.1f}s)"
+    region = audio[int(start_s * sr): int(end_s * sr)]
+    import tempfile
+    import soundfile as sf_mod
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    sf_mod.write(tmp.name, region, sr)
+    # waveform with region highlighted
+    wf_path = tmp.name.replace(".wav", "_wf.png")
+    try:
+        engine.region_waveform_png(audio, sr, start_s, end_s, wf_path)
+    except Exception as e:
+        print(f"[region_preview] waveform failed: {e}")
+        wf_path = None
+    info = (f"**Region:** {start_str} → {end_str}  "
+            f"({end_s - start_s:.1f}s of {total_s:.1f}s total)\n\n"
+            f"Describe what you want changed in this region, then hit **Replace Region**.")
+    return tmp.name, wf_path, info
+
+
+def region_replace_handler(track_id, start_str, end_str, prompt,
+                           model_size, guidance, xfade,
+                           progress=gr.Progress()):
+    """Replace a time region with freshly generated music."""
+    if not track_id:
+        return None, None, None, "", "", "Load a track first.", None, None
+    sr, audio, t = _load_track_audio_arr(track_id)
+    if audio is None:
+        return None, None, None, "", "", "Track file not found.", None, None
+    if not prompt or not prompt.strip():
+        return None, None, None, "", "", "Describe what you want in this region.", None, None
+    start_s = _parse_time(start_str)
+    end_s   = _parse_time(end_str)
+    total_s = len(audio) / sr
+    if end_s <= 0:
+        end_s = total_s
+    if start_s >= end_s or end_s > total_s + 0.1:
+        return (None, None, None, "", "",
+                f"⚠️ Invalid range. Track is {total_s:.1f}s.", None, None)
+    dur = end_s - start_s
+    progress(0.15, desc=f"Generating replacement for {start_s:.1f}s–{end_s:.1f}s…")
+    try:
+        new_audio, used_seed = engine.region_replace(
+            audio, sr, start_s, end_s, prompt.strip(),
+            model_size=model_size, guidance=guidance,
+            xfade=float(xfade))
+    except MemoryError as e:
+        return None, None, None, "", "", f"🛑 {e}", None, None
+    except Exception as e:
+        return None, None, None, "", "", f"⚠️ Region replace failed: {e}", None, None
+    lbl = f"region {start_s:.0f}s–{end_s:.0f}s: {prompt[:25]}"
+    tid, _, _ = _save_simple(new_audio, sr,
+                             (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label=lbl)
+    return _edit_result(tid,
+        f"✅ Region {start_s:.1f}s–{end_s:.1f}s replaced ({dur:.1f}s) → v{library.get_track(tid)['version']} (#{tid})\n\n"
+        f"**Region prompt:** {prompt}")
+
+
+def save_track_notes(track_id, notes_text):
+    if track_id:
+        library.update_track(int(track_id), notes=notes_text.strip())
+    return "✅ Notes saved."
+
+
+def copy_prompt_to_studio(track_id):
+    """Return the track's prompt to fill the Studio prompt box."""
+    if not track_id:
+        return gr.update(), "Select a track first."
+    t = library.get_track(int(track_id))
+    if not t:
+        return gr.update(), "Track not found."
+    return t["prompt"] or "", f"✅ Prompt copied from track #{int(track_id)}"
+
+
 # ── Library handlers ──────────────────────────────────────────────────────────────
-def refresh_library(search="", favs=False, collection="All Tracks", sort="newest"):
+def refresh_library(search="", favs=False, collection="All Tracks", sort="newest",
+                    min_dur=0, max_dur=0):
     rows = library.list_tracks(search=search, favorites_only=favs,
-                               collection=collection, sort=sort)
+                               collection=collection, sort=sort,
+                               min_duration=float(min_dur or 0),
+                               max_duration=float(max_dur or 0))
     data = []
     for r in rows:
         star = "★" if r["favorite"] else "☆"
-        rating = "●" * (r["rating"] or 0) + "○" * (5 - (r["rating"] or 0))
+        n = r["rating"] or 0
+        # color-coded rating: 1-2=grey dot, 3=amber, 4-5=green
+        if n >= 4:
+            rating = "🟢" * n
+        elif n == 3:
+            rating = "🟡" * n
+        elif n > 0:
+            rating = "⚪" * n
+        else:
+            rating = "—"
         meta = []
         if r["bpm"]:
-            meta.append(f"{r['bpm']}bpm")
+            meta.append(f"{int(r['bpm'])}bpm")
         if r["musical_key"]:
             meta.append(r["musical_key"])
         data.append([
             r["id"], star, (r["title"] or r["prompt"])[:40],
-            r["prompt"] or "",                       # full prompt — what you typed
+            r["prompt"] or "",
             r["model"], f"{r['duration']:.0f}s" if r["duration"] else "",
             " ".join(meta), rating, r["created_at"][:16].replace("T", " "),
         ])
@@ -1240,27 +1472,29 @@ def _version_history_md(track: dict) -> str:
 
 def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
     """Click a row -> select it; returns
-    (track_id, audio, cover, detail, versions, current_title)."""
+    (track_id, audio, cover, detail, versions, current_title, notes)."""
     rows = library.list_tracks(search=search, favorites_only=favs,
                                collection=collection, sort=sort)
     ridx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if ridx is None or ridx >= len(rows):
-        return gr.update(), None, None, "", "", ""
+        return gr.update(), None, None, "", "", "", ""
     t = rows[ridx]
     library.update_track(t["id"], play_count=(t["play_count"] or 0) + 1)
     detail = (f"### {t['title'] or t['prompt']}\n"
               f"`#{t['id']}` · {t['model']} · {t['duration']:.0f}s"
-              + (f" · {t['bpm']:.0f} BPM / {t['musical_key']}" if t['bpm'] else "")
+              + (f" · {int(t['bpm'])} BPM / {t['musical_key']}" if t['bpm'] else "")
               + f"\n\n_{t['prompt']}_")
     path = t["filepath"] if os.path.exists(t["filepath"]) else None
     cover = t["cover_path"] if t.get("cover_path") and os.path.exists(t["cover_path"]) else None
-    return t["id"], path, cover, detail, _version_history_md(t), (t["title"] or "")
+    return (t["id"], path, cover, detail, _version_history_md(t),
+            (t["title"] or ""), (t.get("notes") or ""))
 
 
-def do_recover(search="", favs=False, collection="All Tracks", sort="newest"):
+def do_recover(search="", favs=False, collection="All Tracks", sort="newest",
+               min_dur=0, max_dur=0):
     """Re-import any audio files that lost their library entry."""
     library.recover_orphans()
-    return refresh_library(search, favs, collection, sort), _stats_html()
+    return refresh_library(search, favs, collection, sort, min_dur, max_dur), _stats_html()
 
 
 def toggle_fav(track_id, search="", favs=False, collection="All Tracks", sort="newest"):
@@ -1342,17 +1576,34 @@ def batch_generate(prompts_text, duration, model_size, guidance,
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────────
-def build_prompt(genre, moods, instruments, bpm_text):
+_ENERGY_MAP = {
+    "Minimal": "minimal arrangement, sparse, stripped back",
+    "Medium": "balanced production",
+    "Full production": "full rich production, layered, polished",
+    "Maximum energy": "maximum energy, massive full production, hard-hitting",
+}
+
+def build_prompt(genre, moods, instruments, bpm_text,
+                 mood_chips=None, energy="Medium",
+                 key_root="", key_scale="", bpm_lock=False, bpm_lock_val=120):
     parts = []
     if genre and genre in GENRES:
         parts.append(GENRES[genre])
-    if moods:
-        parts.append(", ".join(moods))
+    all_moods = list(moods or []) + list(mood_chips or [])
+    if all_moods:
+        parts.append(", ".join(all_moods))
     if instruments:
         parts.append("featuring " + ", ".join(instruments))
-    if bpm_text and str(bpm_text).strip():
+    if energy and energy != "Medium":
+        parts.append(_ENERGY_MAP.get(energy, ""))
+    if key_root and key_root.strip():
+        ks = f"{key_root} {key_scale}".strip() if key_scale else key_root
+        parts.append(f"in {ks}")
+    if bpm_lock and bpm_lock_val:
+        parts.append(f"{int(bpm_lock_val)} BPM")
+    elif bpm_text and str(bpm_text).strip():
         parts.append(f"{bpm_text} BPM")
-    return ", ".join(parts)
+    return ", ".join(p for p in parts if p)
 
 
 def random_prompt():
@@ -1365,15 +1616,18 @@ def random_prompt():
 def _stats_html():
     s = library.stats()
     mins = s["total_seconds"] / 60
+    hrs = mins / 60
     free = engine.free_ram_gb()
-    # color the RAM card by headroom
     ram_color = "#5eead4" if free > 6 else "#fbbf24" if free > 3 else "#f87171"
+    dur_display = f"{hrs:.1f}h" if hrs >= 1 else f"{mins:.0f}m"
+    avg_dur = (s["total_seconds"] / s["total"]) if s["total"] else 0
     return f"""
     <div id='statbar'>
       <div class='statcard'><div class='n'>{s['total']}</div><div class='l'>Tracks</div></div>
       <div class='statcard'><div class='n'>{s['favorites']}</div><div class='l'>Favorites</div></div>
       <div class='statcard'><div class='n'>{s['plays']}</div><div class='l'>Plays</div></div>
-      <div class='statcard'><div class='n'>{mins:.0f}m</div><div class='l'>Generated</div></div>
+      <div class='statcard'><div class='n'>{dur_display}</div><div class='l'>Generated</div></div>
+      <div class='statcard'><div class='n'>{avg_dur:.0f}s</div><div class='l'>Avg Length</div></div>
       <div class='statcard'><div class='n' style='color:{ram_color};-webkit-text-fill-color:{ram_color}'>{free:.1f}GB</div><div class='l'>Free RAM</div></div>
     </div>"""
 
@@ -1441,15 +1695,40 @@ def build():
                             placeholder="vocals, distortion")
 
                         with gr.Accordion("✨ Prompt Builder", open=False):
-                            # Category first, then the genres within it — keeps ~46
-                            # genres browsable instead of one giant wall of buttons.
+                            # ── Mood quick-chips ──
+                            gr.HTML("<div class='preset-label'>🎭 Quick mood</div>")
+                            mood_chips = gr.CheckboxGroup(
+                                ["Dark", "Euphoric", "Melancholy", "Aggressive",
+                                 "Dreamy", "Tense", "Uplifting", "Nostalgic",
+                                 "Chill", "Hypnotic"],
+                                label="", show_label=False)
+                            # ── Energy ──
+                            energy = gr.Radio(
+                                ["Minimal", "Medium", "Full production", "Maximum energy"],
+                                value="Medium", label="⚡ Energy level")
+                            # ── Key picker ──
+                            with gr.Row():
+                                key_root = gr.Dropdown(
+                                    ["", "A", "A#/Bb", "B", "C", "C#/Db", "D", "D#/Eb",
+                                     "E", "F", "F#/Gb", "G", "G#/Ab"],
+                                    value="", label="🎵 Key root", scale=1)
+                                key_scale = gr.Dropdown(
+                                    ["", "major", "minor", "dorian", "phrygian",
+                                     "lydian", "mixolydian", "locrian"],
+                                    value="", label="Scale", scale=1)
+                            # ── BPM lock ──
+                            with gr.Row():
+                                bpm_lock = gr.Checkbox(False, label="🔒 Lock BPM", scale=1)
+                                bpm_lock_val = gr.Slider(60, 200, 120, step=1,
+                                                         label="BPM", scale=3)
+                            # Category first, then the genres within it
                             _cats = list(GENRE_GROUPS.keys())
                             genre_cat = gr.Radio(_cats, value=_cats[0], label="Category")
                             genre = gr.Radio(
                                 choices=list(GENRE_GROUPS[_cats[0]].keys()),
                                 value=list(GENRE_GROUPS[_cats[0]].keys())[0],
                                 label="Genre")
-                            bpm_text = gr.Textbox(label="BPM", placeholder="120")
+                            bpm_text = gr.Textbox(label="BPM (freetext)", placeholder="120")
                             moods = gr.CheckboxGroup(MOODS, label="Moods")
                             instruments = gr.CheckboxGroup(INSTRUMENTS, label="Instruments")
                             with gr.Row():
@@ -1540,7 +1819,9 @@ def build():
                         suggest_out = gr.Markdown()
 
                 build_btn.click(build_prompt,
-                    [genre, moods, instruments, bpm_text], prompt)
+                    [genre, moods, instruments, bpm_text,
+                     mood_chips, energy, key_root, key_scale,
+                     bpm_lock, bpm_lock_val], prompt)
                 rand_btn.click(random_prompt, outputs=prompt)
                 suggest_btn.click(do_suggest, outputs=suggest_out)
                 # 🎤 Sounds like… -> fills the prompt box
@@ -1553,11 +1834,23 @@ def build():
                 with gr.Row():
                     search = gr.Textbox(show_label=False, scale=3,
                         placeholder="🔍 Search by name, prompt, or tag…")
-                    coll_filter = gr.Dropdown(library.list_collections(),
+                    coll_filter = gr.Dropdown(
+                        ["All Tracks", "★ Favorites", "📅 This Week",
+                         "⭐ High Rated (4+)", "⏱ Long (60s+)"]
+                        + [c for c in library.list_collections()
+                           if c not in ("All Tracks",)],
                         value="All Tracks", label="Collection", scale=1)
-                    sort = gr.Dropdown(["newest", "oldest", "rating", "plays", "title"],
+                    sort = gr.Dropdown(
+                        ["newest", "oldest", "rating", "plays", "title",
+                         "duration", "bpm"],
                         value="newest", label="Sort", scale=1)
                     favs = gr.Checkbox(False, label="★ Favorites")
+                with gr.Row():
+                    dur_filter = gr.Dropdown(
+                        ["Any length", "Short (<15s)", "Medium (15–45s)",
+                         "Long (45–90s)", "Epic (90s+)"],
+                        value="Any length", label="⏱ Duration", scale=2)
+                    lib_stats_bar = gr.HTML(_stats_html(), scale=3)
 
                 with gr.Row(equal_height=False):
                     # LEFT: the track list
@@ -1594,28 +1887,107 @@ def build():
                             tag_in = gr.Textbox(show_label=False, scale=2,
                                                 placeholder="add tag")
                             tag_btn = gr.Button("Tag", scale=1)
+                        copy_prompt_btn = gr.Button("📋 Copy prompt → Studio", size="sm")
+                        with gr.Row():
+                            notes_in = gr.Textbox(show_label=False, scale=4,
+                                placeholder="✏️ Notes (good for the drop, needs more bass…)",
+                                lines=2)
+                            notes_save_btn = gr.Button("💾", scale=1)
+                        notes_status = gr.Markdown()
                         with gr.Accordion("📜 Version history", open=False):
                             sel_versions = gr.Markdown()
 
-                _filt = [search, favs, coll_filter, sort]
-                def _refresh(s, f, c, so): return refresh_library(s, f, c, so)
-                def _refresh_all(s, f, c, so):
-                    # refresh table AND the collection dropdown choices
-                    cols = library.list_collections()
-                    keep = c if c in cols else "All Tracks"
-                    return (refresh_library(s, f, keep, so),
-                            gr.update(choices=cols, value=keep))
-                refresh_btn.click(_refresh_all, _filt, [lib, coll_filter])
-                recover_btn.click(do_recover, _filt, [lib, stats])
-                search.submit(_refresh, _filt, lib)
-                search.change(_refresh, _filt, lib)
-                favs.change(_refresh, _filt, lib)
-                coll_filter.change(_refresh, _filt, lib)
-                sort.change(_refresh, _filt, lib)
+                _DUR_MAP = {
+                    "Any length": (0, 0),
+                    "Short (<15s)": (0, 15),
+                    "Medium (15–45s)": (15, 45),
+                    "Long (45–90s)": (45, 90),
+                    "Epic (90s+)": (90, 0),
+                }
+                _SMART_COLL = {"★ Favorites", "📅 This Week", "⭐ High Rated (4+)", "⏱ Long (60s+)"}
 
-                # click a row -> auto-select + play + cover + history + prefill rename
+                def _resolve_smart(search, favs, coll, sort, dur_label):
+                    min_d, max_d = _DUR_MAP.get(dur_label, (0, 0))
+                    real_favs = favs
+                    real_coll = coll
+                    if coll == "★ Favorites":
+                        real_favs = True
+                        real_coll = "All Tracks"
+                    elif coll == "⭐ High Rated (4+)":
+                        rows = library.list_tracks(search=search, collection="All Tracks",
+                                                    sort=sort, min_duration=min_d, max_duration=max_d)
+                        rows = [r for r in rows if (r["rating"] or 0) >= 4]
+                        data = []
+                        for r in rows:
+                            star = "★" if r["favorite"] else "☆"
+                            n = r["rating"] or 0
+                            rating = ("🟢" * n) if n >= 4 else ("🟡" * n) if n == 3 else ("⚪" * n) if n > 0 else "—"
+                            meta = []
+                            if r["bpm"]: meta.append(f"{int(r['bpm'])}bpm")
+                            if r["musical_key"]: meta.append(r["musical_key"])
+                            data.append([r["id"], star, (r["title"] or r["prompt"])[:40],
+                                         r["prompt"] or "", r["model"],
+                                         f"{r['duration']:.0f}s" if r["duration"] else "",
+                                         " ".join(meta), rating,
+                                         r["created_at"][:16].replace("T", " ")])
+                        return data
+                    elif coll == "⏱ Long (60s+)":
+                        min_d = max(min_d, 60)
+                        real_coll = "All Tracks"
+                    elif coll == "📅 This Week":
+                        from datetime import datetime, timedelta, timezone
+                        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                        rows = library.list_tracks(search=search, favorites_only=real_favs,
+                                                    collection="All Tracks", sort=sort,
+                                                    min_duration=min_d, max_duration=max_d)
+                        rows = [r for r in rows if r["created_at"] >= week_ago]
+                        data = []
+                        for r in rows:
+                            star = "★" if r["favorite"] else "☆"
+                            n = r["rating"] or 0
+                            rating = ("🟢" * n) if n >= 4 else ("🟡" * n) if n == 3 else ("⚪" * n) if n > 0 else "—"
+                            meta = []
+                            if r["bpm"]: meta.append(f"{int(r['bpm'])}bpm")
+                            if r["musical_key"]: meta.append(r["musical_key"])
+                            data.append([r["id"], star, (r["title"] or r["prompt"])[:40],
+                                         r["prompt"] or "", r["model"],
+                                         f"{r['duration']:.0f}s" if r["duration"] else "",
+                                         " ".join(meta), rating,
+                                         r["created_at"][:16].replace("T", " ")])
+                        return data
+                    return refresh_library(search, real_favs, real_coll, sort, min_d, max_d)
+
+                _filt = [search, favs, coll_filter, sort]
+                _filt5 = [search, favs, coll_filter, sort, dur_filter]
+
+                def _refresh(s, f, c, so, d="Any length"):
+                    return _resolve_smart(s, f, c, so, d)
+
+                def _refresh5(s, f, c, so, d):
+                    return _resolve_smart(s, f, c, so, d)
+
+                def _refresh_all(s, f, c, so, d):
+                    cols = (["All Tracks", "★ Favorites", "📅 This Week",
+                             "⭐ High Rated (4+)", "⏱ Long (60s+)"]
+                            + [x for x in library.list_collections() if x != "All Tracks"])
+                    keep = c if c in cols else "All Tracks"
+                    return (_resolve_smart(s, f, keep, so, d),
+                            gr.update(choices=cols, value=keep),
+                            _stats_html())
+
+                refresh_btn.click(_refresh_all, _filt5, [lib, coll_filter, lib_stats_bar])
+                recover_btn.click(do_recover, _filt + [gr.State(0), gr.State(0)], [lib, stats])
+                search.submit(_refresh5, _filt5, lib)
+                search.change(_refresh5, _filt5, lib)
+                favs.change(_refresh5, _filt5, lib)
+                coll_filter.change(_refresh5, _filt5, lib)
+                sort.change(_refresh5, _filt5, lib)
+                dur_filter.change(_refresh5, _filt5, lib)
+
+                # click a row -> auto-select + play + cover + history + prefill rename + notes
                 lib.select(on_row_select, _filt,
-                           [sel_id, sel_audio, sel_cover, sel_detail, sel_versions, rename_in])
+                           [sel_id, sel_audio, sel_cover, sel_detail,
+                            sel_versions, rename_in, notes_in])
 
                 # these all respect the active search/filter so the view doesn't jump
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
@@ -1625,6 +1997,8 @@ def build():
                 tag_btn.click(add_tag, [sel_id, tag_in] + _filt, lib)
                 rename_btn.click(rename_track, [sel_id, rename_in] + _filt, lib)
                 rename_in.submit(rename_track, [sel_id, rename_in] + _filt, lib)
+                notes_save_btn.click(save_track_notes, [sel_id, notes_in], notes_status)
+                copy_prompt_btn.click(copy_prompt_to_studio, sel_id, [prompt, suggest_out])
 
             # ───────────────── EDIT STUDIO [NEW] ─────────────────
             with gr.Tab("🎹  Edit Studio", id="edit") as edit_tab:
@@ -1644,8 +2018,60 @@ def build():
                         e_versions = gr.Markdown()
                         e_status = gr.Markdown()
                     with gr.Column(scale=3):
+                        # ── Region Editor (flagship feature) ──
+                        with gr.Accordion("🎯 Region Editor — surgically replace any moment", open=True):
+                            gr.HTML("""
+                            <div style='background:linear-gradient(90deg,#1a0f33,#0a1c28);
+                                border:1px solid #8b5cff55; border-radius:10px; padding:12px 14px;
+                                margin-bottom:8px;'>
+                              <div style='color:#a78bfa;font-weight:700;font-size:13px;
+                                  letter-spacing:.3px;margin-bottom:4px;'>
+                                🎯 REGION EDITOR
+                              </div>
+                              <div style='color:#9494b0;font-size:11px;line-height:1.5;'>
+                                Pick any moment in your song, describe what you want changed,
+                                and AI regenerates just that section — seamlessly crossfaded back in.
+                                Works on 2-minute songs. Every replace saves a new version.
+                              </div>
+                            </div>""")
+                            # Time range inputs
+                            with gr.Row():
+                                e_reg_start = gr.Textbox(
+                                    label="▶ Start", value="0:00",
+                                    placeholder="0:45 or 45",
+                                    scale=1)
+                                e_reg_end = gr.Textbox(
+                                    label="⏹ End", value="",
+                                    placeholder="1:05 or 65  (blank = end of track)",
+                                    scale=1)
+                                e_reg_preview_btn = gr.Button("👁 Preview region",
+                                                               scale=1, size="sm")
+                            # Region waveform — shows the full song with selected region highlighted
+                            e_reg_waveform = gr.Image(
+                                label="Waveform (yellow = selected region)",
+                                show_label=True, height=90, interactive=False)
+                            e_reg_audio = gr.Audio(
+                                label="Selected region playback", type="filepath",
+                                show_label=True)
+                            e_reg_info = gr.Markdown()
+                            gr.HTML("<div class='preset-label' style='margin-top:8px;'>"
+                                    "Describe what you want in this region:</div>")
+                            e_reg_prompt = gr.Textbox(
+                                show_label=False, lines=2,
+                                placeholder="harder drums · add piano break · drop the bass · "
+                                            "more atmospheric · silence then big hit · "
+                                            "keep same vibe but more tension…")
+                            with gr.Row():
+                                e_reg_model = gr.Radio(["small", "medium"], value="small",
+                                                        label="Model", scale=2)
+                                e_reg_guidance = gr.Slider(2, 8, 4, step=0.5,
+                                                            label="Guidance", scale=2)
+                                e_reg_xfade = gr.Slider(0.05, 0.5, 0.15, step=0.05,
+                                                         label="Crossfade (s)", scale=1)
+                            e_reg_replace_btn = gr.Button(
+                                "🔪 Replace this region", variant="primary", size="lg")
                         # ── Tweak with a prompt ──
-                        with gr.Accordion("✏️ Tweak with a prompt", open=True):
+                        with gr.Accordion("✏️ Tweak with a prompt", open=False):
                             gr.Markdown("Describe a change in plain words.")
                             e_tweak = gr.Textbox(show_label=False,
                                 placeholder="less drums, more piano, slower, darker…")
@@ -1663,6 +2089,41 @@ def build():
                             e_revamp_dir = gr.Textbox(show_label=False,
                                 placeholder="optional direction: more emotional · darker · uplifting")
                             e_revamp_btn = gr.Button("🔄 Revamp it", variant="primary")
+                        # ── One-click presets ──
+                        with gr.Accordion("⚡ Quick Presets", open=False):
+                            gr.Markdown("One click — applies and saves as a new version.")
+                            with gr.Row():
+                                e_preset_bass = gr.Button("🔊 Bass Boost", size="sm")
+                                e_preset_lofi = gr.Button("📼 Lo-fi", size="sm")
+                                e_preset_master = gr.Button("🎚 Stream Master", size="sm")
+                                e_normalize_btn = gr.Button("📊 Normalize", size="sm")
+                                e_cut_silence_btn = gr.Button("✂️ Cut Silence", size="sm")
+                        # ── Pitch & Speed ──
+                        with gr.Accordion("🎵 Pitch & Speed", open=False):
+                            gr.Markdown("Change pitch without affecting speed, or change speed "
+                                        "without affecting pitch.")
+                            with gr.Row():
+                                e_pitch_slider = gr.Slider(-12, 12, 0, step=1,
+                                                            label="Pitch (semitones)")
+                                e_pitch_btn = gr.Button("Apply pitch shift")
+                            with gr.Row():
+                                e_speed_slider = gr.Slider(50, 150, 100, step=1,
+                                                            label="Speed %  (100 = original)")
+                                e_speed_btn = gr.Button("Apply speed")
+                        # ── Fade & Envelope ──
+                        with gr.Accordion("🌅 Fade In / Fade Out", open=False):
+                            with gr.Row():
+                                e_fade_in = gr.Slider(0, 5, 0, step=0.1,
+                                                       label="Fade in (s)")
+                                e_fade_out = gr.Slider(0, 5, 0, step=0.1,
+                                                        label="Fade out (s)")
+                            e_fade_btn = gr.Button("Apply fades")
+                        # ── Stereo Widen ──
+                        with gr.Accordion("↔️ Stereo Widen", open=False):
+                            gr.Markdown("Widen the stereo field. 1.0 = mono, 2.0 = wide.")
+                            e_width_slider = gr.Slider(0.5, 3.0, 1.5, step=0.1,
+                                                        label="Width")
+                            e_width_btn = gr.Button("Apply stereo widen")
                         # ── Effects ──
                         with gr.Accordion("🎛 Effects", open=False):
                             with gr.Row():
@@ -2092,6 +2553,35 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         e_split_btn.click(edit_split, e_id,
             [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
         e_exp_btn.click(do_export, [e_id, e_exp_platform], [e_exp_file, e_status])
+
+        # ⚡ Quick presets
+        # 🎯 Region Editor
+        e_reg_preview_btn.click(
+            region_preview,
+            [e_id, e_reg_start, e_reg_end],
+            [e_reg_audio, e_reg_waveform, e_reg_info])
+        e_reg_replace_btn.click(
+            region_replace_handler,
+            [e_id, e_reg_start, e_reg_end, e_reg_prompt,
+             e_reg_model, e_reg_guidance, e_reg_xfade],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
+        _ES = [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats]
+        e_preset_bass.click(edit_bass_boost, e_id, _ES)
+        e_preset_lofi.click(edit_lofi_preset, e_id, _ES)
+        e_preset_master.click(edit_stream_master, e_id, _ES)
+        e_normalize_btn.click(edit_normalize, e_id, _ES)
+        e_cut_silence_btn.click(edit_cut_silence, e_id, _ES)
+
+        # 🎵 Pitch & Speed
+        e_pitch_btn.click(edit_pitch_shift, [e_id, e_pitch_slider], _ES)
+        e_speed_btn.click(edit_speed_change, [e_id, e_speed_slider], _ES)
+
+        # 🌅 Fade
+        e_fade_btn.click(edit_fade, [e_id, e_fade_in, e_fade_out], _ES)
+
+        # ↔️ Stereo Widen
+        e_width_btn.click(edit_stereo_widen, [e_id, e_width_slider], _ES)
 
         # ✏️ Tweak in Edit Studio
         e_tweak_btn.click(edit_tweak,

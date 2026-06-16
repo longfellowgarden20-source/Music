@@ -76,7 +76,8 @@ def init_db():
                           ("version", "integer default 1"),
                           ("parent_id", "integer default 0"),
                           ("edit_label", "text default ''"),
-                          ("stems_json", "text default ''")]:
+                          ("stems_json", "text default ''"),
+                          ("notes", "text default ''")]:
             if col not in existing:
                 c.execute(f"alter table tracks add column {col} {decl}")
         # index after the column is guaranteed to exist
@@ -88,7 +89,7 @@ def add_track(**kw) -> int:
             "temperature", "seed", "filepath", "waveform_path", "cover_path",
             "sample_rate", "bpm", "musical_key", "tags", "favorite", "rating",
             "play_count", "collection", "project_id", "version", "parent_id",
-            "edit_label", "stems_json", "created_at"]
+            "edit_label", "stems_json", "notes", "created_at"]
     kw.setdefault("created_at", datetime.now(timezone.utc).isoformat())
     kw.setdefault("favorite", 0)
     kw.setdefault("rating", 0)
@@ -101,6 +102,7 @@ def add_track(**kw) -> int:
     kw.setdefault("parent_id", 0)
     kw.setdefault("edit_label", "")
     kw.setdefault("stems_json", "")
+    kw.setdefault("notes", "")
     vals = [kw.get(c) for c in cols]
     placeholders = ",".join("?" * len(cols))
     with _lock, _conn() as c:
@@ -190,7 +192,8 @@ def duplicate_track(track_id: int) -> Optional[int]:
 
 
 def list_tracks(search: str = "", favorites_only: bool = False,
-                collection: str = "", sort: str = "newest") -> list[dict]:
+                collection: str = "", sort: str = "newest",
+                min_duration: float = 0, max_duration: float = 0) -> list[dict]:
     q = "select * from tracks where 1=1"
     args: list = []
     if search:
@@ -202,12 +205,20 @@ def list_tracks(search: str = "", favorites_only: bool = False,
     if collection and collection != "All Tracks":
         q += " and collection=?"
         args.append(collection)
+    if min_duration > 0:
+        q += " and duration >= ?"
+        args.append(min_duration)
+    if max_duration > 0:
+        q += " and duration <= ?"
+        args.append(max_duration)
     order = {
         "newest": "created_at desc",
         "oldest": "created_at asc",
         "rating": "rating desc, created_at desc",
         "plays": "play_count desc",
         "title": "title asc",
+        "duration": "duration desc, created_at desc",
+        "bpm": "bpm desc, created_at desc",
     }.get(sort, "created_at desc")
     q += f" order by {order}"
     with _lock, _conn() as c:
