@@ -260,6 +260,30 @@ label.float, span.svelte-19djge9, .float {
 select, option { background:var(--bg-2)!important; color:var(--text)!important; }
 
 footer { display:none!important; }
+
+/* ── Multitrack Mixer lanes ──────────────────────────────────────────────────── */
+.mx-lane {
+  display:flex; align-items:center; gap:0;
+  background:rgba(14,14,26,.9);
+  border:1px solid var(--line); border-radius:12px;
+  margin-bottom:6px; overflow:hidden; }
+.mx-label {
+  min-width:84px; padding:0 10px;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1px;
+  height:72px; flex-shrink:0; }
+.mx-label.drums  { background:rgba(239,68,68,.15);  border-right:3px solid #ef4444; color:#ef4444; }
+.mx-label.bass   { background:rgba(34,197,94,.13);  border-right:3px solid #22c55e; color:#22c55e; }
+.mx-label.other  { background:rgba(139,92,255,.15); border-right:3px solid #8b5cff; color:#a78bfa; }
+.mx-label.vocals { background:rgba(244,114,182,.15);border-right:3px solid #f472b6; color:#f472b6; }
+.mx-label.master { background:rgba(34,211,238,.12); border-right:3px solid #22d3ee; color:#22d3ee; }
+.mx-wf  { flex:1; padding:4px 6px; min-width:0; }
+.mx-wf img { width:100%; height:60px; object-fit:cover; border-radius:6px;
+             display:block; background:rgba(0,0,0,.3); }
+.mx-ctrl { display:flex; flex-direction:column; gap:4px; padding:6px 10px;
+           flex-shrink:0; min-width:130px; }
+.mx-muted { opacity:.35; }
+.mx-solo-active .mx-lane:not(.mx-soloed) { opacity:.25; }
 """
 
 # Production-grade prompt templates, grouped by category. MusicGen responds best
@@ -1178,6 +1202,128 @@ def quick_add(track_id, instrument, model_size, guidance):
     return r[0], r[1]
 
 
+# ── Multitrack Mixer ──────────────────────────────────────────────────────────────
+
+# Per-stem colors (match CSS above)
+_STEM_COLORS = {
+    "drums":  ("#ef4444", "#f87171"),
+    "bass":   ("#22c55e", "#4ade80"),
+    "other":  ("#8b5cff", "#a78bfa"),
+    "vocals": ("#f472b6", "#fb7185"),
+}
+_STEM_ORDER = ["drums", "bass", "other", "vocals"]
+
+
+def mixer_split(track_id, progress=gr.Progress()):
+    """Split a track into stems, render a waveform PNG per stem.
+    Returns per-stem: (audio_path, waveform_path, info_html) × 4 + master_wf + status."""
+    import soundfile as sf_mod
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t or not os.path.exists(t["filepath"]):
+        empty = (None, None, "")
+        return *[empty] * 4, None, "Load a valid track first."
+
+    progress(0.05, desc="Splitting into stems — takes ~1–3 min on CPU…")
+    try:
+        stems = engine.separate_stems(t["filepath"])
+    except Exception as e:
+        empty = (None, None, "")
+        return *[empty] * 4, None, f"⚠️ Separation failed: {e}"
+
+    results = []
+    for name in _STEM_ORDER:
+        path = stems.get(name)
+        if not path or not os.path.exists(path):
+            results.append((None, None, f"<div class='mx-label {name}'>{name}<br>missing</div>"))
+            continue
+        audio_arr, sr = sf_mod.read(path, dtype="float32")
+        if audio_arr.ndim > 1:
+            audio_arr = audio_arr.mean(axis=1)
+        wf_path = path.replace(".wav", "_wf.png")
+        c1, c2 = _STEM_COLORS.get(name, ("#8b5cff", "#a78bfa"))
+        try:
+            engine.waveform_png(audio_arr, sr, wf_path, c1, c2)
+        except Exception:
+            wf_path = None
+        dur = len(audio_arr) / sr
+        info = (f"<div class='mx-label {name}'><span>{name}</span>"
+                f"<span style='font-size:9px;opacity:.6;margin-top:2px'>{dur:.0f}s</span></div>")
+        results.append((path, wf_path, info))
+        progress(0.2 + _STEM_ORDER.index(name) * 0.18, desc=f"Rendered {name}…")
+
+    # master waveform (full track)
+    master_wf = None
+    try:
+        arr, sr = sf_mod.read(t["filepath"], dtype="float32")
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        master_wf = t["filepath"].replace(".wav", "_master_wf.png")
+        engine.waveform_png(arr, sr, master_wf, "#22d3ee", "#8b5cff")
+    except Exception:
+        master_wf = None
+
+    flat = []
+    for audio_p, wf_p, info_h in results:
+        flat += [audio_p, wf_p, info_h]
+    return *flat, master_wf, f"✅ Split into {len(stems)} stems. Adjust volumes and hit Mix Down."
+
+
+def mixer_mixdown(track_id,
+                  mute_d, vol_d,
+                  mute_b, vol_b,
+                  mute_o, vol_o,
+                  mute_v, vol_v,
+                  progress=gr.Progress()):
+    """Combine stem files at given volumes (respecting mutes) → new version."""
+    import soundfile as sf_mod
+    import numpy as np
+    t = library.get_track(int(track_id)) if track_id else None
+    if not t:
+        return _edit_result(track_id, "Load a track first.")
+
+    src_base = os.path.dirname(t["filepath"])
+    src_name = os.path.splitext(os.path.basename(t["filepath"]))[0]
+
+    vols   = {"drums": vol_d,  "bass": vol_b,  "other": vol_o,  "vocals": vol_v}
+    mutes  = {"drums": mute_d, "bass": mute_b, "other": mute_o, "vocals": mute_v}
+
+    # locate stem files written by separate_stems (same base name + _<stem>.wav)
+    import glob
+    clips = []
+    sr_out = None
+    for name in _STEM_ORDER:
+        pattern = os.path.join(src_base, f"{src_name}_{name}.wav")
+        matches = glob.glob(pattern)
+        if not matches:
+            continue
+        if mutes.get(name):
+            continue
+        arr, sr = sf_mod.read(matches[0], dtype="float32")
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        clips.append((arr, float(vols.get(name, 1.0))))
+        sr_out = sr
+
+    if not clips:
+        return _edit_result(track_id, "⚠️ All stems are muted — nothing to mix.")
+
+    length = min(len(a) for a, _ in clips)
+    mix = np.zeros(length, dtype=np.float32)
+    for a, v in clips:
+        mix += a[:length] * v
+    mix = engine.normalize(mix)
+
+    muted_names = [n for n in _STEM_ORDER if mutes.get(n)]
+    label = "mixdown" + (f" (no {'+'.join(muted_names)})" if muted_names else "")
+    tid, _, _ = _save_simple(mix, sr_out,
+                             (t["title"] or "track"),
+                             t.get("collection", "All Tracks"),
+                             parent_id=int(track_id), edit_label=label)
+    return _edit_result(tid,
+        f"✅ Mixed down → #{tid}  "
+        + (f"(muted: {', '.join(muted_names)})" if muted_names else "(all stems active)"))
+
+
 # ── Edit Studio extra tools ────────────────────────────────────────────────────────
 
 def edit_pitch_shift(track_id, semitones):
@@ -2070,6 +2216,72 @@ def build():
                                                          label="Crossfade (s)", scale=1)
                             e_reg_replace_btn = gr.Button(
                                 "🔪 Replace this region", variant="primary", size="lg")
+
+                        # ── Multitrack Mixer ──
+                        with gr.Accordion("🎚 Multitrack Mixer — see & control every stem", open=False):
+                            gr.HTML("""
+                            <div style='background:linear-gradient(90deg,#0a1c10,#0e0e1a);
+                                border:1px solid #22c55e44; border-radius:10px; padding:10px 14px;
+                                margin-bottom:10px;'>
+                              <div style='color:#4ade80;font-weight:700;font-size:13px;
+                                  letter-spacing:.3px;margin-bottom:3px;'>
+                                🎚 MULTITRACK MIXER
+                              </div>
+                              <div style='color:#9494b0;font-size:11px;line-height:1.5'>
+                                Splits your song into Drums · Bass · Other · Vocals using AI (Demucs).
+                                Each stem gets its own waveform lane. Mute what you don't want,
+                                adjust volumes, then hit <b>Mix Down</b> — saved as a new version.
+                                <br><b style='color:#f472b6'>The screeching / electronic noise will
+                                be isolated in the "Other" stem — just mute it.</b>
+                              </div>
+                            </div>""")
+
+                            mx_split_btn = gr.Button("🔪 Split into stems (takes ~2 min)",
+                                                      variant="primary", size="lg")
+                            mx_status = gr.Markdown()
+
+                            # Master waveform
+                            gr.HTML("<div class='preset-label'>MASTER</div>")
+                            mx_master_wf = gr.Image(show_label=False, height=70,
+                                                     interactive=False)
+
+                            # ── 4 stem lanes ──
+                            _lane_defs = [
+                                ("🥁 DRUMS", "drums", "#ef4444"),
+                                ("🎸 BASS",  "bass",  "#22c55e"),
+                                ("🎛 OTHER", "other", "#8b5cff"),
+                                ("🎤 VOCALS","vocals","#f472b6"),
+                            ]
+                            mx_audios, mx_wfs, mx_mutes, mx_vols = [], [], [], []
+                            for label, stem, color in _lane_defs:
+                                gr.HTML(f"<div class='preset-label' style='color:{color};'>"
+                                        f"{label}</div>")
+                                with gr.Row():
+                                    mx_wf = gr.Image(show_label=False, height=64,
+                                                      interactive=False, scale=5)
+                                    with gr.Column(scale=1, min_width=120):
+                                        mx_mute = gr.Checkbox(False, label="Mute")
+                                        mx_vol  = gr.Slider(0, 1.5, 1.0, step=0.05,
+                                                             label="Vol", show_label=True)
+                                mx_audio = gr.Audio(show_label=False, type="filepath",
+                                                     visible=False)
+                                mx_wfs.append(mx_wf)
+                                mx_mutes.append(mx_mute)
+                                mx_vols.append(mx_vol)
+                                mx_audios.append(mx_audio)
+
+                            gr.HTML("<div class='preset-label' style='margin-top:10px;'>"
+                                    "Preview individual stem:</div>")
+                            mx_preview_sel = gr.Radio(
+                                ["Drums", "Bass", "Other", "Vocals"],
+                                value="Other", label="", show_label=False)
+                            mx_preview_audio = gr.Audio(label="Stem preview",
+                                                         type="filepath")
+
+                            with gr.Row():
+                                mx_mixdown_btn = gr.Button("🎛 Mix Down → save new version",
+                                                            variant="primary", size="lg", scale=3)
+
                         # ── Tweak with a prompt ──
                         with gr.Accordion("✏️ Tweak with a prompt", open=False):
                             gr.Markdown("Describe a change in plain words.")
@@ -2555,6 +2767,60 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         e_exp_btn.click(do_export, [e_id, e_exp_platform], [e_exp_file, e_status])
 
         # ⚡ Quick presets
+        # 🎚 Multitrack Mixer
+        _MX_SPLIT_OUTS = (mx_audios + mx_wfs + [mx_master_wf, mx_status])
+
+        def _mx_split(tid, progress=gr.Progress()):
+            import soundfile as sf_mod
+            t = library.get_track(int(tid)) if tid else None
+            if not t or not os.path.exists(t["filepath"]):
+                return [None]*4 + [None]*4 + [None, "Load a track first."]
+            progress(0.05, desc="Splitting into stems…")
+            try:
+                stems = engine.separate_stems(t["filepath"])
+            except Exception as e:
+                return [None]*4 + [None]*4 + [None, f"⚠️ {e}"]
+            paths, wf_paths = [], []
+            for name in _STEM_ORDER:
+                path = stems.get(name)
+                if not path or not os.path.exists(path):
+                    paths.append(None); wf_paths.append(None); continue
+                arr, sr = sf_mod.read(path, dtype="float32")
+                if arr.ndim > 1: arr = arr.mean(axis=1)
+                wf = path.replace(".wav", "_wf.png")
+                c1, c2 = _STEM_COLORS.get(name, ("#8b5cff", "#a78bfa"))
+                try: engine.waveform_png(arr, sr, wf, c1, c2)
+                except Exception: wf = None
+                paths.append(path); wf_paths.append(wf)
+                progress(0.2 + _STEM_ORDER.index(name)*0.18, desc=f"Rendered {name}")
+            # master waveform
+            master_wf = None
+            try:
+                arr, sr = sf_mod.read(t["filepath"], dtype="float32")
+                if arr.ndim > 1: arr = arr.mean(axis=1)
+                master_wf = t["filepath"].replace(".wav", "_masterwf.png")
+                engine.waveform_png(arr, sr, master_wf, "#22d3ee", "#8b5cff")
+            except Exception: pass
+            return paths + wf_paths + [master_wf, f"✅ Stems ready. Mute/adjust and Mix Down."]
+
+        mx_split_btn.click(_mx_split, e_id,
+            mx_audios + mx_wfs + [mx_master_wf, mx_status])
+
+        # preview selected stem
+        def _mx_preview(sel, a_d, a_b, a_o, a_v):
+            m = {"Drums": a_d, "Bass": a_b, "Other": a_o, "Vocals": a_v}
+            return m.get(sel)
+        mx_preview_sel.change(_mx_preview,
+            [mx_preview_sel] + mx_audios, mx_preview_audio)
+
+        mx_mixdown_btn.click(
+            mixer_mixdown,
+            [e_id] + [mx_mutes[0], mx_vols[0],
+                      mx_mutes[1], mx_vols[1],
+                      mx_mutes[2], mx_vols[2],
+                      mx_mutes[3], mx_vols[3]],
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])
+
         # 🎯 Region Editor
         e_reg_preview_btn.click(
             region_preview,
