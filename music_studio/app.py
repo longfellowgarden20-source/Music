@@ -170,17 +170,40 @@ input[type=range]{ accent-color:var(--accent)!important; }
 footer { display:none!important; }
 """
 
+# Production-grade prompt templates. MusicGen responds best to: genre + tempo +
+# specific instruments + production descriptors + mood. These are tuned to sound
+# good, not just be short tags.
 GENRES = {
-    "Lofi Hip Hop": "lofi hip hop, mellow boom-bap drums, warm rhodes piano, vinyl crackle, rainy mood",
-    "Dark Trap": "dark trap beat, hard 808 bass, crisp hi-hats, eerie bells, moody and aggressive",
-    "Cinematic": "epic cinematic orchestral, soaring strings, big drums, rising tension, film score",
-    "House": "upbeat house music, four-on-the-floor, driving bassline, energetic, club ready",
-    "Ambient": "ambient soundscape, soft evolving pads, ethereal, peaceful, meditative",
-    "Synthwave": "retro synthwave, analog synths, gated reverb drums, neon 80s nostalgia",
-    "Acoustic": "warm acoustic guitar, intimate, coffee shop, indie folk, fingerpicked",
-    "Drill": "UK drill beat, sliding 808s, dark piano melody, hard percussion",
-    "Jazz": "smooth jazz, upright bass, brushed drums, saxophone, late night lounge",
-    "Phonk": "phonk, distorted 808 cowbell, memphis vocal chops, aggressive, drift mood",
+    "Lofi Hip Hop": "lofi hip hop instrumental, 72 BPM, warm Rhodes electric piano chords, "
+        "soft dusty boom-bap drums, deep round sub bass, mellow jazzy harmony, vinyl crackle, "
+        "tape saturation, relaxed late-night mood, professionally mixed",
+    "Dark Trap": "dark trap beat, 140 BPM, booming distorted 808 bass with glide, "
+        "fast crisp hi-hat rolls, punchy snare on the offbeat, eerie minor-key bell melody, "
+        "atmospheric pads, hard aggressive mood, clean modern mix",
+    "Cinematic": "epic cinematic orchestral score, sweeping legato strings, powerful brass swells, "
+        "thunderous taiko and timpani drums, soaring melodic theme, building tension to a climax, "
+        "wide reverb, emotional and heroic, film trailer quality",
+    "House": "upbeat house track, 124 BPM, punchy four-on-the-floor kick, crisp claps and hats, "
+        "deep groovy bassline, warm analog synth chords, uplifting piano stabs, "
+        "energetic club atmosphere, clean dance mix",
+    "Ambient": "ambient atmospheric music, slow evolving warm synth pads, ethereal textures, "
+        "gentle reverb-soaked tones, deep sustained drones, calm and meditative, "
+        "spacious and immersive, no drums",
+    "Synthwave": "retro 80s synthwave, 110 BPM, pulsing analog bass arpeggios, "
+        "lush gated-reverb drums, bright nostalgic lead synth, warm pads, neon night-drive mood, "
+        "vintage chorus, cinematic and dreamy",
+    "Acoustic": "intimate acoustic guitar instrumental, gentle fingerpicked steel-string, "
+        "warm natural tone, soft brushed percussion, subtle upright bass, "
+        "cozy coffee-shop indie folk, heartfelt and organic, close-miked",
+    "Drill": "UK drill beat, 142 BPM, sliding aggressive 808 bass, "
+        "syncopated skippy hi-hats, hard snares, dark ominous piano melody, "
+        "gritty street atmosphere, hard-hitting modern mix",
+    "Jazz": "smooth late-night jazz, warm walking upright bass, soft brushed drums, "
+        "expressive tenor saxophone melody, mellow electric piano comping, "
+        "relaxed swing groove, intimate lounge mood, vinyl warmth",
+    "Phonk": "phonk beat, 130 BPM, distorted cowbell melody, heavy memphis 808 bass, "
+        "aggressive crunchy drums, dark vintage vocal chops, drift-night mood, "
+        "lo-fi grit, hard-hitting",
 }
 
 MOODS = ["energetic", "chill", "dark", "happy", "epic", "dreamy", "aggressive",
@@ -668,9 +691,11 @@ def build():
                                 rand_btn = gr.Button("🎲 Random")
 
                         with gr.Row():
-                            duration = gr.Slider(3, 20, value=8, step=1, label="Duration (s)")
-                            guidance = gr.Slider(1, 10, value=3, step=0.5, label="Guidance")
-                            temperature = gr.Slider(0.3, 1.5, value=1.0, step=0.05,
+                            duration = gr.Slider(3, 30, value=15, step=1,
+                                label="Duration (s) — longer = more structure")
+                            guidance = gr.Slider(1, 10, value=4.5, step=0.5,
+                                label="Guidance — higher follows prompt")
+                            temperature = gr.Slider(0.3, 1.5, value=0.95, step=0.05,
                                                     label="Temperature")
 
                         with gr.Accordion("🎚 Post-processing", open=False):
@@ -686,8 +711,8 @@ def build():
                                 speed = gr.Slider(0.5, 2.0, 1.0, step=0.05, label="Speed")
 
                         with gr.Row():
-                            model_size = gr.Radio(["small", "medium"], value="small",
-                                label="Model (medium = better, heavier)")
+                            model_size = gr.Radio(["small", "medium", "large"], value="medium",
+                                label="Model — small=fast · medium=good · large=best (slow)")
                             seed_in = gr.Textbox(label="Seed (-1 = random)", value="-1", scale=1)
                         with gr.Row():
                             collection = gr.Textbox(label="Save to collection",
@@ -785,7 +810,7 @@ def build():
                     placeholder="lofi study beat, piano\ndark trap, 808\ncinematic epic strings")
                 with gr.Row():
                     b_duration = gr.Slider(3, 20, 8, step=1, label="Duration each (s)")
-                    b_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    b_model = gr.Radio(["small", "medium", "large"], value="medium", label="Model")
                     b_guidance = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
                 batch_btn = gr.Button("⚡ Generate all", variant="primary", size="lg")
                 batch_status = gr.Markdown()
@@ -804,7 +829,7 @@ def build():
                     s_v_melody = gr.Slider(0, 1, 0.65, step=0.05, label="Vol", scale=0)
                 with gr.Row():
                     s_dur = gr.Slider(3, 20, 8, step=1, label="Duration (s)")
-                    s_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    s_model = gr.Radio(["small", "medium", "large"], value="medium", label="Model")
                     s_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
                     s_coll = gr.Textbox(label="Collection", value="Stems", scale=1)
                 stems_btn = gr.Button("🎚 Generate & mix", variant="primary", size="lg")
@@ -819,7 +844,7 @@ def build():
                     placeholder="lofi hip hop, warm rhodes, vinyl crackle")
                 with gr.Row():
                     mel_dur = gr.Slider(3, 20, 8, step=1, label="Duration (s)")
-                    mel_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    mel_model = gr.Radio(["small", "medium", "large"], value="medium", label="Model")
                     mel_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
                     mel_coll = gr.Textbox(label="Collection", value="Melody", scale=1)
                 mel_btn = gr.Button("🎹 Restyle melody", variant="primary", size="lg")
@@ -839,7 +864,7 @@ def build():
                         label="Mode  (restyle = same vibe + your prompt · continue = extend it)")
                 with gr.Row():
                     ref_dur = gr.Slider(3, 20, 8, step=1, label="Duration (s)")
-                    ref_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    ref_model = gr.Radio(["small", "medium", "large"], value="medium", label="Model")
                     ref_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
                     ref_coll = gr.Textbox(label="Collection", value="Inspired", scale=1)
                 ref_btn = gr.Button("💿 Generate from reference", variant="primary", size="lg")
@@ -858,7 +883,7 @@ def build():
                         label="Blend  (smart = match the track · simple = overlay)")
                     al_vol = gr.Slider(0, 1, 0.7, step=0.05, label="Layer volume")
                 with gr.Row():
-                    al_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    al_model = gr.Radio(["small", "medium", "large"], value="medium", label="Model")
                     al_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
                     al_coll = gr.Textbox(label="Collection", value="Layered", scale=1)
                 al_btn = gr.Button("➕ Add layer", variant="primary", size="lg")
