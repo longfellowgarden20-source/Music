@@ -35,6 +35,25 @@ PALETTES = {
     "synthwave": ("#ec4899", "#8b5cff"),
     "acoustic":  ("#d97706", "#facc15"),
     "jazz":      ("#8b5cff", "#22d3ee"),
+    "techno":    ("#64748b", "#22d3ee"),
+    "trance":    ("#3b82f6", "#a78bfa"),
+    "dubstep":   ("#10b981", "#facc15"),
+    "metal":     ("#6b7280", "#ef4444"),
+    "rock":      ("#ef4444", "#f59e0b"),
+    "funk":      ("#f59e0b", "#ec4899"),
+    "reggae":    ("#22c55e", "#facc15"),
+    "horror":    ("#7f1d1d", "#1f2937"),
+    "fantasy":   ("#8b5cff", "#facc15"),
+    "latin":     ("#f97316", "#ef4444"),
+    "afrobeat":  ("#f59e0b", "#22c55e"),
+    "reggaeton": ("#f97316", "#ec4899"),
+    "k-pop":     ("#ec4899", "#22d3ee"),
+    "8-bit":     ("#22c55e", "#3b82f6"),
+    "chiptune":  ("#22c55e", "#3b82f6"),
+    "soul":      ("#a16207", "#f59e0b"),
+    "r&b":       ("#a16207", "#f59e0b"),
+    "blues":     ("#1e3a8a", "#3b82f6"),
+    "country":   ("#d97706", "#facc15"),
 }
 
 
@@ -170,41 +189,67 @@ input[type=range]{ accent-color:var(--accent)!important; }
 footer { display:none!important; }
 """
 
-# Production-grade prompt templates. MusicGen responds best to: genre + tempo +
-# specific instruments + production descriptors + mood. These are tuned to sound
-# good, not just be short tags.
-GENRES = {
-    "Lofi Hip Hop": "lofi hip hop instrumental, 72 BPM, warm Rhodes electric piano chords, "
-        "soft dusty boom-bap drums, deep round sub bass, mellow jazzy harmony, vinyl crackle, "
-        "tape saturation, relaxed late-night mood, professionally mixed",
-    "Dark Trap": "dark trap beat, 140 BPM, booming distorted 808 bass with glide, "
-        "fast crisp hi-hat rolls, punchy snare on the offbeat, eerie minor-key bell melody, "
-        "atmospheric pads, hard aggressive mood, clean modern mix",
-    "Cinematic": "epic cinematic orchestral score, sweeping legato strings, powerful brass swells, "
-        "thunderous taiko and timpani drums, soaring melodic theme, building tension to a climax, "
-        "wide reverb, emotional and heroic, film trailer quality",
-    "House": "upbeat house track, 124 BPM, punchy four-on-the-floor kick, crisp claps and hats, "
-        "deep groovy bassline, warm analog synth chords, uplifting piano stabs, "
-        "energetic club atmosphere, clean dance mix",
-    "Ambient": "ambient atmospheric music, slow evolving warm synth pads, ethereal textures, "
-        "gentle reverb-soaked tones, deep sustained drones, calm and meditative, "
-        "spacious and immersive, no drums",
-    "Synthwave": "retro 80s synthwave, 110 BPM, pulsing analog bass arpeggios, "
-        "lush gated-reverb drums, bright nostalgic lead synth, warm pads, neon night-drive mood, "
-        "vintage chorus, cinematic and dreamy",
-    "Acoustic": "intimate acoustic guitar instrumental, gentle fingerpicked steel-string, "
-        "warm natural tone, soft brushed percussion, subtle upright bass, "
-        "cozy coffee-shop indie folk, heartfelt and organic, close-miked",
-    "Drill": "UK drill beat, 142 BPM, sliding aggressive 808 bass, "
-        "syncopated skippy hi-hats, hard snares, dark ominous piano melody, "
-        "gritty street atmosphere, hard-hitting modern mix",
-    "Jazz": "smooth late-night jazz, warm walking upright bass, soft brushed drums, "
-        "expressive tenor saxophone melody, mellow electric piano comping, "
-        "relaxed swing groove, intimate lounge mood, vinyl warmth",
-    "Phonk": "phonk beat, 130 BPM, distorted cowbell melody, heavy memphis 808 bass, "
-        "aggressive crunchy drums, dark vintage vocal chops, drift-night mood, "
-        "lo-fi grit, hard-hitting",
+# Production-grade prompt templates, grouped by category. MusicGen responds best
+# to: genre + tempo + specific instruments + production descriptors + mood.
+GENRE_GROUPS = {
+    "Hip-Hop / Trap": {
+        "Lofi Hip Hop": "lofi hip hop instrumental, 72 BPM, warm Rhodes electric piano chords, soft dusty boom-bap drums, deep round sub bass, mellow jazzy harmony, vinyl crackle, tape saturation, relaxed late-night mood, professionally mixed",
+        "Boom Bap": "classic boom bap hip hop, 90 BPM, hard punchy kick and snare, dusty soul sample chops, deep upright bass, scratches, 90s golden-era vibe, gritty and warm",
+        "Trap": "modern trap beat, 140 BPM, booming 808 bass with glide, fast crisp hi-hat rolls, punchy snares, catchy bell melody, atmospheric pads, hard club mix",
+        "Dark Trap": "dark trap beat, 140 BPM, distorted aggressive 808, eerie minor-key bells, fast hi-hat triplets, ominous pads, menacing and hard, clean modern mix",
+        "Drill": "UK drill beat, 142 BPM, sliding aggressive 808 bass, syncopated skippy hi-hats, hard snares, dark ominous piano melody, gritty street atmosphere",
+        "Phonk": "phonk beat, 130 BPM, distorted cowbell melody, heavy memphis 808 bass, aggressive crunchy drums, dark vintage vocal chops, drift-night mood, lo-fi grit",
+        "Cloud Rap": "cloud rap beat, 130 BPM, dreamy ethereal synth pads, hazy reverb, soft 808s, atmospheric and spacey, melancholic and floaty",
+        "Old School": "old school 80s hip hop, 105 BPM, funky breakbeat drums, electro synth bass, vocoder stabs, turntable scratches, fun and bouncy",
+    },
+    "Electronic / Dance": {
+        "House": "upbeat house track, 124 BPM, punchy four-on-the-floor kick, crisp claps, deep groovy bassline, warm analog synth chords, uplifting piano stabs, energetic club mix",
+        "Deep House": "deep house, 122 BPM, smooth rolling sub bass, soft chord stabs, warm pads, shuffled hats, late-night groove, hypnotic and classy",
+        "Techno": "driving techno, 130 BPM, relentless pounding kick, dark hypnotic synth stabs, industrial percussion, rumbling bass, warehouse energy, hypnotic",
+        "Trance": "uplifting trance, 138 BPM, euphoric supersaw lead, rolling bassline, big emotional breakdown, shimmering arpeggios, festival energy",
+        "Dubstep": "heavy dubstep, 140 BPM, massive wobble bass drops, aggressive growls, half-time drums, glitchy effects, hard and intense",
+        "Drum and Bass": "drum and bass, 174 BPM, fast breakbeat amen drums, deep rolling reese bass, atmospheric pads, energetic and driving",
+        "EDM": "festival EDM, 128 BPM, huge supersaw drop, punchy kick, big build-up, anthemic lead, hands-up energy, massive and bright",
+        "Future Bass": "future bass, 150 BPM, lush detuned supersaw chords, pitched vocal chops, punchy drums, emotional and colorful, melodic drop",
+        "Synthwave": "retro 80s synthwave, 110 BPM, pulsing analog bass arpeggios, lush gated-reverb drums, bright nostalgic lead synth, neon night-drive mood, vintage chorus",
+        "Lo-fi House": "lo-fi house, 120 BPM, dusty filtered chords, bouncy kick, vinyl noise, mellow groovy bassline, warm nostalgic vibe",
+    },
+    "Band / Live": {
+        "Rock": "energetic rock, 120 BPM, driving distorted electric guitar riffs, punchy live drums, melodic bass, powerful and anthemic, full band mix",
+        "Indie Rock": "indie rock, 118 BPM, jangly clean guitars, steady drums, warm bass, catchy and laid-back, slightly lo-fi, heartfelt",
+        "Metal": "heavy metal, 140 BPM, palm-muted distorted guitars, double-kick drums, aggressive riffing, dark and powerful, tight mix",
+        "Punk": "fast punk rock, 170 BPM, raw distorted power chords, frantic drums, energetic and rebellious, garage-band rawness",
+        "Funk": "funky groove, 105 BPM, slap bass, tight wah guitar, punchy horns, syncopated drums, soulful and danceable",
+        "Blues": "slow blues, 70 BPM, expressive electric guitar bends, walking bass, brushed drums, soulful organ, smoky bar mood",
+        "Reggae": "classic reggae, 80 BPM, offbeat guitar skank, deep dub bassline, laid-back drums, warm organ, sunny island groove",
+        "Country": "modern country, 110 BPM, bright acoustic guitar, pedal steel, steady drums, warm bass, heartfelt and wholesome",
+    },
+    "Chill / Acoustic": {
+        "Acoustic": "intimate acoustic guitar instrumental, gentle fingerpicked steel-string, warm natural tone, soft brushed percussion, subtle upright bass, cozy indie folk, heartfelt",
+        "Ambient": "ambient atmospheric music, slow evolving warm synth pads, ethereal textures, gentle reverb, deep sustained drones, calm meditative, spacious, no drums",
+        "Chillhop": "chillhop, 85 BPM, jazzy guitar licks, mellow keys, soft boom-bap drums, warm bass, relaxed study vibe, smooth and cozy",
+        "Jazz": "smooth late-night jazz, warm walking upright bass, soft brushed drums, expressive tenor saxophone, mellow electric piano, relaxed swing, lounge mood",
+        "Bossa Nova": "bossa nova, 110 BPM, soft nylon guitar, gentle shaker, smooth upright bass, mellow and warm, breezy Brazilian groove",
+        "Soul / R&B": "smooth R&B soul, 90 BPM, warm electric piano, silky bass, soft trap-soul drums, lush chords, romantic and intimate",
+        "Meditation": "calming meditation music, soft drones, gentle singing bowls, airy pads, nature ambience, deeply peaceful and slow",
+        "Piano": "solo emotional piano, expressive grand piano, gentle dynamics, reflective melody, intimate and cinematic, close-miked",
+    },
+    "Cinematic / World": {
+        "Cinematic Epic": "epic cinematic orchestral score, sweeping legato strings, powerful brass swells, thunderous taiko drums, soaring theme, building to a climax, trailer quality",
+        "Cinematic Sad": "emotional cinematic score, delicate solo piano, soft sustained strings, melancholic and tender, slow and moving, film-score quality",
+        "Horror": "dark horror score, dissonant strings, eerie drones, sudden stingers, unsettling atmosphere, tense and creepy",
+        "Fantasy": "epic fantasy orchestral, heroic French horns, lush strings, choir, adventurous and majestic, grand and uplifting",
+        "Orchestral": "classical orchestral piece, full symphony, elegant strings and woodwinds, dynamic and expressive, refined concert-hall sound",
+        "Latin": "latin music, 100 BPM, lively brass section, congas and timbales, montuno piano, upbeat and danceable, festive",
+        "Afrobeat": "afrobeat, 110 BPM, syncopated percussion, groovy bass, bright guitar, horn stabs, infectious and energetic",
+        "Reggaeton": "reggaeton, 95 BPM, dembow rhythm, punchy kick and snare, deep bass, catchy synth melody, club-ready latin groove",
+        "K-Pop": "k-pop, 120 BPM, bright punchy synths, energetic drums, catchy hook, polished and colorful, danceable",
+        "8-Bit Chiptune": "8-bit chiptune, 140 BPM, retro square-wave melodies, arpeggiated bass, NES-style percussion, playful and nostalgic video-game music",
+    },
 }
+
+# Flat dict for lookups (build_prompt, presets, palette).
+GENRES = {name: prompt for grp in GENRE_GROUPS.values() for name, prompt in grp.items()}
 
 MOODS = ["energetic", "chill", "dark", "happy", "epic", "dreamy", "aggressive",
          "nostalgic", "romantic", "tense", "uplifting", "melancholic"]
@@ -718,17 +763,26 @@ def build():
                             placeholder="vocals, distortion")
 
                         with gr.Accordion("✨ Prompt Builder", open=False):
-                            # Radio instead of Dropdown — always visible, one-click,
-                            # no flaky hidden list to fight with.
+                            # Category first, then the genres within it — keeps ~46
+                            # genres browsable instead of one giant wall of buttons.
+                            _cats = list(GENRE_GROUPS.keys())
+                            genre_cat = gr.Radio(_cats, value=_cats[0], label="Category")
                             genre = gr.Radio(
-                                choices=list(GENRES.keys()),
-                                value="Lofi Hip Hop", label="Genre")
+                                choices=list(GENRE_GROUPS[_cats[0]].keys()),
+                                value=list(GENRE_GROUPS[_cats[0]].keys())[0],
+                                label="Genre")
                             bpm_text = gr.Textbox(label="BPM", placeholder="120")
                             moods = gr.CheckboxGroup(MOODS, label="Moods")
                             instruments = gr.CheckboxGroup(INSTRUMENTS, label="Instruments")
                             with gr.Row():
                                 build_btn = gr.Button("Build prompt →")
                                 rand_btn = gr.Button("🎲 Random")
+
+                            # switching category repopulates the genre choices
+                            def _on_cat(cat):
+                                names = list(GENRE_GROUPS[cat].keys())
+                                return gr.update(choices=names, value=names[0])
+                            genre_cat.change(_on_cat, genre_cat, genre)
 
                         with gr.Row():
                             duration = gr.Slider(3, 30, value=15, step=1,
@@ -788,15 +842,15 @@ def build():
                             add_bass = gr.Button("🎸 + Bass", size="sm")
                             add_keys = gr.Button("🎹 + Keys", size="sm")
                             add_hats = gr.Button("🎵 + Hi-hats", size="sm")
-                        gr.HTML("<div class='preset-label'>Quick presets</div>")
-                        with gr.Row():
-                            for name in list(GENRES.keys())[:5]:
-                                gr.Button(name, size="sm").click(
-                                    lambda n=name: GENRES[n], outputs=prompt)
-                        with gr.Row():
-                            for name in list(GENRES.keys())[5:10]:
-                                gr.Button(name, size="sm").click(
-                                    lambda n=name: GENRES[n], outputs=prompt)
+                        gr.HTML("<div class='preset-label'>Popular presets (full list in Prompt Builder)</div>")
+                        _popular = ["Lofi Hip Hop", "Trap", "House", "Cinematic Epic",
+                                    "Synthwave", "Rock", "Jazz", "Drill", "Ambient",
+                                    "Reggaeton", "Future Bass", "Phonk"]
+                        for chunk_start in range(0, len(_popular), 4):
+                            with gr.Row():
+                                for name in _popular[chunk_start:chunk_start + 4]:
+                                    gr.Button(name, size="sm").click(
+                                        lambda n=name: GENRES[n], outputs=prompt)
                         suggest_btn = gr.Button("🧠 Suggest from my favorites", size="sm")
                         suggest_out = gr.Markdown()
 
