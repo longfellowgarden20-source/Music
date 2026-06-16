@@ -693,6 +693,12 @@ def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
     return t["id"], path, detail, _version_history_md(t)
 
 
+def do_recover():
+    """Re-import any audio files that lost their library entry."""
+    n = library.recover_orphans()
+    return refresh_library(), _stats_html()
+
+
 def toggle_fav(track_id):
     t = library.get_track(int(track_id))
     if t:
@@ -958,7 +964,9 @@ def build():
                     sort = gr.Dropdown(["newest", "oldest", "rating", "plays", "title"],
                         value="newest", label="Sort", scale=1)
                     favs = gr.Checkbox(False, label="★ Favorites only")
-                refresh_btn = gr.Button("↻ Refresh")
+                with gr.Row():
+                    refresh_btn = gr.Button("↻ Refresh")
+                    recover_btn = gr.Button("🔧 Recover lost tracks")
 
                 gr.HTML("<div class='preset-label'>👆 Click any track below to select &amp; play it</div>")
                 lib = gr.Dataframe(headers=LIB_HEADERS, datatype="str",
@@ -982,6 +990,7 @@ def build():
 
                 def _refresh(s, f, c, so): return refresh_library(s, f, c, so)
                 refresh_btn.click(_refresh, [search, favs, coll_filter, sort], lib)
+                recover_btn.click(do_recover, outputs=[lib, stats])
                 search.submit(_refresh, [search, favs, coll_filter, sort], lib)
                 favs.change(_refresh, [search, favs, coll_filter, sort], lib)
                 coll_filter.change(_refresh, [search, favs, coll_filter, sort], lib)

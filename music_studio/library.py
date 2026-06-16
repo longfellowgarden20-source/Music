@@ -14,7 +14,12 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-DB_PATH = "music_output/music_library.db"
+# Real library by default. Set MUSIC_STUDIO_TEST_DB=1 to use a throwaway DB
+# so automated tests can NEVER touch your actual saved tracks.
+if os.environ.get("MUSIC_STUDIO_TEST_DB"):
+    DB_PATH = "music_output/_test_library.db"
+else:
+    DB_PATH = "music_output/music_library.db"
 AUDIO_DIR = "music_output"
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
@@ -203,6 +208,38 @@ def stats() -> dict:
         plays = c.execute("select coalesce(sum(play_count),0) n from tracks").fetchone()["n"]
         dur = c.execute("select coalesce(sum(duration),0) n from tracks").fetchone()["n"]
     return {"total": total, "favorites": favs, "plays": plays, "total_seconds": dur}
+
+
+def recover_orphans(audio_dir: str = AUDIO_DIR) -> int:
+    """Re-import any .wav in the output folder that has no DB row.
+    Rescues tracks whose metadata was lost. Skips stem_/_cover/_wave helpers."""
+    import soundfile as sf
+    with _lock, _conn() as c:
+        known = {r["filepath"] for r in c.execute("select filepath from tracks")}
+    recovered = 0
+    for fn in sorted(os.listdir(audio_dir)):
+        if not fn.endswith(".wav"):
+            continue
+        if fn.startswith("stem_") or "_test" in fn:
+            continue
+        path = os.path.join(audio_dir, fn)
+        if path in known:
+            continue
+        try:
+            info = sf.info(path)
+            dur = info.frames / info.samplerate
+            sr = info.samplerate
+        except Exception:
+            dur, sr = 0, 32000
+        # derive a title from the filename (strip timestamp prefix)
+        title = fn.rsplit(".", 1)[0]
+        parts = title.split("_", 3)
+        nice = parts[3].replace("_", " ") if len(parts) > 3 else title
+        add_track(title=nice[:60], prompt=nice, duration=dur, model="recovered",
+                  guidance=0, seed=0, filepath=path, sample_rate=sr,
+                  collection="Recovered")
+        recovered += 1
+    return recovered
 
 
 # ── Optional Supabase sync ───────────────────────────────────────────────────────
