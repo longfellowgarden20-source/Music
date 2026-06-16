@@ -1,0 +1,933 @@
+"""
+AI Music Studio — pro UI (Gradio).
+
+Run:  ./music_env/bin/python -m music_studio.app
+Opens a dark, studio-style interface at http://localhost:7860
+
+Tabs:
+  Studio   — generate, post-process, analyze, save (with all controls)
+  Library  — every track ever made: search, filter, favorite, rate, tag, delete
+  Batch    — queue many prompts, generate them in sequence
+  Settings — model, output info, Supabase sync toggle
+"""
+from __future__ import annotations
+import os
+import random
+import gradio as gr
+
+# allow running both as module and as a script
+try:
+    from . import engine, library, extras
+except ImportError:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from music_studio import engine, library, extras
+
+# [#10] genre/keyword -> accent palette for dynamic theming
+PALETTES = {
+    "lofi":      ("#a78bfa", "#f0abfc"),
+    "trap":      ("#ef4444", "#f59e0b"),
+    "drill":     ("#dc2626", "#7c3aed"),
+    "phonk":     ("#b91c1c", "#1f2937"),
+    "cinematic": ("#f59e0b", "#fbbf24"),
+    "house":     ("#22d3ee", "#06b6d4"),
+    "ambient":   ("#34d399", "#5eead4"),
+    "synthwave": ("#ec4899", "#8b5cff"),
+    "acoustic":  ("#d97706", "#facc15"),
+    "jazz":      ("#8b5cff", "#22d3ee"),
+}
+
+
+def palette_for(prompt: str) -> tuple[str, str]:
+    p = (prompt or "").lower()
+    for key, pal in PALETTES.items():
+        if key in p:
+            return pal
+    return ("#8b5cff", "#22d3ee")  # default
+
+# ── Theme / CSS ─────────────────────────────────────────────────────────────────
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root, .dark {
+  --bg-0:#070710; --bg-1:#0e0e1a; --bg-2:#15151f; --bg-3:#1c1c2b;
+  --line:#26263a; --line-2:#33334d;
+  --accent:#8b5cff; --accent-2:#22d3ee; --accent-3:#f472b6;
+  --text:#edeef5; --muted:#9494b0; --muted-2:#6b6b85;
+  --glow:rgba(139,92,255,.35);
+}
+* { font-family:'Inter',system-ui,sans-serif!important; }
+.gradio-container { background:var(--bg-0)!important; max-width:1500px!important;
+  margin:0 auto!important; }
+body { background:
+  radial-gradient(900px 500px at 12% -5%, rgba(139,92,255,.10), transparent 60%),
+  radial-gradient(800px 500px at 95% 0%, rgba(34,211,238,.08), transparent 55%),
+  var(--bg-0)!important; }
+
+/* ── Hero ─────────────────────────────────────────── */
+#hero {
+  position:relative; overflow:hidden;
+  background:linear-gradient(120deg,#141026 0%,#1a0f33 45%,#0a1c28 100%);
+  border:1px solid var(--line-2); border-radius:20px; padding:28px 32px; margin-bottom:14px;
+  box-shadow:0 8px 40px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.04);
+}
+#hero::before {
+  content:''; position:absolute; inset:0; opacity:.5;
+  background:linear-gradient(90deg,transparent,rgba(139,92,255,.18),rgba(34,211,238,.14),transparent);
+  background-size:200% 100%; animation:shimmer 6s linear infinite;
+}
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+#hero h1 { position:relative; font-family:'Space Grotesk',sans-serif!important;
+  font-size:36px; font-weight:700; margin:0; letter-spacing:-1px;
+  background:linear-gradient(92deg,#c4b0ff 0%,#a78bfa 35%,#22d3ee 100%);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+#hero p { position:relative; color:#b8b8d0; margin:8px 0 0; font-size:13.5px; font-weight:400; }
+.eq { display:inline-flex; gap:3px; align-items:flex-end; height:22px; margin-left:14px;
+  vertical-align:middle; }
+.eq span { width:3px; background:linear-gradient(180deg,#22d3ee,#8b5cff); border-radius:3px;
+  animation:eq 1.1s ease-in-out infinite; }
+.eq span:nth-child(1){height:40%;animation-delay:0s}
+.eq span:nth-child(2){height:90%;animation-delay:.15s}
+.eq span:nth-child(3){height:60%;animation-delay:.3s}
+.eq span:nth-child(4){height:100%;animation-delay:.45s}
+.eq span:nth-child(5){height:50%;animation-delay:.6s}
+@keyframes eq { 0%,100%{transform:scaleY(.4)} 50%{transform:scaleY(1)} }
+
+/* ── Panels / cards ──────────────────────────────── */
+.block, .form, .panel, .gr-box, .gr-group {
+  background:rgba(20,20,32,.7)!important; backdrop-filter:blur(10px);
+  border:1px solid var(--line)!important; border-radius:16px!important; }
+.gr-accordion { border-radius:14px!important; border-color:var(--line)!important; }
+
+/* ── Buttons ─────────────────────────────────────── */
+button { border-radius:11px!important; transition:all .18s ease!important;
+  font-weight:600!important; }
+.gr-button-primary, button.primary, button.lg {
+  background:linear-gradient(95deg,#8b5cff,#a16bff 50%,#22d3ee)!important;
+  background-size:160% 100%!important; border:none!important; color:#fff!important;
+  font-weight:700!important; letter-spacing:.3px; box-shadow:0 4px 20px var(--glow)!important; }
+.gr-button-primary:hover, button.primary:hover {
+  background-position:100% 0!important; transform:translateY(-1px);
+  box-shadow:0 6px 28px var(--glow)!important; }
+.gr-button-secondary, button.secondary {
+  background:var(--bg-3)!important; border:1px solid var(--line-2)!important;
+  color:var(--text)!important; }
+.gr-button-secondary:hover { border-color:var(--accent)!important;
+  color:#fff!important; transform:translateY(-1px); }
+button.stop { background:linear-gradient(95deg,#ef4444,#f87171)!important;
+  border:none!important; color:#fff!important; }
+
+/* ── Inputs ──────────────────────────────────────── */
+label span { color:var(--text)!important; font-weight:600!important; font-size:13px!important; }
+input, textarea, select, .gr-input {
+  background:var(--bg-2)!important; color:var(--text)!important;
+  border:1px solid var(--line)!important; border-radius:10px!important; }
+input:focus, textarea:focus { border-color:var(--accent)!important;
+  box-shadow:0 0 0 3px rgba(139,92,255,.18)!important; }
+input[type=range]{ accent-color:var(--accent)!important; }
+
+/* ── Tabs ────────────────────────────────────────── */
+.tab-nav button { font-size:14px!important; font-weight:600!important;
+  color:var(--muted)!important; border:none!important; background:transparent!important; }
+.tab-nav button.selected { color:#fff!important;
+  border-bottom:2px solid var(--accent)!important; }
+.tabitem { background:transparent!important; padding-top:14px!important; }
+
+/* ── Stat bar ────────────────────────────────────── */
+#statbar { display:flex; gap:12px; margin:4px 0 10px; }
+.statcard { flex:1; position:relative; overflow:hidden;
+  background:linear-gradient(145deg,rgba(28,28,43,.85),rgba(14,14,26,.85));
+  border:1px solid var(--line); border-radius:14px; padding:14px 18px;
+  transition:transform .2s ease, border-color .2s ease; }
+.statcard:hover { transform:translateY(-2px); border-color:var(--accent); }
+.statcard::after { content:''; position:absolute; top:0; left:0; right:0; height:2px;
+  background:linear-gradient(90deg,#8b5cff,#22d3ee); opacity:.7; }
+.statcard .n { font-family:'Space Grotesk',sans-serif!important; font-size:26px;
+  font-weight:700; background:linear-gradient(90deg,#c4b0ff,#22d3ee);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent; line-height:1.1; }
+.statcard .l { font-size:10.5px; color:var(--muted); text-transform:uppercase;
+  letter-spacing:1.5px; margin-top:3px; font-weight:600; }
+
+/* ── Audio player ────────────────────────────────── */
+.gr-audio, [data-testid='waveform'] { border-radius:14px!important; }
+
+/* ── Dataframe ───────────────────────────────────── */
+.gr-dataframe table { font-size:13px!important; }
+.gr-dataframe thead th { background:var(--bg-3)!important; color:var(--accent-2)!important;
+  text-transform:uppercase; font-size:10.5px!important; letter-spacing:1px; }
+.gr-dataframe tbody tr:hover { background:rgba(139,92,255,.08)!important; }
+
+/* ── Preset chips row ────────────────────────────── */
+.preset-label { color:var(--muted); font-size:11px; text-transform:uppercase;
+  letter-spacing:1.5px; font-weight:600; margin:8px 0 2px; }
+
+/* ── Scrollbar ───────────────────────────────────── */
+::-webkit-scrollbar { width:10px; height:10px; }
+::-webkit-scrollbar-track { background:var(--bg-0); }
+::-webkit-scrollbar-thumb { background:var(--line-2); border-radius:6px; }
+::-webkit-scrollbar-thumb:hover { background:var(--accent); }
+
+footer { display:none!important; }
+"""
+
+GENRES = {
+    "Lofi Hip Hop": "lofi hip hop, mellow boom-bap drums, warm rhodes piano, vinyl crackle, rainy mood",
+    "Dark Trap": "dark trap beat, hard 808 bass, crisp hi-hats, eerie bells, moody and aggressive",
+    "Cinematic": "epic cinematic orchestral, soaring strings, big drums, rising tension, film score",
+    "House": "upbeat house music, four-on-the-floor, driving bassline, energetic, club ready",
+    "Ambient": "ambient soundscape, soft evolving pads, ethereal, peaceful, meditative",
+    "Synthwave": "retro synthwave, analog synths, gated reverb drums, neon 80s nostalgia",
+    "Acoustic": "warm acoustic guitar, intimate, coffee shop, indie folk, fingerpicked",
+    "Drill": "UK drill beat, sliding 808s, dark piano melody, hard percussion",
+    "Jazz": "smooth jazz, upright bass, brushed drums, saxophone, late night lounge",
+    "Phonk": "phonk, distorted 808 cowbell, memphis vocal chops, aggressive, drift mood",
+}
+
+MOODS = ["energetic", "chill", "dark", "happy", "epic", "dreamy", "aggressive",
+         "nostalgic", "romantic", "tense", "uplifting", "melancholic"]
+INSTRUMENTS = ["piano", "guitar", "808 bass", "strings", "synth pads", "saxophone",
+               "drums", "flute", "bells", "vinyl crackle", "choir", "violin"]
+
+
+# ── Generation handler ────────────────────────────────────────────────────────────
+def do_generate(prompt, negative, duration, model_size, guidance, temperature,
+                seed_in, do_normalize, fade_in, fade_out, do_loop, do_trim,
+                pitch, speed, mp3, auto_analyze, collection,
+                progress=gr.Progress(track_tqdm=True)):
+    if not prompt or not prompt.strip():
+        return None, "⚠️ Enter a prompt.", _stats_html(), gr.update()
+
+    progress(0.05, desc="Loading model…")
+    try:
+        seed = int(seed_in) if str(seed_in).strip() not in ("", "-1") else None
+    except ValueError:
+        seed = None
+
+    progress(0.2, desc="Generating audio…")
+    sr, audio, used_seed = engine.generate(
+        prompt=prompt, negative=negative, duration=duration, model_size=model_size,
+        guidance=guidance, temperature=temperature, seed=seed)
+
+    progress(0.7, desc="Post-processing…")
+    if do_trim:
+        audio = engine.trim_silence(audio)
+    if pitch and pitch != 0:
+        audio = engine.pitch_shift(audio, sr, pitch)
+    if speed and speed != 1.0:
+        sr, audio = engine.change_speed(audio, sr, speed)
+    if do_loop:
+        audio = engine.make_loop(audio, sr)
+    if do_normalize:
+        audio = engine.normalize(audio)
+    if fade_in or fade_out:
+        audio = engine.fade(audio, sr, fade_in, fade_out)
+
+    analysis = {"bpm": None, "key": None}
+    if auto_analyze:
+        progress(0.85, desc="Analyzing BPM + key…")
+        analysis = engine.analyze(audio, sr)
+
+    progress(0.92, desc="Saving + art…")
+    path = engine.save_wav(audio, sr, prompt)
+    mp3_path = engine.export_mp3(path) if mp3 else None
+
+    pal = palette_for(prompt)
+    base = os.path.splitext(path)[0]
+    wf_path = cv_path = None
+    try:
+        wf_path = engine.waveform_png(audio, sr, base + "_wave.png", pal[0], pal[1])
+    except Exception as e:
+        print(f"[ui] waveform failed: {e}")
+    try:
+        cv_path = engine.cover_art(prompt, base + "_cover.png",
+                                   bpm=analysis["bpm"], key=analysis["key"], palette=pal)
+    except Exception as e:
+        print(f"[ui] cover failed: {e}")
+
+    track_id = library.add_track(
+        title=prompt[:60], prompt=prompt, negative=negative, duration=duration,
+        model=model_size, guidance=guidance, temperature=temperature, seed=used_seed,
+        filepath=path, waveform_path=wf_path or "", cover_path=cv_path or "",
+        sample_rate=sr, bpm=analysis["bpm"],
+        musical_key=analysis["key"], collection=collection or "All Tracks")
+
+    try:
+        library.sync_to_supabase(track_id)
+    except Exception:
+        pass
+
+    info = (f"✅ **Saved** · #{track_id} · seed `{used_seed}`"
+            + (f" · {analysis['bpm']} BPM · key {analysis['key']}" if analysis['bpm'] else "")
+            + (f" · MP3 ✓" if mp3_path else ""))
+    theme_html = _theme_accent(pal)
+    return ((sr, audio), info, _stats_html(), refresh_library(),
+            cv_path, theme_html, track_id)
+
+
+def _theme_accent(pal):
+    """[#10] inject a CSS var override so accents shift to the genre palette."""
+    return f"""<style>:root,.dark{{--accent:{pal[0]}!important;
+      --accent-2:{pal[1]}!important;--glow:{pal[0]}55!important;}}</style>"""
+
+
+def _save_simple(audio, sr, prompt, collection, model="small", guidance=3, seed=None):
+    """Shared save path for variation/extend/stems results (with art)."""
+    audio = engine.normalize(audio)
+    an = engine.analyze(audio, sr)
+    path = engine.save_wav(audio, sr, prompt)
+    pal = palette_for(prompt)
+    base = os.path.splitext(path)[0]
+    wf = cv = None
+    try:
+        wf = engine.waveform_png(audio, sr, base + "_wave.png", pal[0], pal[1])
+        cv = engine.cover_art(prompt, base + "_cover.png", bpm=an["bpm"],
+                              key=an["key"], palette=pal)
+    except Exception as e:
+        print(f"[ui] art failed: {e}")
+    tid = library.add_track(title=prompt[:60], prompt=prompt,
+        duration=len(audio) / sr, model=model, guidance=guidance, seed=seed,
+        filepath=path, waveform_path=wf or "", cover_path=cv or "",
+        sample_rate=sr, bpm=an["bpm"], musical_key=an["key"],
+        collection=collection or "All Tracks")
+    try:
+        library.sync_to_supabase(tid)
+    except Exception:
+        pass
+    return tid, path, an
+
+
+# [#3] Variations — N takes of the same prompt
+def do_variations(prompt, n, duration, model_size, guidance, collection,
+                  progress=gr.Progress()):
+    if not prompt.strip():
+        return None, None, None, "Enter a prompt.", refresh_library(), _stats_html()
+    outs = []
+    takes = engine.variations(prompt, n=int(n), duration=duration,
+                              model_size=model_size, guidance=guidance)
+    for i, (sr, a, seed) in enumerate(takes):
+        progress((i + 1) / len(takes), desc=f"Variation {i+1}/{len(takes)}")
+        _save_simple(a, sr, prompt, collection, model_size, guidance, seed)
+        outs.append((sr, a))
+    outs += [None] * (3 - len(outs))  # pad to 3 audio slots
+    return (outs[0], outs[1], outs[2],
+            f"✅ {len(takes)} variations saved.", refresh_library(), _stats_html())
+
+
+# [#2] Extend an existing track
+def do_extend(track_id, prompt, add_dur, model_size, guidance, collection,
+              progress=gr.Progress()):
+    if not track_id:
+        return None, "Pick a track ID to extend.", refresh_library(), _stats_html()
+    t = library.get_track(int(track_id))
+    if not t or not os.path.exists(t["filepath"]):
+        return None, "Track not found.", refresh_library(), _stats_html()
+    import soundfile as sf
+    prior, psr = sf.read(t["filepath"])
+    if prior.ndim > 1:
+        prior = prior.mean(axis=1)
+    progress(0.3, desc="Extending…")
+    use_prompt = prompt.strip() or t["prompt"]
+    sr, combined, seed = engine.extend(use_prompt, prior.astype("float32"), psr,
+                                       add_duration=add_dur, model_size=model_size,
+                                       guidance=guidance)
+    tid, path, an = _save_simple(combined, sr, use_prompt + " (extended)",
+                                 collection, model_size, guidance, seed)
+    return (sr, combined), f"✅ Extended → new track #{tid} ({len(combined)/sr:.0f}s)", \
+           refresh_library(), _stats_html()
+
+
+# [#7] Stems mix
+def do_stems(p_drums, p_bass, p_melody, v_drums, v_bass, v_melody,
+             duration, model_size, guidance, collection, progress=gr.Progress()):
+    layers = [
+        {"prompt": p_drums, "volume": v_drums},
+        {"prompt": p_bass, "volume": v_bass},
+        {"prompt": p_melody, "volume": v_melody},
+    ]
+    progress(0.2, desc="Rendering layers…")
+    sr, mix, seeds = engine.stems_mix(layers, duration=duration,
+                                      model_size=model_size, guidance=guidance)
+    if mix is None:
+        return None, "Add at least one layer prompt.", refresh_library(), _stats_html()
+    name = "stem mix: " + ", ".join(
+        l["prompt"] for l in layers if l["prompt"].strip())[:50]
+    tid, path, an = _save_simple(mix, sr, name, collection, model_size, guidance)
+    return (sr, mix), f"✅ Mixed {len(seeds)} layers → track #{tid}", \
+           refresh_library(), _stats_html()
+
+
+# [#4] Melody-conditioned (uses extend's audio conditioning under the hood)
+def do_melody(melody_file, prompt, duration, model_size, guidance, collection,
+              progress=gr.Progress()):
+    if not melody_file:
+        return None, "Upload or record a melody first.", refresh_library(), _stats_html()
+    if not prompt.strip():
+        return None, "Describe the style to apply.", refresh_library(), _stats_html()
+    import soundfile as sf
+    mel, msr = sf.read(melody_file)
+    if mel.ndim > 1:
+        mel = mel.mean(axis=1)
+    progress(0.3, desc="Restyling melody…")
+    # condition generation on the uploaded melody
+    sr, out, seed = engine.extend(prompt, mel.astype("float32"), msr,
+                                  add_duration=duration, model_size=model_size,
+                                  guidance=guidance)
+    # keep only the newly styled portion after the melody prime
+    tid, path, an = _save_simple(out, sr, prompt + " (from melody)",
+                                 collection, model_size, guidance, seed)
+    return (sr, out), f"✅ Melody restyled → track #{tid}", \
+           refresh_library(), _stats_html()
+
+
+# [#6] Distribution export
+def do_export(track_id, platform):
+    if not track_id:
+        return None, "Pick a track ID."
+    res = extras.export_for_distribution(int(track_id), platform=platform, make_zip=True)
+    if not res["ok"]:
+        return None, f"⚠️ {res.get('error')}"
+    files = ", ".join(res["files"])
+    return res["zip"], f"✅ Exported **{res['meta']['title']}**\n\nFiles: {files}\n\nZip ready below ⬇"
+
+
+# [#8] Prompt suggestions
+def do_suggest():
+    sugg = extras.suggest_prompts(5)
+    if not sugg:
+        return "Rate or favorite some tracks (★4+) and I'll learn your taste."
+    return "**Based on your favorites:**\n\n" + "\n".join(f"- {s}" for s in sugg)
+
+
+# [NEW] Reference a song for inspiration (continue / restyle)
+def do_reference(ref_file, prompt, mode, duration, model_size, guidance, collection,
+                 progress=gr.Progress()):
+    if not ref_file:
+        return None, "Upload a reference song first.", refresh_library(), _stats_html()
+    import soundfile as sf
+    ref, rsr = sf.read(ref_file)
+    if ref.ndim > 1:
+        ref = ref.mean(axis=1)
+    progress(0.3, desc=f"Taking inspiration ({mode})…")
+    sr, out, seed = engine.reference_generate(
+        ref.astype("float32"), rsr, prompt=prompt, mode=mode, duration=duration,
+        model_size=model_size, guidance=guidance)
+    name = (prompt.strip() or "reference track") + f" ({mode})"
+    tid, path, an = _save_simple(out, sr, name, collection, model_size, guidance, seed)
+    return (sr, out), f"✅ {mode.title()} from reference → track #{tid} ({len(out)/sr:.0f}s)", \
+           refresh_library(), _stats_html()
+
+
+# [NEW] Add an instrument layer to an existing track
+def do_add_layer(track_id, instrument, blend, volume, model_size, guidance,
+                 collection, progress=gr.Progress()):
+    if not track_id:
+        return None, "Pick a track ID to add to.", refresh_library(), _stats_html()
+    if not instrument.strip():
+        return None, "Describe the instrument to add.", refresh_library(), _stats_html()
+    t = library.get_track(int(track_id))
+    if not t or not os.path.exists(t["filepath"]):
+        return None, "Track not found.", refresh_library(), _stats_html()
+    import soundfile as sf
+    base, bsr = sf.read(t["filepath"])
+    if base.ndim > 1:
+        base = base.mean(axis=1)
+    progress(0.3, desc=f"Adding {instrument} ({blend})…")
+    sr, mix, seed = engine.add_layer(base.astype("float32"), bsr, instrument,
+                                     blend=blend, volume=volume,
+                                     model_size=model_size, guidance=guidance)
+    name = f"{t['title'] or t['prompt']} + {instrument}"
+    tid, path, an = _save_simple(mix, sr, name[:60], collection, model_size, guidance, seed)
+    return (sr, mix), f"✅ Added {instrument} → new track #{tid}", \
+           refresh_library(), _stats_html()
+
+
+# quick-add buttons on the Studio tab use the last generated track
+def quick_add(track_id, instrument, model_size, guidance):
+    if not track_id:
+        return None, "Generate a track first, then add layers."
+    r = do_add_layer(track_id, instrument, "smart", 0.7, model_size, guidance, "Layered")
+    return r[0], r[1]
+
+
+# ── Library handlers ──────────────────────────────────────────────────────────────
+def refresh_library(search="", favs=False, collection="All Tracks", sort="newest"):
+    rows = library.list_tracks(search=search, favorites_only=favs,
+                               collection=collection, sort=sort)
+    data = []
+    for r in rows:
+        star = "★" if r["favorite"] else "☆"
+        rating = "●" * (r["rating"] or 0) + "○" * (5 - (r["rating"] or 0))
+        meta = []
+        if r["bpm"]:
+            meta.append(f"{r['bpm']}bpm")
+        if r["musical_key"]:
+            meta.append(r["musical_key"])
+        data.append([
+            r["id"], star, (r["title"] or r["prompt"])[:48], r["model"],
+            f"{r['duration']:.0f}s" if r["duration"] else "",
+            " ".join(meta), rating, r["created_at"][:16].replace("T", " "),
+        ])
+    return data
+
+
+def load_track_audio(track_id):
+    t = library.get_track(int(track_id))
+    if not t or not os.path.exists(t["filepath"]):
+        return None, "Track not found."
+    library.update_track(int(track_id), play_count=(t["play_count"] or 0) + 1)
+    detail = (f"**{t['title'] or t['prompt']}**\n\n"
+              f"Prompt: {t['prompt']}\n\n"
+              f"Model: {t['model']} · {t['duration']:.0f}s · guidance {t['guidance']} · "
+              f"seed `{t['seed']}`"
+              + (f" · {t['bpm']} BPM / {t['musical_key']}" if t['bpm'] else ""))
+    return t["filepath"], detail
+
+
+def toggle_fav(track_id):
+    t = library.get_track(int(track_id))
+    if t:
+        library.update_track(int(track_id), favorite=0 if t["favorite"] else 1)
+    return refresh_library()
+
+
+def set_rating(track_id, stars):
+    if track_id:
+        library.update_track(int(track_id), rating=int(stars))
+    return refresh_library()
+
+
+def del_track(track_id):
+    if track_id:
+        library.delete_track(int(track_id))
+    return refresh_library(), _stats_html()
+
+
+def add_tag(track_id, tag):
+    if not track_id or not tag.strip():
+        return refresh_library()
+    t = library.get_track(int(track_id))
+    tags = set(filter(None, (t["tags"] or "").split(",")))
+    tags.add(tag.strip())
+    library.update_track(int(track_id), tags=",".join(sorted(tags)))
+    return refresh_library()
+
+
+# ── Batch ──────────────────────────────────────────────────────────────────────
+def batch_generate(prompts_text, duration, model_size, guidance,
+                   progress=gr.Progress()):
+    prompts = [p.strip() for p in prompts_text.splitlines() if p.strip()]
+    if not prompts:
+        return "Enter one prompt per line.", refresh_library(), _stats_html()
+    done = 0
+    for i, p in enumerate(prompts):
+        progress((i + 1) / len(prompts), desc=f"[{i+1}/{len(prompts)}] {p[:40]}")
+        try:
+            sr, audio, seed = engine.generate(
+                prompt=p, duration=duration, model_size=model_size, guidance=guidance)
+            audio = engine.normalize(audio)
+            path = engine.save_wav(audio, sr, p)
+            tid = library.add_track(title=p[:60], prompt=p, duration=duration,
+                                    model=model_size, guidance=guidance, seed=seed,
+                                    filepath=path, sample_rate=sr,
+                                    collection="Batch")
+            try:
+                library.sync_to_supabase(tid)
+            except Exception:
+                pass
+            done += 1
+        except Exception as e:
+            print(f"[batch] failed '{p}': {e}")
+    return f"✅ Generated {done}/{len(prompts)} tracks.", refresh_library(), _stats_html()
+
+
+# ── Prompt builder ────────────────────────────────────────────────────────────────
+def build_prompt(genre, moods, instruments, bpm_text):
+    parts = []
+    if genre and genre in GENRES:
+        parts.append(GENRES[genre])
+    if moods:
+        parts.append(", ".join(moods))
+    if instruments:
+        parts.append("featuring " + ", ".join(instruments))
+    if bpm_text and str(bpm_text).strip():
+        parts.append(f"{bpm_text} BPM")
+    return ", ".join(parts)
+
+
+def random_prompt():
+    g = random.choice(list(GENRES.keys()))
+    m = random.sample(MOODS, k=2)
+    ins = random.sample(INSTRUMENTS, k=2)
+    return build_prompt(g, m, ins, random.choice(["", "90", "120", "140", "160"]))
+
+
+def _stats_html():
+    s = library.stats()
+    mins = s["total_seconds"] / 60
+    return f"""
+    <div id='statbar'>
+      <div class='statcard'><div class='n'>{s['total']}</div><div class='l'>Tracks</div></div>
+      <div class='statcard'><div class='n'>{s['favorites']}</div><div class='l'>Favorites</div></div>
+      <div class='statcard'><div class='n'>{s['plays']}</div><div class='l'>Plays</div></div>
+      <div class='statcard'><div class='n'>{mins:.0f}m</div><div class='l'>Generated</div></div>
+    </div>"""
+
+
+LIB_HEADERS = ["ID", "♥", "Title", "Model", "Len", "BPM/Key", "Rating", "Created"]
+
+
+# ── Build UI ──────────────────────────────────────────────────────────────────────
+THEME = gr.themes.Base(primary_hue="purple", neutral_hue="slate").set(
+    body_background_fill="#0a0a0f")
+
+
+# [#9] keyboard shortcuts — Cmd/Ctrl+Enter generates, Space toggles play
+SHORTCUTS_JS = """
+() => {
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      const btns = [...document.querySelectorAll('button')];
+      const gen = btns.find(b => b.textContent.trim().includes('GENERATE'));
+      if (gen) { gen.click(); e.preventDefault(); }
+    }
+    if (e.code === 'Space' && e.target.tagName !== 'INPUT'
+        && e.target.tagName !== 'TEXTAREA') {
+      const audio = document.querySelector('audio');
+      if (audio) { audio.paused ? audio.play() : audio.pause(); e.preventDefault(); }
+    }
+  });
+}
+"""
+
+
+def build():
+    with gr.Blocks(title="AI Music Studio") as app:
+
+        gr.HTML("""
+        <div id='hero'>
+          <h1>AI MUSIC STUDIO
+            <span class='eq'><span></span><span></span><span></span><span></span><span></span></span>
+          </h1>
+          <p>Generate · process · analyze · organize — fully local &amp; private. Powered by MusicGen.
+          &nbsp;·&nbsp; <b>⌘/Ctrl+Enter</b> generate &nbsp; <b>Space</b> play/pause</p>
+        </div>""")
+
+        stats = gr.HTML(_stats_html())
+        theme_holder = gr.HTML()   # [#10] dynamic accent injection
+
+        with gr.Tabs():
+            # ───────────────── STUDIO ─────────────────
+            with gr.Tab("🎛  Studio"):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        prompt = gr.Textbox(label="Prompt", lines=3,
+                            placeholder="lofi hip hop, warm rhodes, vinyl crackle, rainy mood")
+                        negative = gr.Textbox(label="Negative prompt (avoid)", lines=1,
+                            placeholder="vocals, distortion")
+
+                        with gr.Accordion("✨ Prompt Builder", open=False):
+                            with gr.Row():
+                                genre = gr.Dropdown(list(GENRES.keys()), label="Genre")
+                                bpm_text = gr.Textbox(label="BPM", placeholder="120", scale=1)
+                            moods = gr.CheckboxGroup(MOODS, label="Moods")
+                            instruments = gr.CheckboxGroup(INSTRUMENTS, label="Instruments")
+                            with gr.Row():
+                                build_btn = gr.Button("Build prompt →")
+                                rand_btn = gr.Button("🎲 Random")
+
+                        with gr.Row():
+                            duration = gr.Slider(3, 20, value=8, step=1, label="Duration (s)")
+                            guidance = gr.Slider(1, 10, value=3, step=0.5, label="Guidance")
+                            temperature = gr.Slider(0.3, 1.5, value=1.0, step=0.05,
+                                                    label="Temperature")
+
+                        with gr.Accordion("🎚 Post-processing", open=False):
+                            with gr.Row():
+                                do_normalize = gr.Checkbox(True, label="Normalize")
+                                do_trim = gr.Checkbox(False, label="Trim silence")
+                                do_loop = gr.Checkbox(False, label="Seamless loop")
+                            with gr.Row():
+                                fade_in = gr.Slider(0, 3, 0, step=0.1, label="Fade in (s)")
+                                fade_out = gr.Slider(0, 3, 0, step=0.1, label="Fade out (s)")
+                            with gr.Row():
+                                pitch = gr.Slider(-12, 12, 0, step=1, label="Pitch (semitones)")
+                                speed = gr.Slider(0.5, 2.0, 1.0, step=0.05, label="Speed")
+
+                        with gr.Row():
+                            model_size = gr.Radio(["small", "medium"], value="small",
+                                label="Model (medium = better, heavier)")
+                            seed_in = gr.Textbox(label="Seed (-1 = random)", value="-1", scale=1)
+                        with gr.Row():
+                            collection = gr.Textbox(label="Save to collection",
+                                                    value="All Tracks", scale=2)
+                            mp3 = gr.Checkbox(False, label="Also export MP3")
+                            auto_analyze = gr.Checkbox(True, label="Detect BPM/key")
+
+                        gen_btn = gr.Button("🎵  GENERATE", variant="primary", size="lg")
+
+                    with gr.Column(scale=2):
+                        cover_out = gr.Image(label="Cover art", height=240,
+                                             show_label=True, interactive=False)
+                        audio_out = gr.Audio(label="Output", type="numpy",
+                                             interactive=False)
+                        info = gr.Markdown("Ready.")
+                        last_tid = gr.Number(visible=False, value=0)
+                        with gr.Row():
+                            var_btn = gr.Button("🎲 3 Variations", size="sm")
+                            ext_btn = gr.Button("➕ Extend +8s", size="sm")
+                            exp_btn = gr.Button("📦 Export", size="sm")
+                        gr.HTML("<div class='preset-label'>Add a layer to this track (smart match)</div>")
+                        with gr.Row():
+                            add_drums = gr.Button("🥁 + Drums", size="sm")
+                            add_bass = gr.Button("🎸 + Bass", size="sm")
+                            add_keys = gr.Button("🎹 + Keys", size="sm")
+                            add_hats = gr.Button("🎵 + Hi-hats", size="sm")
+                        gr.HTML("<div class='preset-label'>Quick presets</div>")
+                        with gr.Row():
+                            for name in list(GENRES.keys())[:5]:
+                                gr.Button(name, size="sm").click(
+                                    lambda n=name: GENRES[n], outputs=prompt)
+                        with gr.Row():
+                            for name in list(GENRES.keys())[5:10]:
+                                gr.Button(name, size="sm").click(
+                                    lambda n=name: GENRES[n], outputs=prompt)
+                        suggest_btn = gr.Button("🧠 Suggest from my favorites", size="sm")
+                        suggest_out = gr.Markdown()
+
+                build_btn.click(build_prompt,
+                    [genre, moods, instruments, bpm_text], prompt)
+                rand_btn.click(random_prompt, outputs=prompt)
+                suggest_btn.click(do_suggest, outputs=suggest_out)
+
+            # ───────────────── LIBRARY ─────────────────
+            with gr.Tab("📚  Library"):
+                with gr.Row():
+                    search = gr.Textbox(label="Search", placeholder="prompt, title, tag…", scale=2)
+                    coll_filter = gr.Dropdown(library.list_collections(),
+                        value="All Tracks", label="Collection", scale=1)
+                    sort = gr.Dropdown(["newest", "oldest", "rating", "plays", "title"],
+                        value="newest", label="Sort", scale=1)
+                    favs = gr.Checkbox(False, label="★ Favorites only")
+                refresh_btn = gr.Button("↻ Refresh")
+
+                lib = gr.Dataframe(headers=LIB_HEADERS, datatype="str",
+                    value=refresh_library(), interactive=False, wrap=True, row_count=(8, "dynamic"))
+
+                with gr.Row():
+                    sel_id = gr.Number(label="Track ID", precision=0)
+                    play_btn = gr.Button("▶ Play")
+                    fav_btn = gr.Button("♥ Favorite")
+                    del_btn = gr.Button("🗑 Delete", variant="stop")
+                with gr.Row():
+                    rating_in = gr.Slider(0, 5, 0, step=1, label="Set rating", scale=2)
+                    rate_btn = gr.Button("Apply rating", scale=1)
+                    tag_in = gr.Textbox(label="Add tag", scale=2)
+                    tag_btn = gr.Button("Add tag", scale=1)
+
+                sel_audio = gr.Audio(label="Now playing", type="filepath")
+                sel_detail = gr.Markdown()
+
+                def _refresh(s, f, c, so): return refresh_library(s, f, c, so)
+                refresh_btn.click(_refresh, [search, favs, coll_filter, sort], lib)
+                search.submit(_refresh, [search, favs, coll_filter, sort], lib)
+                favs.change(_refresh, [search, favs, coll_filter, sort], lib)
+                coll_filter.change(_refresh, [search, favs, coll_filter, sort], lib)
+                sort.change(_refresh, [search, favs, coll_filter, sort], lib)
+
+                play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
+                fav_btn.click(toggle_fav, sel_id, lib)
+                del_btn.click(del_track, sel_id, [lib, stats])
+                rate_btn.click(set_rating, [sel_id, rating_in], lib)
+                tag_btn.click(add_tag, [sel_id, tag_in], lib)
+
+            # ───────────────── BATCH ─────────────────
+            with gr.Tab("⚡  Batch"):
+                gr.Markdown("Queue many prompts — one per line — and generate them all.")
+                batch_prompts = gr.Textbox(lines=10, label="Prompts (one per line)",
+                    placeholder="lofi study beat, piano\ndark trap, 808\ncinematic epic strings")
+                with gr.Row():
+                    b_duration = gr.Slider(3, 20, 8, step=1, label="Duration each (s)")
+                    b_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    b_guidance = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
+                batch_btn = gr.Button("⚡ Generate all", variant="primary", size="lg")
+                batch_status = gr.Markdown()
+
+            # ───────────────── STEMS [#7] ─────────────────
+            with gr.Tab("🎚  Stems"):
+                gr.Markdown("Generate **layers** separately and mix them into one track.")
+                with gr.Row():
+                    s_drums = gr.Textbox(label="Drums layer", value="punchy drum loop, crisp hats")
+                    s_v_drums = gr.Slider(0, 1, 0.8, step=0.05, label="Vol", scale=0)
+                with gr.Row():
+                    s_bass = gr.Textbox(label="Bass layer", value="deep sub bassline, groovy")
+                    s_v_bass = gr.Slider(0, 1, 0.7, step=0.05, label="Vol", scale=0)
+                with gr.Row():
+                    s_melody = gr.Textbox(label="Melody layer", value="warm piano melody, emotional")
+                    s_v_melody = gr.Slider(0, 1, 0.65, step=0.05, label="Vol", scale=0)
+                with gr.Row():
+                    s_dur = gr.Slider(3, 20, 8, step=1, label="Duration (s)")
+                    s_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    s_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
+                    s_coll = gr.Textbox(label="Collection", value="Stems", scale=1)
+                stems_btn = gr.Button("🎚 Generate & mix", variant="primary", size="lg")
+                stems_audio = gr.Audio(label="Mixed output", type="numpy")
+                stems_status = gr.Markdown()
+
+            # ───────────────── MELODY [#4] ─────────────────
+            with gr.Tab("🎹  Melody"):
+                gr.Markdown("Upload or **record a melody** (hum it!) and restyle it into any genre.")
+                mel_in = gr.Audio(label="Your melody", type="filepath", sources=["upload", "microphone"])
+                mel_prompt = gr.Textbox(label="Style to apply",
+                    placeholder="lofi hip hop, warm rhodes, vinyl crackle")
+                with gr.Row():
+                    mel_dur = gr.Slider(3, 20, 8, step=1, label="Duration (s)")
+                    mel_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    mel_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
+                    mel_coll = gr.Textbox(label="Collection", value="Melody", scale=1)
+                mel_btn = gr.Button("🎹 Restyle melody", variant="primary", size="lg")
+                mel_audio = gr.Audio(label="Restyled output", type="numpy")
+                mel_status = gr.Markdown()
+
+            # ───────────────── REFERENCE [NEW] ─────────────────
+            with gr.Tab("💿  Reference"):
+                gr.Markdown("Upload a song to **take inspiration** from its beat & vibe. "
+                            "_Borrows the feel — doesn't clone the exact track._")
+                ref_in = gr.Audio(label="Reference song", type="filepath",
+                                  sources=["upload"])
+                ref_prompt = gr.Textbox(label="Your twist (optional)",
+                    placeholder="make it lofi · slower · darker · add piano")
+                with gr.Row():
+                    ref_mode = gr.Radio(["restyle", "continue"], value="restyle",
+                        label="Mode  (restyle = same vibe + your prompt · continue = extend it)")
+                with gr.Row():
+                    ref_dur = gr.Slider(3, 20, 8, step=1, label="Duration (s)")
+                    ref_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    ref_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
+                    ref_coll = gr.Textbox(label="Collection", value="Inspired", scale=1)
+                ref_btn = gr.Button("💿 Generate from reference", variant="primary", size="lg")
+                ref_audio = gr.Audio(label="Output", type="numpy")
+                ref_status = gr.Markdown()
+
+            # ───────────────── ADD LAYER [NEW] ─────────────────
+            with gr.Tab("➕  Add Layer"):
+                gr.Markdown("Add **drums, bass, or any instrument** to an existing track.")
+                with gr.Row():
+                    al_id = gr.Number(label="Track ID", precision=0)
+                    al_inst = gr.Textbox(label="Instrument / layer",
+                        value="punchy drums, crisp hats", scale=2)
+                with gr.Row():
+                    al_blend = gr.Radio(["smart", "simple"], value="smart",
+                        label="Blend  (smart = match the track · simple = overlay)")
+                    al_vol = gr.Slider(0, 1, 0.7, step=0.05, label="Layer volume")
+                with gr.Row():
+                    al_model = gr.Radio(["small", "medium"], value="small", label="Model")
+                    al_guid = gr.Slider(1, 10, 3, step=0.5, label="Guidance")
+                    al_coll = gr.Textbox(label="Collection", value="Layered", scale=1)
+                al_btn = gr.Button("➕ Add layer", variant="primary", size="lg")
+                al_audio = gr.Audio(label="Output", type="numpy")
+                al_status = gr.Markdown()
+
+            # ───────────────── EXPORT [#6] ─────────────────
+            with gr.Tab("📦  Export"):
+                gr.Markdown("Bundle a track into an **upload-ready pack** — "
+                            "WAV + MP3 + cover art + auto title/description/hashtags.")
+                with gr.Row():
+                    exp_id = gr.Number(label="Track ID", precision=0)
+                    exp_platform = gr.Dropdown(["all", "youtube", "beatstars", "tiktok"],
+                        value="all", label="Platform")
+                exp_go = gr.Button("📦 Build export pack", variant="primary", size="lg")
+                exp_status = gr.Markdown()
+                exp_file = gr.File(label="Download pack (.zip)")
+
+            # ───────────────── SETTINGS ─────────────────
+            with gr.Tab("⚙  Settings"):
+                gr.Markdown(f"""
+### Output
+All tracks save to **`{os.path.abspath(engine.OUT_DIR)}`**
+Metadata lives in **`{library.DB_PATH}`** (SQLite).
+
+### Models
+- **small** — 300M, fast, low memory — recommended on 16GB
+- **medium** — 1.5B, better quality, heavier (slower on CPU)
+
+### Cloud sync
+If `NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set, each track's
+metadata syncs to a `music_tracks` table and audio uploads to a `music` storage
+bucket. This is what powers the future Vercel deployment.
+
+### Performance
+Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
+≤ 20s. Longer pieces: generate sections and stitch in the Library.
+""")
+                gr.Markdown("**Supabase status:** " +
+                    ("🟢 configured" if os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+                     else "⚪ not configured (local only)"))
+
+        # ── Wiring (after all components exist) ──
+        gen_btn.click(
+            do_generate,
+            [prompt, negative, duration, model_size, guidance, temperature, seed_in,
+             do_normalize, fade_in, fade_out, do_loop, do_trim, pitch, speed, mp3,
+             auto_analyze, collection],
+            [audio_out, info, stats, lib, cover_out, theme_holder, last_tid])
+
+        batch_btn.click(batch_generate,
+            [batch_prompts, b_duration, b_model, b_guidance],
+            [batch_status, lib, stats])
+
+        # [#3] Variations — generate 3, show first in player
+        def _variations_single(p, d, m, g, c):
+            a1, a2, a3, msg, libd, st = do_variations(p, 3, d, m, g, c)
+            return a1, msg, libd, st
+        var_btn.click(_variations_single,
+            [prompt, duration, model_size, guidance, collection],
+            [audio_out, info, lib, stats])
+
+        # [#2] Extend last/selected track
+        ext_btn.click(do_extend,
+            [last_tid, prompt, gr.State(8), model_size, guidance, collection],
+            [audio_out, info, lib, stats])
+
+        # [#7] Stems
+        stems_btn.click(do_stems,
+            [s_drums, s_bass, s_melody, s_v_drums, s_v_bass, s_v_melody,
+             s_dur, s_model, s_guid, s_coll],
+            [stems_audio, stems_status, lib, stats])
+
+        # [#4] Melody restyle
+        mel_btn.click(do_melody,
+            [mel_in, mel_prompt, mel_dur, mel_model, mel_guid, mel_coll],
+            [mel_audio, mel_status, lib, stats])
+
+        # [#6] Export tab
+        exp_go.click(do_export, [exp_id, exp_platform], [exp_file, exp_status])
+        exp_btn.click(do_export, [last_tid, gr.State("all")], [exp_file, exp_status])
+
+        # [NEW] Reference inspiration
+        ref_btn.click(do_reference,
+            [ref_in, ref_prompt, ref_mode, ref_dur, ref_model, ref_guid, ref_coll],
+            [ref_audio, ref_status, lib, stats])
+
+        # [NEW] Add layer tab
+        al_btn.click(do_add_layer,
+            [al_id, al_inst, al_blend, al_vol, al_model, al_guid, al_coll],
+            [al_audio, al_status, lib, stats])
+
+        # [NEW] Studio quick-add layer buttons (use last generated track)
+        add_drums.click(lambda tid, m, g: quick_add(tid, "punchy drums, crisp hi-hats", m, g),
+            [last_tid, model_size, guidance], [audio_out, info])
+        add_bass.click(lambda tid, m, g: quick_add(tid, "deep sub bassline", m, g),
+            [last_tid, model_size, guidance], [audio_out, info])
+        add_keys.click(lambda tid, m, g: quick_add(tid, "warm piano keys, melodic", m, g),
+            [last_tid, model_size, guidance], [audio_out, info])
+        add_hats.click(lambda tid, m, g: quick_add(tid, "crisp hi-hats, percussion", m, g),
+            [last_tid, model_size, guidance], [audio_out, info])
+
+    return app
+
+
+if __name__ == "__main__":
+    print("Starting AI Music Studio (pro)…")
+    print(f"Output: {os.path.abspath(engine.OUT_DIR)}")
+    build().launch(server_port=7860, share=False, inbrowser=True,
+                   theme=THEME, css=CSS, js=SHORTCUTS_JS)

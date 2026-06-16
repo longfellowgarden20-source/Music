@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Virtual environments (the model deps are heavy — never commit)
+music_env/
+venv/
+.venv/
+env/
+
+# Generated audio, art, exports, and the local library DB
+music_output/
+*.wav
+*.mp3
+*.db
+
+# Hugging Face / torch model cache
+.cache/
+~/.cache/huggingface/
+
+# Secrets
+.env
+.env.local
+*.pickle
+*.json.key
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
