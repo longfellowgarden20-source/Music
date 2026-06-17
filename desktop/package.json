@@ -1,0 +1,53 @@
+{
+  "name": "stemai-desktop",
+  "version": "1.0.0",
+  "description": "StemAI — local AI music studio",
+  "author": "StemAI",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "dev": "ELECTRON_DEV=1 electron .",
+    "prep": "node scripts/prep.js",
+    "pack:mac": "npm run prep && electron-builder --mac --publish never",
+    "pack:win": "npm run prep && electron-builder --win --publish never",
+    "pack:dir": "npm run prep && electron-builder --dir --publish never"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.stemai.app",
+    "productName": "StemAI",
+    "files": [
+      "main.js",
+      "preload.js",
+      "ui/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "engine",
+        "to": "engine",
+        "filter": ["**/*"]
+      }
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "mac": {
+      "category": "public.app-category.music",
+      "target": [{ "target": "dmg", "arch": ["arm64"] }],
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
+  }
+}

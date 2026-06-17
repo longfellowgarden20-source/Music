@@ -91,3 +91,39 @@ def revamp(original_prompt: str, direction: str = "") -> str:
     except Exception as e:
         print(f"[groq] revamp failed: {e}")
         return f"{original_prompt}, fresh original melody, reinterpreted"
+
+
+_NOTES_SYS = (
+    "You are a professional music producer giving concise, actionable feedback on a track. "
+    "You receive technical analysis data and the original prompt. "
+    "Return ONLY a JSON object with exactly these keys:\n"
+    '  "vibe": one sentence describing the overall feel (max 15 words)\n'
+    '  "strengths": array of 2 short strings — what works well\n'
+    '  "suggestions": array of 3 short strings — specific production improvements\n'
+    '  "next": one sentence on what to try next (a follow-up track idea)\n'
+    "Be direct and specific. No fluff. No markdown. Valid JSON only."
+)
+
+
+def track_notes(prompt: str, bpm: float | None, key: str | None,
+                duration: float | None) -> dict:
+    """Analyze a track and return producer notes as a dict."""
+    parts = [f"Prompt: {prompt}"]
+    if bpm:   parts.append(f"BPM: {round(bpm)}")
+    if key:   parts.append(f"Key: {key}")
+    if duration: parts.append(f"Duration: {round(duration)}s")
+    user = "\n".join(parts)
+    try:
+        import json
+        raw = _ask(_NOTES_SYS, user, max_tokens=400)
+        # strip any accidental markdown fences
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[groq] track_notes failed: {e}")
+        return {
+            "vibe": "Could not analyze — check your Groq API key.",
+            "strengths": [],
+            "suggestions": [],
+            "next": "",
+        }

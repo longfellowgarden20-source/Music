@@ -14,13 +14,34 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
+# Resolve the user data directory so tracks and the DB survive app updates
+# and live somewhere the customer can find/back up.
+#   macOS  → ~/Library/Application Support/StemAI/
+#   Windows → %APPDATA%/StemAI/
+#   Linux   → ~/.local/share/StemAI/
+import platform as _platform
+
+def _data_dir() -> str:
+    system = _platform.system()
+    if system == "Darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "StemAI")
+    elif system == "Windows":
+        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "StemAI")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "share", "StemAI")
+    os.makedirs(base, exist_ok=True)
+    return base
+
 # Real library by default. Set MUSIC_STUDIO_TEST_DB=1 to use a throwaway DB
 # so automated tests can NEVER touch your actual saved tracks.
 if os.environ.get("MUSIC_STUDIO_TEST_DB"):
     DB_PATH = "music_output/_test_library.db"
+    AUDIO_DIR = "music_output"
 else:
-    DB_PATH = "music_output/music_library.db"
-AUDIO_DIR = "music_output"
+    _DATA = _data_dir()
+    AUDIO_DIR = os.path.join(_DATA, "tracks")
+    DB_PATH   = os.path.join(_DATA, "library.db")
+
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
 _lock = threading.Lock()
@@ -84,7 +105,31 @@ def init_db():
         c.execute("create index if not exists idx_project on tracks(project_id)")
 
 
+def _rel(path: str) -> str:
+    """Store only the filename, not the full path. Survives username/machine changes."""
+    return os.path.basename(path) if path else ""
+
+def _abs(rel: str) -> str:
+    """Resolve a stored filename back to its full path."""
+    if not rel:
+        return ""
+    if os.path.isabs(rel):
+        # Legacy absolute path from before this fix — transparently migrate it.
+        return rel
+    return os.path.join(AUDIO_DIR, rel)
+
+def _resolve(row: dict) -> dict:
+    """Expand relative path fields to absolute before returning to callers."""
+    for col in ("filepath", "waveform_path", "cover_path"):
+        if col in row and row[col]:
+            row[col] = _abs(row[col])
+    return row
+
 def add_track(**kw) -> int:
+    # Store only filenames, not full paths.
+    for col in ("filepath", "waveform_path", "cover_path"):
+        if kw.get(col):
+            kw[col] = _rel(kw[col])
     cols = ["title", "prompt", "negative", "duration", "model", "guidance",
             "temperature", "seed", "filepath", "waveform_path", "cover_path",
             "sample_rate", "bpm", "musical_key", "tags", "favorite", "rating",
@@ -138,12 +183,15 @@ def list_versions(project_id: int) -> list[dict]:
         rows = c.execute(
             "select * from tracks where project_id=? order by version asc",
             (project_id,)).fetchall()
-    return [dict(r) for r in rows]
+    return [_resolve(dict(r)) for r in rows]
 
 
 def update_track(track_id: int, **fields):
     if not fields:
         return
+    for col in ("filepath", "waveform_path", "cover_path"):
+        if fields.get(col):
+            fields[col] = _rel(fields[col])
     sets = ",".join(f"{k}=?" for k in fields)
     vals = list(fields.values()) + [track_id]
     with _lock, _conn() as c:
@@ -154,17 +202,19 @@ def delete_track(track_id: int, remove_file: bool = True):
     with _lock, _conn() as c:
         row = c.execute("select filepath from tracks where id=?", (track_id,)).fetchone()
         c.execute("delete from tracks where id=?", (track_id,))
-    if remove_file and row and row["filepath"] and os.path.exists(row["filepath"]):
-        try:
-            os.remove(row["filepath"])
-        except OSError:
-            pass
+    if remove_file and row and row["filepath"]:
+        full = _abs(row["filepath"])
+        if os.path.exists(full):
+            try:
+                os.remove(full)
+            except OSError:
+                pass
 
 
 def get_track(track_id: int) -> Optional[dict]:
     with _lock, _conn() as c:
         row = c.execute("select * from tracks where id=?", (track_id,)).fetchone()
-    return dict(row) if row else None
+    return _resolve(dict(row)) if row else None
 
 
 def duplicate_track(track_id: int) -> Optional[int]:
@@ -189,6 +239,27 @@ def duplicate_track(track_id: int) -> Optional[int]:
         filepath=new_path, sample_rate=t["sample_rate"], bpm=t["bpm"],
         musical_key=t["musical_key"], tags=t.get("tags", ""),
         collection=t.get("collection", "All Tracks"))  # project_id=0 -> own project
+
+
+def clone_track(track_id: int, new_filepath: str, edit_label: str = "") -> Optional[dict]:
+    """Save a new version of a track pointing at a different audio file (e.g. after vocal merge)."""
+    import shutil
+    t = get_track(track_id)
+    if not t:
+        return None
+    dest = os.path.join(AUDIO_DIR, os.path.basename(new_filepath))
+    if new_filepath != dest:
+        shutil.move(new_filepath, dest)
+    new_id = add_track(
+        title=t["title"], prompt=t["prompt"],
+        negative=t.get("negative", ""), duration=t["duration"], model=t["model"],
+        guidance=t["guidance"], temperature=t.get("temperature"), seed=t["seed"],
+        filepath=dest, sample_rate=t["sample_rate"], bpm=t["bpm"],
+        musical_key=t["musical_key"], tags=t.get("tags", ""),
+        collection=t.get("collection", "All Tracks"),
+        edit_label=edit_label,
+    )
+    return get_track(new_id)
 
 
 def list_tracks(search: str = "", favorites_only: bool = False,
@@ -223,7 +294,7 @@ def list_tracks(search: str = "", favorites_only: bool = False,
     q += f" order by {order}"
     with _lock, _conn() as c:
         rows = c.execute(q, args).fetchall()
-    return [dict(r) for r in rows]
+    return [_resolve(dict(r)) for r in rows]
 
 
 def list_collections() -> list[str]:
@@ -260,7 +331,8 @@ def recover_orphans(audio_dir: str = AUDIO_DIR) -> int:
         if fn.startswith(SKIP) or any(s in fn for s in SKIP_SUBSTR):
             continue
         path = os.path.join(audio_dir, fn)
-        if path in known:
+        # known may contain relative filenames or legacy absolute paths
+        if path in known or fn in known:
             continue
         try:
             info = sf.info(path)

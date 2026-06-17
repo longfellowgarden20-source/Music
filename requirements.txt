@@ -16,3 +16,4 @@ pedalboard==0.9.23
 demucs==4.0.1
 certifi
 psutil
+imageio-ffmpeg

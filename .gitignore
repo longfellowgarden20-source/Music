@@ -26,6 +26,19 @@ music_output/
 *.pickle
 *.json.key
 
+# Node / Next.js
+node_modules/
+.next/
+studio/out/
+
+# Desktop app build artifacts (large / generated)
+desktop/node_modules/
+desktop/engine/
+desktop/engine_build/
+desktop/build_work/
+desktop/ui/
+desktop/dist/
+
 # OS / editor
 .DS_Store
 *.swp

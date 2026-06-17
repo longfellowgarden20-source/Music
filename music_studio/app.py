@@ -1618,12 +1618,12 @@ def _version_history_md(track: dict) -> str:
 
 def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
     """Click a row -> select it; returns
-    (track_id, audio, cover, detail, versions, current_title, notes)."""
+    (track_id, audio, cover, detail, versions, current_title, notes, daw_link_html)."""
     rows = library.list_tracks(search=search, favorites_only=favs,
                                collection=collection, sort=sort)
     ridx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
     if ridx is None or ridx >= len(rows):
-        return gr.update(), None, None, "", "", "", ""
+        return gr.update(), None, None, "", "", "", "", gr.update()
     t = rows[ridx]
     library.update_track(t["id"], play_count=(t["play_count"] or 0) + 1)
     detail = (f"### {t['title'] or t['prompt']}\n"
@@ -1632,8 +1632,14 @@ def on_row_select(search, favs, collection, sort, evt: gr.SelectData):
               + f"\n\n_{t['prompt']}_")
     path = t["filepath"] if os.path.exists(t["filepath"]) else None
     cover = t["cover_path"] if t.get("cover_path") and os.path.exists(t["cover_path"]) else None
-    return (t["id"], path, cover, detail, _version_history_md(t),
-            (t["title"] or ""), (t.get("notes") or ""))
+    tid = t["id"]
+    daw_html = (f'<a href="http://localhost:3000/studio/{tid}" target="_blank" '
+                f'style="display:inline-flex;align-items:center;justify-content:center;'
+                f'padding:6px 14px;background:#1c1c2b;border:1px solid #8b5cff;'
+                f'border-radius:8px;color:#c4b0ff;font-size:13px;font-weight:700;'
+                f'text-decoration:none;height:100%;white-space:nowrap">🎛 DAW</a>')
+    return (tid, path, cover, detail, _version_history_md(t),
+            (t["title"] or ""), (t.get("notes") or ""), daw_html)
 
 
 def do_recover(search="", favs=False, collection="All Tracks", sort="newest",
@@ -2020,6 +2026,7 @@ def build():
                         sel_id = gr.Number(label="Track ID", precision=0)
                         with gr.Row():
                             edit_btn = gr.Button("✏️ Edit", variant="primary", scale=2)
+                            daw_link = gr.HTML('<a id="daw-open-link" href="http://localhost:3000" target="_blank" style="display:inline-flex;align-items:center;justify-content:center;padding:6px 14px;background:#1c1c2b;border:1px solid #8b5cff;border-radius:8px;color:#c4b0ff;font-size:13px;font-weight:700;text-decoration:none;height:100%;white-space:nowrap">🎛 DAW</a>')
                             play_btn = gr.Button("▶ Play", scale=1)
                             fav_btn = gr.Button("♥", scale=1)
                             del_btn = gr.Button("🗑", variant="stop", scale=1)
@@ -2133,7 +2140,7 @@ def build():
                 # click a row -> auto-select + play + cover + history + prefill rename + notes
                 lib.select(on_row_select, _filt,
                            [sel_id, sel_audio, sel_cover, sel_detail,
-                            sel_versions, rename_in, notes_in])
+                            sel_versions, rename_in, notes_in, daw_link])
 
                 # these all respect the active search/filter so the view doesn't jump
                 play_btn.click(load_track_audio, sel_id, [sel_audio, sel_detail])
@@ -2731,10 +2738,10 @@ Generation is **CPU-only** for stability on Apple Silicon 16GB. Keep duration
         # ✏️ Edit in Library -> load into Edit Studio + jump to that tab
         def _open_editor(track_id):
             tid, audio, cover, header, vers = edit_load(track_id)
-            return (tid, audio, cover, header, vers,
-                    gr.Tabs(selected="edit"))
+            return (tid, audio, cover, header, vers, "",
+                    gr.update(selected="edit"))
         edit_btn.click(_open_editor, sel_id,
-            [e_id, e_audio, e_cover, e_header, e_versions, main_tabs])
+            [e_id, e_audio, e_cover, e_header, e_versions, e_status, main_tabs])
 
         e_dupe.click(edit_duplicate, e_id,
             [e_id, e_audio, e_cover, e_header, e_versions, e_status, lib, stats])

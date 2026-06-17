@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+:root {
+  /* StemAI brand: Spotify green on near-black. */
+  --bg0: #0a0a0a;
+  --bg1: #0f0f0f;
+  --bg2: #141414;
+  --bg3: #1c1c1c;
+  --line: #272727;
+  --line2: #333333;
+  --accent: #1db954;
+  --accent2: #1ed760;
+  --green: #1db954;
+  --red: #ef4444;
+  --amber: #fbbf24;
+  --pink: #f472b6;
+  --text: #f1f1f1;
+  --muted: #a7a7a7;
+  --muted2: #6a6a6a;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg0);
+  color: var(--text);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  min-height: 100%;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg0); }
+::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+button { font-family: inherit; }
+input, textarea, select { font-family: inherit; }
+a { color: inherit; }
+
+.card {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.btn {
+  background: var(--bg3);
+  border: 1px solid var(--line2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .15s;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary {
+  background: linear-gradient(95deg, var(--accent), var(--accent2));
+  border: none;
+  color: #fff;
+}
+.btn-primary:hover { opacity: .9; }
+.input {
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+}
+.input:focus { border-color: var(--accent); }
+.label {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  font-weight: 700;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,.25);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  display: inline-block;
+}
+@keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.5 } }
+.pulse { animation: pulse 1.4s ease-in-out infinite; }

@@ -19,7 +19,31 @@ from datetime import datetime
 OUT_DIR = "music_output"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-DEVICE = "cpu"   # MPS crashes on 16GB unified memory with these models
+def _pick_device() -> str:
+    """Prefer Apple GPU (MPS) when available — much faster + lower RAM than CPU.
+    Override with MUSIC_STUDIO_DEVICE=cpu to force CPU."""
+    forced = os.environ.get("MUSIC_STUDIO_DEVICE", "").strip().lower()
+    if forced in ("cpu", "mps"):
+        return forced
+    try:
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+DEVICE = _pick_device()
+# float16 halves model RAM and speeds up MPS; CPU stays float32 (no fp16 speedup there).
+DTYPE = torch.float16 if DEVICE == "mps" else torch.float32
+
+# Limit MPS to 60% of unified memory so the OS and UI stay responsive.
+# Without this, MusicGen can claim all shared GPU/CPU RAM and crash the system.
+if DEVICE == "mps":
+    try:
+        torch.mps.set_per_process_memory_fraction(0.6)
+    except Exception:
+        pass
 
 _model = None
 _processor = None
@@ -27,12 +51,109 @@ _melody_model = None
 _melody_processor = None
 _current = None
 
+# ── Cancellation (kill switch) ─────────────────────────────────────────────────────
+# A cooperative cancel: request_cancel() flips the flag, and the stopping criteria
+# below checks it on every decoding step so generation halts mid-token instead of
+# running to completion. is_generating() lets the API report whether work is live.
+import threading
+_cancel = threading.Event()
+_generating = threading.Event()
+
+
+def request_cancel():
+    """Ask any in-flight generation to stop as soon as the next token is checked."""
+    _cancel.set()
+
+
+def is_generating() -> bool:
+    return _generating.is_set()
+
+
+def is_cancelled() -> bool:
+    return _cancel.is_set()
+
+
+class _CancelledError(RuntimeError):
+    """Raised internally when a generation was cancelled by the kill switch."""
+
+
+def _stopping_criteria():
+    """Build a StoppingCriteriaList that halts generation when cancel is requested.
+    Returns None if transformers' StoppingCriteria isn't importable (older versions)."""
+    try:
+        from transformers import StoppingCriteria, StoppingCriteriaList
+    except Exception:
+        return None
+
+    class _Cancel(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kw):
+            return _cancel.is_set()
+
+    return StoppingCriteriaList([_Cancel()])
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def generation_session():
+    """Bracket a top-level generation. Clears any stale cancel flag, marks work as
+    live, and ensures the live flag is cleared even if generation raises."""
+    _cancel.clear()
+    _generating.set()
+    try:
+        yield
+    finally:
+        _generating.clear()
+        _cancel.clear()
+
+
+def _generate_tokens(**kwargs):
+    """Wrapper around _model.generate that injects the cancel stopping criteria and
+    raises _CancelledError if the run was stopped by the kill switch.
+
+    When the stopping criteria fires mid-stream MusicGen may also raise while trying
+    to decode an incomplete token sequence — so if cancel is set we treat ANY error
+    from generate as a clean cancellation rather than a real failure."""
+    sc = _stopping_criteria()
+    if sc is not None:
+        kwargs["stopping_criteria"] = sc
+    try:
+        out = _model.generate(**kwargs)
+    except Exception:
+        if _cancel.is_set():
+            raise _CancelledError("generation cancelled")
+        raise
+    if _cancel.is_set():
+        raise _CancelledError("generation cancelled")
+    return out
+
 # ── Safety guardrails (16GB-friendly) ─────────────────────────────────────────────
 # Approx peak RAM each model needs while generating (model + activations).
 # Tuned a touch optimistic — these run in slightly less once weights are loaded.
 MODEL_RAM_GB = {"small": 1.6, "medium": 3.6, "large": 7.5}
 # Hard duration caps so a long clip on a big model can't blow memory.
 MODEL_MAX_DURATION = {"small": 30, "medium": 18, "large": 10}
+
+
+def _prep_inputs(inputs):
+    """Move processor inputs to DEVICE and cast float tensors (e.g. conditioning
+    audio) to the model's dtype so fp16 weights don't hit a float/Half mismatch.
+    Integer tensors (token ids, attention masks) are left untouched."""
+    inputs = inputs.to(DEVICE)
+    if DTYPE != torch.float32:
+        for k, v in inputs.items():
+            if torch.is_tensor(v) and torch.is_floating_point(v):
+                inputs[k] = v.to(DTYPE)
+    return inputs
+
+
+def _force_cpu():
+    """Permanently drop to CPU float32 for the rest of the session and drop the
+    currently-loaded model so it reloads on CPU."""
+    global DEVICE, DTYPE
+    DEVICE, DTYPE = "cpu", torch.float32
+    free_memory()
 
 
 def free_ram_gb() -> float:
@@ -47,13 +168,25 @@ def safety_check(model_size: str, duration: float):
     """Raise a clear error if this generation is likely to crash the machine.
     Returns the (possibly capped) duration."""
     need = MODEL_RAM_GB.get(model_size, 3.0)
+    if DTYPE == torch.float16:   # fp16 weights ~halve the footprint
+        need *= 0.55
     free = free_ram_gb()
     # if the model isn't loaded yet we need headroom for it; if already loaded, less
     headroom = need if _current != model_size else need * 0.4
-    if free < headroom + 0.8:   # +0.8GB OS breathing room
-        raise MemoryError(
-            f"Low memory: {free:.1f}GB free, but '{model_size}' needs ~{headroom:.1f}GB. "
-            f"Close some apps, or switch to a smaller model.")
+    if free < headroom + 1.5:   # 1.5GB OS breathing room (was 0.8 — too tight on Mac)
+        # Before hard-failing, try dropping to CPU which shares less with the OS
+        if DEVICE == "mps":
+            print(f"[engine] low RAM ({free:.1f}GB), falling back to CPU for safety")
+            _force_cpu()
+            free = free_ram_gb()
+            if free < headroom + 1.5:
+                raise MemoryError(
+                    f"Not enough memory to generate. Close other apps and try again. "
+                    f"({free:.1f}GB free, need ~{headroom:.1f}GB)")
+        else:
+            raise MemoryError(
+                f"Not enough memory to generate. Close other apps and try again. "
+                f"({free:.1f}GB free, need ~{headroom:.1f}GB)")
     cap = MODEL_MAX_DURATION.get(model_size, 20)
     return min(duration, cap)
 
@@ -74,7 +207,7 @@ def free_memory():
 
 def load_model(size: str = "small"):
     """Standard text->music model (musicgen-small/medium/large)."""
-    global _model, _processor, _current
+    global _model, _processor, _current, DEVICE, DTYPE
     if _current == size and _model is not None:
         return
     # switching models? free the old one first so we don't hold two in RAM
@@ -82,9 +215,17 @@ def load_model(size: str = "small"):
         free_memory()
     from transformers import AutoProcessor, MusicgenForConditionalGeneration
     model_id = f"facebook/musicgen-{size}"
-    print(f"[engine] loading {model_id} on {DEVICE} ...")
     _processor = AutoProcessor.from_pretrained(model_id)
-    _model = MusicgenForConditionalGeneration.from_pretrained(model_id).to(DEVICE)
+    try:
+        print(f"[engine] loading {model_id} on {DEVICE} ({DTYPE}) ...")
+        _model = MusicgenForConditionalGeneration.from_pretrained(
+            model_id, torch_dtype=DTYPE).to(DEVICE)
+    except Exception as e:
+        # MPS / fp16 path failed — fall back to plain CPU float32 so generation still works.
+        print(f"[engine] {DEVICE}/{DTYPE} load failed ({e}); falling back to cpu float32")
+        DEVICE, DTYPE = "cpu", torch.float32
+        _model = MusicgenForConditionalGeneration.from_pretrained(
+            model_id, torch_dtype=DTYPE).to(DEVICE)
     _current = size
     print("[engine] model ready")
 
@@ -109,15 +250,35 @@ def generate(prompt: str, duration: float = 8, model_size: str = "small",
     inputs = _processor(text=[text], padding=True, return_tensors="pt").to(DEVICE)
     max_tokens = int(duration * 50)  # ~50 tokens / second
 
-    with torch.no_grad():
-        out = _model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            guidance_scale=guidance,
-            do_sample=True,
-            temperature=float(temperature),
-        )
-    audio = out[0, 0].cpu().numpy().astype(np.float32)
+    try:
+        with torch.no_grad():
+            out = _generate_tokens(
+                **inputs,
+                max_new_tokens=max_tokens,
+                guidance_scale=guidance,
+                do_sample=True,
+                temperature=float(temperature),
+            )
+    except _CancelledError:
+        raise   # kill switch — never retry, let it propagate
+    except Exception as e:
+        if DEVICE == "mps":
+            print(f"[engine] mps generate failed ({e}); retrying on cpu")
+            _force_cpu()
+            load_model(model_size)
+            inputs = _processor(text=[text], padding=True, return_tensors="pt").to(DEVICE)
+            with torch.no_grad():
+                out = _generate_tokens(
+                    **inputs, max_new_tokens=max_tokens, guidance_scale=guidance,
+                    do_sample=True, temperature=float(temperature))
+        else:
+            raise
+    audio = out[0, 0].float().cpu().numpy().astype(np.float32)
+    # fp16 sampling can nudge the raw peak past 1.0 — guard against clipping
+    # before any downstream use (export normalizes too, but be safe everywhere).
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 1.0:
+        audio = audio / peak * 0.99
     sr = _model.config.audio_encoder.sampling_rate
     return sr, audio, used_seed
 
@@ -148,18 +309,63 @@ def extend(prompt: str, prior_audio: np.ndarray, prior_sr: int,
     # condition on the last ~4s for continuity
     tail = prime[-int(target_sr * 4):]
 
-    inputs = _processor(
+    inputs = _prep_inputs(_processor(
         audio=[tail], sampling_rate=target_sr,
-        text=[prompt], padding=True, return_tensors="pt").to(DEVICE)
+        text=[prompt], padding=True, return_tensors="pt"))
     max_tokens = int(add_duration * 50)
     with torch.no_grad():
-        out = _model.generate(**inputs, max_new_tokens=max_tokens,
+        out = _generate_tokens(**inputs, max_new_tokens=max_tokens,
                               guidance_scale=guidance, do_sample=True,
                               temperature=float(temperature))
     new_part = out[0, 0].cpu().numpy().astype(np.float32)
     # crossfade the seam so it sounds continuous
     combined = _seam(prime, new_part, target_sr, 0.15)
     return target_sr, combined, used_seed
+
+
+# Section "recipes" appended to the base prompt so each part has its own feel,
+# while keeping the same persona/instrumentation as the original track.
+SECTION_RECIPES = {
+    "Intro":  "intro section, stripped back, softer, building up gently, fewer drums",
+    "Verse":  "verse section, steady groove, moderate energy, room for vocals",
+    "Chorus": "chorus section, fuller and bigger, more energy, catchy and lifted, all elements in",
+    "Bridge": "bridge section, switch-up, different feel, breakdown, more atmospheric",
+    "Drop":   "drop section, maximum energy, hard-hitting, full drums and bass",
+    "Outro":  "outro section, winding down, stripped back, resolving, fading energy",
+}
+
+# Default structure for one-click "complete the song" → ~72s arranged track.
+AUTO_ARRANGEMENT = [
+    ("Verse", 12), ("Chorus", 14), ("Verse", 12),
+    ("Bridge", 10), ("Chorus", 14), ("Outro", 10),
+]
+
+
+def auto_finish(prompt: str, prior_audio: np.ndarray, prior_sr: int,
+                model_size: str = "small", guidance: float = 3.0,
+                arrangement: list[tuple[str, float]] | None = None,
+                on_progress=None):
+    """One-click: build a short take into a full arranged song that *flows* from
+    the original. Each section CONTINUES from the running song (via extend), so it
+    grows rather than restarting. Returns (sample_rate, full_audio, roles_list)."""
+    arrangement = arrangement or AUTO_ARRANGEMENT
+    base = (prompt or "continue the music").strip()
+    full = prior_audio
+    sr = prior_sr
+    roles = []
+    n = len(arrangement)
+    for i, (role, dur) in enumerate(arrangement):
+        if _cancel.is_set():
+            raise _CancelledError("generation cancelled")
+        if on_progress:
+            on_progress(i, n, role)
+        recipe = SECTION_RECIPES.get(role, "")
+        sec_prompt = f"{base.rstrip('.')}, {recipe}" if recipe else base
+        sr, full, _ = extend(sec_prompt, full, sr, add_duration=dur,
+                             model_size=model_size, guidance=guidance)
+        roles.append(role)
+    full = auto_master(full, sr)
+    return sr, full, roles
 
 
 def _seam(a: np.ndarray, b: np.ndarray, sr: int, xfade: float) -> np.ndarray:
@@ -226,11 +432,11 @@ def reference_generate(ref_audio: np.ndarray, ref_sr: int, prompt: str = "",
     prime = ref[-int(target_sr * 6):]
 
     text = prompt.strip() or "music in the same style as the reference"
-    inputs = _processor(audio=[prime], sampling_rate=target_sr,
-                        text=[text], padding=True, return_tensors="pt").to(DEVICE)
+    inputs = _prep_inputs(_processor(audio=[prime], sampling_rate=target_sr,
+                        text=[text], padding=True, return_tensors="pt"))
     max_tokens = int(duration * 50)
     with torch.no_grad():
-        out = _model.generate(**inputs, max_new_tokens=max_tokens,
+        out = _generate_tokens(**inputs, max_new_tokens=max_tokens,
                               guidance_scale=guidance, do_sample=True,
                               temperature=float(temperature))
     new_part = out[0, 0].cpu().numpy().astype(np.float32)
@@ -275,15 +481,15 @@ def add_layer(base_audio: np.ndarray, base_sr: int, instrument_prompt: str,
     if blend == "smart":
         prime = base[-int(target_sr * 6):]
         prime_len = len(prime)
-        inputs = _processor(audio=[prime], sampling_rate=target_sr,
+        inputs = _prep_inputs(_processor(audio=[prime], sampling_rate=target_sr,
                             text=[instrument_prompt], padding=True,
-                            return_tensors="pt").to(DEVICE)
+                            return_tensors="pt"))
     else:
-        inputs = _processor(text=[instrument_prompt], padding=True,
-                            return_tensors="pt").to(DEVICE)
+        inputs = _prep_inputs(_processor(text=[instrument_prompt], padding=True,
+                            return_tensors="pt"))
 
     with torch.no_grad():
-        out = _model.generate(**inputs, max_new_tokens=max_tokens,
+        out = _generate_tokens(**inputs, max_new_tokens=max_tokens,
                               guidance_scale=guidance, do_sample=True, temperature=1.0)
     layer = out[0, 0].cpu().numpy().astype(np.float32)
     # smart mode echoes the prime at the head — drop it so the layer aligns to t=0
@@ -536,16 +742,16 @@ def region_replace(audio: np.ndarray, sr: int,
     tail = prime[-int(target_sr * 4):] if len(prime) > 0 else None
 
     if tail is not None and len(tail) > 0:
-        inputs = _processor(
+        inputs = _prep_inputs(_processor(
             audio=[tail], sampling_rate=target_sr,
-            text=[prompt], padding=True, return_tensors="pt").to(DEVICE)
+            text=[prompt], padding=True, return_tensors="pt"))
     else:
-        inputs = _processor(
-            text=[prompt], padding=True, return_tensors="pt").to(DEVICE)
+        inputs = _prep_inputs(_processor(
+            text=[prompt], padding=True, return_tensors="pt"))
 
     max_tokens = int(duration * 50)
     with torch.no_grad():
-        out = _model.generate(**inputs, max_new_tokens=max_tokens,
+        out = _generate_tokens(**inputs, max_new_tokens=max_tokens,
                               guidance_scale=guidance, do_sample=True,
                               temperature=float(temperature))
 
@@ -650,8 +856,8 @@ def separate_stems(filepath: str, out_dir: str = None) -> dict:
     from demucs.apply import apply_model
 
     if _demucs is None:
-        print("[engine] loading Demucs (htdemucs) — downloads once …")
-        _demucs = get_model("htdemucs")
+        print("[engine] loading Demucs (htdemucs_6s) — downloads once …")
+        _demucs = get_model("htdemucs_6s")
         _demucs.eval()
 
     # load with soundfile (avoids torchaudio/torchcodec dependency)
@@ -664,20 +870,36 @@ def separate_stems(filepath: str, out_dir: str = None) -> dict:
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
+    demucs_device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"[engine] Demucs running on {demucs_device}")
     with torch.no_grad():
-        sources = apply_model(_demucs, wav[None], device="cpu",
+        sources = apply_model(_demucs, wav[None], device=demucs_device,
                               progress=True)[0]
     sources = sources * ref.std() + ref.mean()
 
-    names = _demucs.sources  # ['drums','bass','other','vocals']
+    # htdemucs_6s produces: drums, bass, guitar, piano, other, vocals
+    # DAW expects exactly: drums, bass, other, vocals
+    # Merge guitar + piano + other → "other" so nothing is lost
+    names = _demucs.sources
     out_dir = out_dir or OUT_DIR
     base = os.path.splitext(os.path.basename(filepath))[0]
-    out = {}
+
+    stem_arrays: dict[str, np.ndarray] = {}
     for name, src in zip(names, sources):
         mono = src.mean(0).cpu().numpy().astype(np.float32)
-        path = os.path.join(out_dir, f"{base}_{name}.wav")
-        sf.write(path, mono, sr)
-        out[name] = path
+        daw_name = name if name in ("drums", "bass", "vocals") else "other"
+        if daw_name in stem_arrays:
+            stem_arrays[daw_name] += mono   # sum extras into other
+        else:
+            stem_arrays[daw_name] = mono
+
+    out = {}
+    for daw_name, arr in stem_arrays.items():
+        # soft-clip after summing to prevent clipping when guitar+piano+other add up
+        arr = np.tanh(arr)
+        path = os.path.join(out_dir, f"{base}_{daw_name}.wav")
+        sf.write(path, arr, sr)
+        out[daw_name] = path
     return out
 
 
