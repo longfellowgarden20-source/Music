@@ -5,7 +5,7 @@ import { API, type Track } from "../lib/api";
 // ─── Types ─────────────────────────────────────────────────────────────────────
 type OscType = "triangle" | "sawtooth" | "square" | "sine" | "fatsawtooth" | "fatsquare" | "fattriangle" | "pulse" | "pwm";
 type FilterType = "lowpass" | "highpass" | "bandpass" | "notch";
-type PresetKey = "piano" | "synth" | "bass" | "pad" | "lead" | "drums" | "custom";
+type PresetKey = "piano" | "guitar" | "bass" | "strings" | "synth" | "lead" | "drums" | "custom";
 
 interface SynthParams {
   osc: OscType;
@@ -16,38 +16,92 @@ interface SynthParams {
   distortion: number; volume: number;
 }
 
-interface Preset { label: string; color: string; desc: string; p: SynthParams; }
+interface Preset { label: string; color: string; desc: string; p: SynthParams; sampled?: SampleSet; }
+
+// Real recorded-sample instruments. Tone.Sampler pitch-shifts between the
+// provided notes, so a handful of samples covers the whole keyboard.
+// All files live in /public/samples/<dir>/ and ship with the app (offline-safe).
+type SampleSet = {
+  dir: string;
+  urls: Record<string, string>;  // note -> filename
+};
+
+const SAMPLES: Record<string, SampleSet> = {
+  piano: {
+    dir: "piano",
+    urls: {
+      A0:"A0.mp3", C1:"C1.mp3", "D#1":"Ds1.mp3", "F#1":"Fs1.mp3", A1:"A1.mp3",
+      C2:"C2.mp3", "D#2":"Ds2.mp3", "F#2":"Fs2.mp3", A2:"A2.mp3",
+      C3:"C3.mp3", "D#3":"Ds3.mp3", "F#3":"Fs3.mp3", A3:"A3.mp3",
+      C4:"C4.mp3", "D#4":"Ds4.mp3", "F#4":"Fs4.mp3", A4:"A4.mp3",
+      C5:"C5.mp3", "D#5":"Ds5.mp3", "F#5":"Fs5.mp3", A5:"A5.mp3",
+      C6:"C6.mp3", "D#6":"Ds6.mp3", "F#6":"Fs6.mp3", A6:"A6.mp3", C7:"C7.mp3",
+    },
+  },
+  bass: {
+    dir: "bass-electric",
+    urls: {
+      "A#1":"As1.mp3", "C#2":"Cs2.mp3", E2:"E2.mp3", G2:"G2.mp3",
+      "A#2":"As2.mp3", "C#3":"Cs3.mp3", E3:"E3.mp3", G3:"G3.mp3",
+      "A#3":"As3.mp3", "C#4":"Cs4.mp3", E4:"E4.mp3",
+    },
+  },
+  guitar: {
+    dir: "guitar-acoustic",
+    urls: {
+      A2:"A2.mp3", C3:"C3.mp3", E3:"E3.mp3", A3:"A3.mp3",
+      C4:"C4.mp3", E4:"E4.mp3", A4:"A4.mp3",
+    },
+  },
+  strings: {
+    dir: "strings",
+    urls: {
+      A3:"A3.mp3", C4:"C4.mp3", E4:"E4.mp3", G4:"G4.mp3",
+      A4:"A4.mp3", C5:"C5.mp3", E5:"E5.mp3",
+    },
+  },
+};
 
 const PRESETS: Record<PresetKey, Preset> = {
   piano: {
-    label: "Piano", color: "#1db954", desc: "Warm acoustic feel",
-    p: { osc:"triangle", attack:0.01, decay:0.6, sustain:0.2, release:1.4,
-         detune:0, filterType:"lowpass", filterFreq:7000, filterQ:0.5,
-         reverb:0.35, delay:0, delayTime:0.25, chorus:0, distortion:0, volume:-6 },
+    label: "Piano", color: "#1db954", desc: "Real Steinway grand (recorded)",
+    sampled: SAMPLES.piano,
+    p: { osc:"triangle", attack:0.005, decay:0.6, sustain:0.4, release:1.2,
+         detune:0, filterType:"lowpass", filterFreq:18000, filterQ:0.4,
+         reverb:0.25, delay:0, delayTime:0.25, chorus:0, distortion:0, volume:-4 },
   },
-  synth: {
-    label: "Synth", color: "#22d3ee", desc: "Classic analog sawtooth",
-    p: { osc:"sawtooth", attack:0.05, decay:0.15, sustain:0.8, release:0.4,
-         detune:4, filterType:"lowpass", filterFreq:3500, filterQ:3,
-         reverb:0.2, delay:0, delayTime:0.375, chorus:0.3, distortion:0.1, volume:-8 },
+  guitar: {
+    label: "Guitar", color: "#eab308", desc: "Acoustic guitar (recorded)",
+    sampled: SAMPLES.guitar,
+    p: { osc:"triangle", attack:0.005, decay:0.5, sustain:0.4, release:1.0,
+         detune:0, filterType:"lowpass", filterFreq:16000, filterQ:0.4,
+         reverb:0.2, delay:0, delayTime:0.25, chorus:0.05, distortion:0, volume:-4 },
   },
   bass: {
-    label: "Bass", color: "#a78bfa", desc: "Deep sub-bass",
-    p: { osc:"square", attack:0.01, decay:0.25, sustain:0.7, release:0.2,
-         detune:0, filterType:"lowpass", filterFreq:400, filterQ:1,
-         reverb:0.05, delay:0, delayTime:0.25, chorus:0, distortion:0.05, volume:-3 },
+    label: "Bass", color: "#a78bfa", desc: "Electric bass (recorded)",
+    sampled: SAMPLES.bass,
+    p: { osc:"square", attack:0.005, decay:0.3, sustain:0.7, release:0.4,
+         detune:0, filterType:"lowpass", filterFreq:6000, filterQ:0.5,
+         reverb:0.05, delay:0, delayTime:0.25, chorus:0, distortion:0, volume:-3 },
   },
-  pad: {
-    label: "Pad", color: "#f472b6", desc: "Lush ambient swell",
-    p: { osc:"fattriangle", attack:0.7, decay:0.3, sustain:0.9, release:2.5,
-         detune:8, filterType:"lowpass", filterFreq:5000, filterQ:0.5,
-         reverb:0.75, delay:0.3, delayTime:0.5, chorus:0.5, distortion:0, volume:-10 },
+  strings: {
+    label: "Strings", color: "#f472b6", desc: "Lush bowed strings (recorded)",
+    sampled: SAMPLES.strings,
+    p: { osc:"fattriangle", attack:0.15, decay:0.3, sustain:0.9, release:1.8,
+         detune:0, filterType:"lowpass", filterFreq:14000, filterQ:0.4,
+         reverb:0.55, delay:0, delayTime:0.5, chorus:0.2, distortion:0, volume:-6 },
+  },
+  synth: {
+    label: "Synth", color: "#22d3ee", desc: "Fat analog synth",
+    p: { osc:"fatsawtooth", attack:0.04, decay:0.15, sustain:0.8, release:0.5,
+         detune:12, filterType:"lowpass", filterFreq:3500, filterQ:4,
+         reverb:0.25, delay:0.15, delayTime:0.375, chorus:0.4, distortion:0.08, volume:-9 },
   },
   lead: {
-    label: "Lead", color: "#fb923c", desc: "Bright cutting mono lead",
-    p: { osc:"fatsquare", attack:0.01, decay:0.08, sustain:0.6, release:0.3,
-         detune:2, filterType:"lowpass", filterFreq:9000, filterQ:2,
-         reverb:0.15, delay:0.2, delayTime:0.25, chorus:0.1, distortion:0.25, volume:-7 },
+    label: "Lead", color: "#fb923c", desc: "Bright cutting lead",
+    p: { osc:"fatsquare", attack:0.01, decay:0.08, sustain:0.6, release:0.4,
+         detune:8, filterType:"lowpass", filterFreq:9000, filterQ:3,
+         reverb:0.2, delay:0.25, delayTime:0.25, chorus:0.2, distortion:0.2, volume:-8 },
   },
   drums: {
     label: "Drums", color: "#fbbf24", desc: "808 / trap drum kit",
@@ -56,10 +110,10 @@ const PRESETS: Record<PresetKey, Preset> = {
          reverb:0.1, delay:0, delayTime:0.25, chorus:0, distortion:0.35, volume:-5 },
   },
   custom: {
-    label: "Custom", color: "#94a3b8", desc: "Build your own",
-    p: { osc:"sawtooth", attack:0.05, decay:0.2, sustain:0.5, release:0.5,
-         detune:0, filterType:"lowpass", filterFreq:5000, filterQ:1,
-         reverb:0.2, delay:0, delayTime:0.25, chorus:0, distortion:0, volume:-8 },
+    label: "Custom", color: "#94a3b8", desc: "Build your own synth",
+    p: { osc:"fatsawtooth", attack:0.05, decay:0.2, sustain:0.5, release:0.5,
+         detune:6, filterType:"lowpass", filterFreq:5000, filterQ:2,
+         reverb:0.2, delay:0, delayTime:0.25, chorus:0.1, distortion:0, volume:-8 },
   },
 };
 
@@ -107,6 +161,7 @@ export default function InstrumentStudio({ track, onMerged }: {
   const [merging, setMerging]     = useState(false);
   const [status, setStatus]       = useState("");
   const [tab, setTab]             = useState<"play"|"shape"|"fx"|"build">("play");
+  const [loadingSamples, setLoadingSamples] = useState(false);
 
   const toneRef   = useRef<any>(null);   // Tone module
   const synthRef  = useRef<any>(null);
@@ -114,6 +169,8 @@ export default function InstrumentStudio({ track, onMerged }: {
   const drumRefs  = useRef<any[]>([]);
   const recRef    = useRef<any>(null);
   const blobRef   = useRef<Blob|null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement|null>(null);
+  const [previewing, setPreviewing] = useState(false);
   const initialized = useRef(false);
 
   // ── Load + init Tone once ──────────────────────────────────────────────────
@@ -154,6 +211,8 @@ export default function InstrumentStudio({ track, onMerged }: {
     await rev.generate();
     chainRef.current = { filt, dist, cho, dly, rev };
 
+    const sampled = PRESETS[inst]?.sampled;
+
     if (inst === "drums") {
       // Individual synths per drum pad — no PolySynth needed
       const drums = DRUM_PADS.map(pad => {
@@ -182,6 +241,20 @@ export default function InstrumentStudio({ track, onMerged }: {
       });
       drumRefs.current = drums;
       synthRef.current = null;
+    } else if (sampled) {
+      // Real recorded-sample instrument via Tone.Sampler.
+      setLoadingSamples(true);
+      const sampler = new Tone.Sampler({
+        urls: sampled.urls,
+        baseUrl: `/samples/${sampled.dir}/`,
+        release: params.release,
+        volume: params.volume,
+        onload: () => setLoadingSamples(false),
+        onerror: () => setLoadingSamples(false),
+      });
+      // Samples already sound real — keep the FX chain subtle (filter + reverb + delay).
+      sampler.chain(filt, dly, rev, Tone.getDestination());
+      synthRef.current = sampler;
     } else {
       const synth = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: params.osc },
@@ -194,14 +267,50 @@ export default function InstrumentStudio({ track, onMerged }: {
     }
   }, [getTone]);
 
-  // Rebuild when params change (debounced 80ms so slider dragging doesn't spam)
-  const rebuildTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
+  // Full rebuild only when the instrument (preset) changes.
   useEffect(() => {
     if (!initialized.current) return;
-    if (rebuildTimer.current) clearTimeout(rebuildTimer.current);
-    rebuildTimer.current = setTimeout(() => buildChain(p, preset), 80);
-    return () => { if (rebuildTimer.current) clearTimeout(rebuildTimer.current); };
-  }, [p, preset, buildChain]);
+    buildChain(p, preset);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preset]);
+
+  // Live-adjust FX params without rebuilding (no sample re-download, no dropout).
+  const liveTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
+  useEffect(() => {
+    if (!initialized.current) return;
+    if (liveTimer.current) clearTimeout(liveTimer.current);
+    liveTimer.current = setTimeout(() => {
+      const c = chainRef.current;
+      const s = synthRef.current;
+      try {
+        if (c) {
+          if (c.filt) { c.filt.frequency.value = p.filterFreq; c.filt.Q.value = p.filterQ; c.filt.type = p.filterType; }
+          if (c.dist) c.dist.distortion = p.distortion;
+          if (c.cho)  c.cho.wet.value = p.chorus;
+          if (c.dly)  { c.dly.wet.value = p.delay; c.dly.delayTime.value = p.delayTime; }
+          if (c.rev)  c.rev.wet.value = p.reverb;
+        }
+        if (s) {
+          if (s.volume) s.volume.value = p.volume;
+          // PolySynth: update oscillator + envelope live; Sampler ignores these.
+          if (s.set) {
+            const isSampler = !!PRESETS[preset]?.sampled;
+            if (!isSampler && preset !== "drums") {
+              s.set({
+                oscillator: { type: p.osc },
+                detune: p.detune,
+                envelope: { attack: p.attack, decay: p.decay, sustain: p.sustain, release: p.release },
+              });
+            } else if (isSampler) {
+              s.release = p.release;
+            }
+          }
+        }
+      } catch {}
+    }, 40);
+    return () => { if (liveTimer.current) clearTimeout(liveTimer.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p]);
 
   // Switch preset
   const switchPreset = useCallback((key: PresetKey) => {
@@ -325,9 +434,36 @@ export default function InstrumentStudio({ track, onMerged }: {
     try {
       const blob = await recRef.current?.stop();
       blobRef.current = blob ?? null;
+      // Clean up any previous preview audio
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+        URL.revokeObjectURL(previewAudioRef.current.src);
+        previewAudioRef.current = null;
+      }
+      setPreviewing(false);
       setHasRecording(!!blob);
-      setStatus(blob ? "Performance captured — merge when ready." : "Nothing recorded.");
+      setStatus(blob ? "Performance captured — preview or merge below." : "Nothing recorded.");
     } catch { setStatus("Recording failed."); }
+  }
+
+  function togglePreview() {
+    if (!blobRef.current) return;
+    if (previewing) {
+      previewAudioRef.current?.pause();
+      setPreviewing(false);
+      return;
+    }
+    // Create fresh audio element from blob each time
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      URL.revokeObjectURL(previewAudioRef.current.src);
+    }
+    const url = URL.createObjectURL(blobRef.current);
+    const audio = new Audio(url);
+    previewAudioRef.current = audio;
+    audio.onended = () => setPreviewing(false);
+    audio.play().catch(() => {});
+    setPreviewing(true);
   }
 
   async function mergeRecording() {
@@ -411,6 +547,14 @@ export default function InstrumentStudio({ track, onMerged }: {
         ))}
       </div>
 
+      {/* Sample loading banner */}
+      {loadingSamples && (
+        <div style={{ fontSize:11, color:"var(--accent)", padding:"6px 10px",
+          background:"var(--bg3)", borderRadius:6, display:"flex", alignItems:"center", gap:8 }}>
+          <span className="spinner" /> Loading {pr.label.toLowerCase()} samples…
+        </div>
+      )}
+
       {/* ── PLAY TAB ── */}
       {tab === "play" && (
         preset === "drums" ? (
@@ -427,29 +571,42 @@ export default function InstrumentStudio({ track, onMerged }: {
       {/* ── ENVELOPE TAB ── */}
       {tab === "shape" && (
         <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-          {preset !== "drums" && (
-            <div style={{ marginBottom:4 }}>
-              <ParamLabel>Oscillator</ParamLabel>
-              <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:4 }}>
-                {(["sine","triangle","sawtooth","square","fatsawtooth","fatsquare","fattriangle","pulse"] as OscType[]).map(o => (
-                  <button key={o} onClick={() => setP(pp => ({ ...pp, osc:o }))}
-                    style={{
-                      padding:"4px 9px", borderRadius:6, border:"none", cursor:"pointer", fontSize:11, fontWeight:700,
-                      background: p.osc===o ? pr.color : "var(--bg3)",
-                      color: p.osc===o ? "#000" : "var(--muted)",
-                    }}>
-                    {o}
-                  </button>
-                ))}
+          {pr.sampled ? (
+            <>
+              <div style={{ fontSize:11, color:"var(--muted2)", lineHeight:1.6, marginBottom:4 }}>
+                This is a recorded instrument — its tone comes from real samples.
+                Only release (how long notes ring out) applies here. Use the FX tab to shape it.
               </div>
-            </div>
-          )}
-          <Slider label="Attack"  value={p.attack}  min={0.001} max={3}   step={0.001} display={v=>`${v.toFixed(3)}s`} onChange={v=>setP(pp=>({...pp,attack:v}))} />
-          <Slider label="Decay"   value={p.decay}   min={0.01}  max={3}   step={0.01}  display={v=>`${v.toFixed(2)}s`} onChange={v=>setP(pp=>({...pp,decay:v}))} />
-          <Slider label="Sustain" value={p.sustain} min={0}     max={1}   step={0.01}  display={v=>`${Math.round(v*100)}%`} onChange={v=>setP(pp=>({...pp,sustain:v}))} />
-          <Slider label="Release" value={p.release} min={0.01}  max={6}   step={0.01}  display={v=>`${v.toFixed(2)}s`} onChange={v=>setP(pp=>({...pp,release:v}))} />
-          {preset !== "drums" && (
-            <Slider label="Detune" value={p.detune} min={-50} max={50} step={1} display={v=>`${v}¢`} onChange={v=>setP(pp=>({...pp,detune:v}))} />
+              <Slider label="Release" value={p.release} min={0.05} max={6} step={0.01}
+                display={v=>`${v.toFixed(2)}s`} onChange={v=>setP(pp=>({...pp,release:v}))} />
+            </>
+          ) : (
+            <>
+              {preset !== "drums" && (
+                <div style={{ marginBottom:4 }}>
+                  <ParamLabel>Oscillator</ParamLabel>
+                  <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:4 }}>
+                    {(["sine","triangle","sawtooth","square","fatsawtooth","fatsquare","fattriangle","pulse"] as OscType[]).map(o => (
+                      <button key={o} onClick={() => setP(pp => ({ ...pp, osc:o }))}
+                        style={{
+                          padding:"4px 9px", borderRadius:6, border:"none", cursor:"pointer", fontSize:11, fontWeight:700,
+                          background: p.osc===o ? pr.color : "var(--bg3)",
+                          color: p.osc===o ? "#000" : "var(--muted)",
+                        }}>
+                        {o}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <Slider label="Attack"  value={p.attack}  min={0.001} max={3}   step={0.001} display={v=>`${v.toFixed(3)}s`} onChange={v=>setP(pp=>({...pp,attack:v}))} />
+              <Slider label="Decay"   value={p.decay}   min={0.01}  max={3}   step={0.01}  display={v=>`${v.toFixed(2)}s`} onChange={v=>setP(pp=>({...pp,decay:v}))} />
+              <Slider label="Sustain" value={p.sustain} min={0}     max={1}   step={0.01}  display={v=>`${Math.round(v*100)}%`} onChange={v=>setP(pp=>({...pp,sustain:v}))} />
+              <Slider label="Release" value={p.release} min={0.01}  max={6}   step={0.01}  display={v=>`${v.toFixed(2)}s`} onChange={v=>setP(pp=>({...pp,release:v}))} />
+              {preset !== "drums" && (
+                <Slider label="Detune" value={p.detune} min={-50} max={50} step={1} display={v=>`${v}¢`} onChange={v=>setP(pp=>({...pp,detune:v}))} />
+              )}
+            </>
           )}
         </div>
       )}
@@ -543,10 +700,19 @@ export default function InstrumentStudio({ track, onMerged }: {
             </button>
           )}
           {hasRecording && !recording && (
-            <button onClick={mergeRecording} disabled={merging}
-              className="btn btn-primary" style={{ flex:1, fontSize:12, fontWeight:700 }}>
-              {merging ? <><span className="spinner" /> Merging…</> : "Merge onto track"}
-            </button>
+            <>
+              <button onClick={togglePreview}
+                style={{ flex:1, padding:"9px 0", borderRadius:8, border:"none", cursor:"pointer",
+                  background: previewing ? "var(--accent)" : "var(--bg3)",
+                  color: previewing ? "#000" : "var(--muted)",
+                  fontWeight:700, fontSize:12 }}>
+                {previewing ? "Stop preview" : "Preview"}
+              </button>
+              <button onClick={mergeRecording} disabled={merging}
+                className="btn btn-primary" style={{ flex:1, fontSize:12, fontWeight:700 }}>
+                {merging ? <><span className="spinner" /> Merging…</> : "Merge onto track"}
+              </button>
+            </>
           )}
         </div>
         {status && (

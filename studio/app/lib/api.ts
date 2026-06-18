@@ -120,6 +120,18 @@ export const api = {
     req<{ vibe?: string; strengths?: string[]; suggestions?: string[]; next?: string; error?: string }>(
       `/api/track/${id}/ai-notes`),
 
+  // stems / multitrack DAW
+  stems: (id: number) =>
+    req<{ track_id: number; separated: boolean; stems: Record<string, string> }>(`/api/stems/${id}`),
+  splitStems: (id: number) =>
+    req<{ track_id: number; separated: boolean; stems: Record<string, string> }>(
+      `/api/stems/${id}/split`, { method: "POST" }),
+  stemWaveform: (id: number, stem: string, points = 1400) =>
+    req<{ peaks: number[]; duration: number }>(`/api/waveform-stem/${id}/${stem}?points=${points}`),
+  mixdown: (id: number, mixer: Record<string, { volume: number; muted: boolean; pan?: number }>) =>
+    req<{ id: number; track: Track }>(`/api/stems/${id}/mixdown`, { method: "POST", body: JSON.stringify({ mixer }) }),
+  stemAudioUrl: (id: number, stem: string) => `${API}/api/stem-audio/${id}/${stem}`,
+
   audioUrl: (id: number) => `${API}/api/audio/${id}`,
   coverUrl: (id: number) => `${API}/api/cover/${id}`,
 

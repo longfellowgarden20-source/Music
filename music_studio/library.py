@@ -32,10 +32,14 @@ def _data_dir() -> str:
     os.makedirs(base, exist_ok=True)
     return base
 
-# Real library by default. Set MUSIC_STUDIO_TEST_DB=1 to use a throwaway DB
-# so automated tests can NEVER touch your actual saved tracks.
+# Real library by default.
+# MUSIC_STUDIO_TEST_DB=1 → throwaway DB for automated tests
+# STEMAI_DEV=1           → use local music_output/ folder (dev mode)
 if os.environ.get("MUSIC_STUDIO_TEST_DB"):
     DB_PATH = "music_output/_test_library.db"
+    AUDIO_DIR = "music_output"
+elif os.environ.get("STEMAI_DEV"):
+    DB_PATH = "music_output/library.db"
     AUDIO_DIR = "music_output"
 else:
     _DATA = _data_dir()

@@ -9,6 +9,7 @@ import AiNotes from "../components/AiNotes";
 import ShareTrack from "../components/ShareTrack";
 import VocalRecorder from "../components/VocalRecorder";
 import InstrumentStudio from "../components/InstrumentStudio";
+import MultitTrackMixer from "../components/MultitTrackMixer";
 
 type Busy = string | null;
 
@@ -228,6 +229,11 @@ export default function EditStudio() {
         {/* Share */}
         <div className="card" style={{ padding: 16 }}>
           <ShareTrack track={track} />
+        </div>
+
+        {/* Multitrack mixer */}
+        <div className="card" style={{ padding: 16 }}>
+          <MultitTrackMixer track={track} onMerged={t => { setTrack(t); play(t); }} />
         </div>
 
         {/* Live vocal recording */}

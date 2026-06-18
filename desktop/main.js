@@ -8,7 +8,7 @@
 // In dev (ELECTRON_DEV=1) it assumes you already run `npm run dev` for the UI
 // and the engine yourself; it just opens the window pointed at localhost.
 
-const { app, BrowserWindow, shell, dialog, systemPreferences } = require("electron");
+const { app, BrowserWindow, shell, dialog, systemPreferences, session } = require("electron");
 const path = require("path");
 const http = require("http");
 const fs = require("fs");
@@ -46,15 +46,12 @@ function startUiServer(root) {
         let rel = decodeURIComponent((req.url || "/").split("?")[0]);
         if (rel.endsWith("/")) rel += "index.html";
         let file = path.join(root, rel);
-        // Prevent path traversal outside the UI root.
         if (!file.startsWith(root)) return send(res, 403, "Forbidden");
-        // trailingSlash export: /generate -> /generate/index.html
         if (!fs.existsSync(file) && fs.existsSync(file + ".html")) file += ".html";
         else if (!fs.existsSync(file) && fs.existsSync(path.join(file, "index.html"))) {
           file = path.join(file, "index.html");
         }
         if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-          // SPA fallback for unknown routes -> the export's 404 or root.
           const fallback = path.join(root, "index.html");
           return send(res, 200, fs.readFileSync(fallback), "text/html");
         }
@@ -63,7 +60,15 @@ function startUiServer(root) {
         send(res, 500, String(e));
       }
     });
-    uiServer.on("error", reject);
+    uiServer.on("error", (err) => {
+      if (err.code === "EADDRINUSE") {
+        // Another instance is already running — focus it instead of crashing.
+        console.log("[ui] port in use — another instance is running, focusing it");
+        resolve(); // let the app continue; loadURL will hit the existing server
+      } else {
+        reject(err);
+      }
+    });
     uiServer.listen(UI_PORT, "127.0.0.1", () => resolve());
   });
 }
@@ -174,9 +179,21 @@ function createWindow() {
   setTimeout(reveal, 4000);
 }
 
+// Single instance lock — if another copy is already running, focus it and quit.
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 app.whenReady().then(async () => {
   // Set up mic/media permissions before the window opens.
-  const { session } = require("electron");
   setupPermissions(session.defaultSession);
 
   if (!IS_DEV) {
