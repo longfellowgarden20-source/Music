@@ -57,6 +57,16 @@ from pydantic import BaseModel
 from typing import Optional
 
 try:
+    from dotenv import load_dotenv as _lde
+    # Load .env.local from the repo root (dev) or user home dir (packaged app)
+    for _p in [".env.local", os.path.join(os.path.expanduser("~"), ".stemai.env")]:
+        if os.path.exists(_p):
+            _lde(_p, override=False)
+            break
+except Exception:
+    pass
+
+try:
     from . import library, engine, effects, history, clip_edits, project, stem_fx, youtube, vocals, licensing
 except ImportError:
     import sys
@@ -265,6 +275,32 @@ def ai_notes(track_id: int):
         key=t.get("musical_key"),
         duration=t.get("duration"),
     )
+
+
+@app.post("/api/track/{track_id}/share")
+def share_track(track_id: int):
+    """Upload the track audio to 0x0.st from the backend (no browser CSP restrictions)
+    and return the public URL."""
+    import httpx
+    t = _require(track_id)
+    path = t.get("filepath", "")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Audio file not found")
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        title = (t.get("title") or t.get("prompt") or "track")[:60]
+        fname = title.replace("/", "_").replace("\\", "_") + ".wav"
+        r = httpx.post("https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload", "userhash": ""},
+            files={"fileToUpload": (fname, data, "audio/wav")}, timeout=120)
+        r.raise_for_status()
+        url = r.text.strip()
+        if not url.startswith("http"):
+            raise ValueError(f"Unexpected response: {url}")
+        return {"url": url}
+    except Exception as e:
+        raise HTTPException(502, f"Upload failed: {e}")
 
 
 @app.post("/api/track/{track_id}/collection")
@@ -785,7 +821,13 @@ async def merge_vocal(track_id: int, vocal: UploadFile = File(...)):
 
 
 # ── stems (DAW) ────────────────────────────────────────────────────────────────
-_OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "music_output")
+# Use the engine's OWN output dir (resolved to absolute) so that the directory
+# stems are WRITTEN to is always the same one we LOOK them up in. Previously this
+# recomputed a repo-relative path which diverged from engine.OUT_DIR when the
+# packaged app ran with a different cwd → stems written, never found, silent
+# empty tracks in the DAW.
+_OUT_DIR = os.path.abspath(getattr(engine, "OUT_DIR", "music_output"))
+os.makedirs(_OUT_DIR, exist_ok=True)
 
 def _stem_path(t, name):
     """Find a stem file for track t and stem name.
@@ -820,8 +862,16 @@ def split_stems(track_id: int):
     if not t["filepath"] or not os.path.exists(t["filepath"]):
         raise HTTPException(404, "Track not found")
     try:
-        stems = engine.separate_stems(t["filepath"])
+        # Pass the explicit absolute dir so writes land exactly where _stem_path looks.
+        stems = engine.separate_stems(t["filepath"], out_dir=_OUT_DIR)
+        # Verify the files actually exist before claiming success — never report a
+        # "fake" split that leaves the DAW with empty, silent tracks.
+        missing = [n for n, p in stems.items() if not os.path.exists(p)]
+        if missing:
+            raise RuntimeError(f"stems written but not found on disk: {missing}")
         return {"track_id": track_id, "separated": True, "stems": stems}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Stem separation failed: {e}")
 

@@ -135,7 +135,9 @@ export default function LibraryPage() {
               {/* actions */}
               <div style={{ display: "flex", gap: 6 }}>
                 <button className="btn btn-primary" style={{ flex: 1, padding: "6px 0", fontSize: 12, fontWeight: 700 }}
-                  onClick={() => router.push(`/edit?id=${t.id}`)}>Open in DAW</button>
+                  onClick={() => router.push(`/daw?id=${t.id}`)}>Open in DAW</button>
+                <button className="btn" style={{ padding: "6px 10px", fontSize: 12, color: "var(--muted)" }}
+                  onClick={() => router.push(`/edit?id=${t.id}`)}>Edit</button>
                 <button className="btn" style={{ padding: "6px 12px", fontSize: 12, color: "var(--accent)" }}
                   onClick={() => router.push(`/vocals?track=${t.id}`)}>🎤</button>
                 <button className="btn" style={{ padding: "6px 12px", fontSize: 12, color: "var(--red)" }}

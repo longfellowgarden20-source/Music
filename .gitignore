@@ -45,3 +45,7 @@ desktop/dist/
 .idea/
 .vscode/
 nohup.out
+
+# PyInstaller build artifacts
+/build/
+/dist/

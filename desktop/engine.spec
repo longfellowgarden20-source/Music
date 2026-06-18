@@ -17,7 +17,17 @@ block_cipher = None
 _bundle = ["transformers", "torch", "torchaudio", "demucs",
            "soundfile", "librosa", "scipy", "numpy"]
 
+# Homebrew libs that PyInstaller misses on Apple Silicon
+import glob as _glob
+_extra_libs = []
+for _pat in ["/opt/homebrew/lib/libintl.8.dylib", "/usr/local/lib/libintl.8.dylib"]:
+    _found = _glob.glob(_pat)
+    if _found:
+        _extra_libs.append((_found[0], "."))
+        break
+
 datas, binaries, hiddenimports = [], [], []
+binaries += _extra_libs
 for pkg in _bundle:
     try:
         d, b, h = collect_all(pkg)

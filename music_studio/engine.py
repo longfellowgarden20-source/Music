@@ -16,8 +16,30 @@ import torch
 import soundfile as sf
 from datetime import datetime
 
-OUT_DIR = "music_output"
-os.makedirs(OUT_DIR, exist_ok=True)
+def _resolve_out_dir() -> str:
+    """Absolute, stable, writable output dir for generated audio + stems.
+
+    Must NOT be cwd-relative: the packaged app runs with cwd inside the .app
+    bundle, so a relative "music_output" landed in a throwaway location that the
+    API server (which used an absolute repo path) could never find — stems were
+    written but never located, giving silent empty DAW tracks.
+
+      - dev (STEMAI_DEV=1): repo-local ./music_output, so it's easy to inspect
+      - packaged: ~/Library/Application Support/StemAI/music_output (persistent,
+        same root the DB + tracks already live in)
+    """
+    override = os.environ.get("STEMAI_OUT_DIR", "").strip()
+    if override:
+        d = os.path.abspath(override)
+    elif os.environ.get("STEMAI_DEV") == "1":
+        d = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "music_output"))
+    else:
+        base = os.path.expanduser("~/Library/Application Support/StemAI")
+        d = os.path.join(base, "music_output")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+OUT_DIR = _resolve_out_dir()
 
 def _pick_device() -> str:
     """Prefer Apple GPU (MPS) when available — much faster + lower RAM than CPU.

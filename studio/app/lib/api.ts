@@ -132,6 +132,16 @@ export const api = {
     req<{ id: number; track: Track }>(`/api/stems/${id}/mixdown`, { method: "POST", body: JSON.stringify({ mixer }) }),
   stemAudioUrl: (id: number, stem: string) => `${API}/api/stem-audio/${id}/${stem}`,
 
+  // AI stem ops (DAW)
+  stemRegenerate: (id: number, stem: string, body: Record<string, unknown>) =>
+    req<{ ok: boolean; stem: string; duration: number }>(`/api/daw/${id}/stem-regenerate/${stem}`, { method: "POST", body: JSON.stringify(body) }),
+  stemExtend: (id: number, stem: string, body: Record<string, unknown>) =>
+    req<{ ok: boolean; stem: string; duration: number }>(`/api/daw/${id}/stem-extend/${stem}`, { method: "POST", body: JSON.stringify(body) }),
+  stemSwap: (id: number, stem: string, body: Record<string, unknown>) =>
+    req<{ ok: boolean; stem: string; duration: number }>(`/api/daw/${id}/stem-swap/${stem}`, { method: "POST", body: JSON.stringify(body) }),
+  stemRevert: (id: number, stem: string) =>
+    req<{ ok: boolean; stem: string }>(`/api/daw/${id}/stem-revert/${stem}`, { method: "POST" }),
+
   audioUrl: (id: number) => `${API}/api/audio/${id}`,
   coverUrl: (id: number) => `${API}/api/cover/${id}`,
 

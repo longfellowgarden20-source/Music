@@ -18,7 +18,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <ProgressProvider>
             <PlayerProvider>
               <NavBar />
-              <main style={{ minHeight: "calc(100vh - 56px)" }}>{children}</main>
+              <main style={{ minHeight: "calc(100vh - 56px)", height: "calc(100vh - 56px)" }}>{children}</main>
             </PlayerProvider>
           </ProgressProvider>
         </LicenseGate>

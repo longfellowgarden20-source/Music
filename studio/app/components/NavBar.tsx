@@ -14,6 +14,9 @@ export default function NavBar() {
   const active = (href: string) =>
     href === "/" ? path === "/" : path.startsWith(href);
 
+  // DAW is full-screen — hide nav entirely
+  if (path.startsWith("/daw")) return null;
+
   // Edit Studio is only shown when we're actually in it (arrived via track card)
   const inEdit = path.startsWith("/edit");
 

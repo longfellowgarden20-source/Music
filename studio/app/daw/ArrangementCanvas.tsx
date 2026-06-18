@@ -1,0 +1,668 @@
+"use client";
+import { useRef, useEffect, useCallback } from "react";
+import type { DawTrack, TransportState, ViewState, Gesture, Marker, TimeSelection } from "./dawTypes";
+import { snapSec } from "./snap";
+import { C, withAlpha } from "./theme";
+
+const RULER_H = 30;
+const EDGE_PX = 8;
+const FADE_PX = 14;     // size of fade-handle hit zone
+const MARKER_H = 14;
+
+interface Props {
+  tracks: DawTrack[];
+  transport: TransportState;
+  view: ViewState;
+  positionSec: number;
+  gesture: Gesture | null;
+  markers: Marker[];
+  selection: TimeSelection | null;
+  selectMode: boolean;
+  automationLane: "volume" | "pan" | null;
+  onSeek: (sec: number) => void;
+  onAutomationEdit: (trackId: string, sec: number, value: number) => void;
+  onScrollLeft: (v: number) => void;
+  onZoom: (z: number) => void;
+  onGestureStart: (g: Gesture) => void;
+  onGestureMove: (clientX: number, clientY: number) => void;
+  onGestureEnd: () => void;
+  onClipSplit: (trackId: string, clipId: string) => void;
+  onClipGain: (trackId: string, clipId: string, delta: number) => void;
+  onLoopRange: (start: number, end: number) => void;
+  onMarkerClick: (m: Marker) => void;
+  onSelectRegion: (sel: TimeSelection | null) => void;
+}
+
+export default function ArrangementCanvas({
+  tracks, transport, view, positionSec, gesture, markers, selection, selectMode,
+  automationLane, onAutomationEdit,
+  onSeek, onScrollLeft, onZoom, onGestureStart, onGestureMove, onGestureEnd,
+  onClipSplit, onClipGain, onLoopRange, onMarkerClick, onSelectRegion,
+}: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number>(0);
+  const stateRef = useRef({ tracks, transport, view, positionSec, markers, selection, automationLane });
+  stateRef.current = { tracks, transport, view, positionSec, markers, selection, automationLane };
+
+  // track an in-progress loop-range drag locally for live preview
+  const loopDragRef = useRef<{ start: number; end: number } | null>(null);
+  // in-progress marquee selection
+  const marqueeRef = useRef<TimeSelection | null>(null);
+
+  // ── render ──────────────────────────────────────────────────────────────────
+  const render = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const { tracks, transport, view, positionSec, markers } = stateRef.current;
+    const { zoom, bpm } = transport;
+    const { scrollLeft, trackHeight } = view;
+    const W = canvas.width;
+    const H = canvas.height;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = C.arrange;
+    ctx.fillRect(0, 0, W, H);
+
+    // alternating track rows + bottom separators for depth
+    tracks.forEach((_, i) => {
+      const y = RULER_H + i * trackHeight;
+      ctx.fillStyle = i % 2 === 0 ? C.rowA : C.rowB;
+      ctx.fillRect(0, y, W, trackHeight);
+      ctx.fillStyle = "rgba(0,0,0,0.25)";
+      ctx.fillRect(0, y + trackHeight - 1, W, 1);
+      ctx.fillStyle = "rgba(255,255,255,0.02)";
+      ctx.fillRect(0, y, W, 1);
+    });
+
+    // loop region shading
+    const loopRange = loopDragRef.current ?? (transport.looping ? { start: transport.loopStart, end: transport.loopEnd } : null);
+    if (loopRange && loopRange.end > loopRange.start) {
+      const lx = loopRange.start * zoom - scrollLeft;
+      const lw = (loopRange.end - loopRange.start) * zoom;
+      ctx.fillStyle = withAlpha(C.accent, 0.07);
+      ctx.fillRect(lx, RULER_H, lw, H - RULER_H);
+      ctx.fillStyle = withAlpha(C.accent, 0.5);
+      ctx.fillRect(lx, RULER_H, 1.5, H - RULER_H);
+      ctx.fillRect(lx + lw - 1.5, RULER_H, 1.5, H - RULER_H);
+      // loop band in ruler
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(lx, MARKER_H, lw, 3);
+    }
+
+    // grid + ruler
+    const secPerBeat = 60 / bpm;
+    const intervals = [
+      secPerBeat / 4, secPerBeat / 2, secPerBeat,
+      secPerBeat * 2, secPerBeat * 4, 1, 2, 5, 10, 30
+    ];
+    const interval = intervals.find(iv => iv * zoom > 48) ?? 30;
+    const startSec = scrollLeft / zoom;
+    const endSec = (scrollLeft + W) / zoom;
+    let t = Math.floor(startSec / interval) * interval;
+
+    // ruler bg with subtle gradient for depth
+    const rg = ctx.createLinearGradient(0, 0, 0, RULER_H);
+    rg.addColorStop(0, C.bg2);
+    rg.addColorStop(1, C.bg1);
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, W, RULER_H);
+    ctx.fillStyle = "rgba(0,0,0,0.4)";
+    ctx.fillRect(0, RULER_H - 1, W, 1);
+
+    while (t <= endSec + interval) {
+      const x = Math.round(t * zoom - scrollLeft);
+      const beatNum = Math.round(t / secPerBeat);
+      const isBar = beatNum % 4 === 0;
+      const isBeat = beatNum % 1 === 0;
+
+      ctx.strokeStyle = isBar ? "rgba(255,255,255,0.09)" : "rgba(255,255,255,0.035)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, RULER_H);
+      ctx.lineTo(x + 0.5, H);
+      ctx.stroke();
+
+      const tickH = isBar ? 12 : isBeat ? 7 : 4;
+      ctx.strokeStyle = isBar ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.18)";
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, RULER_H);
+      ctx.lineTo(x + 0.5, RULER_H - tickH);
+      ctx.stroke();
+
+      if (isBar || (zoom > 60 && isBeat)) {
+        const bars = Math.floor(beatNum / 4) + 1;
+        const beats = (beatNum % 4) + 1;
+        const label = isBar ? `${bars}` : `${bars}.${beats}`;
+        ctx.fillStyle = isBar ? C.text2 : C.text3;
+        ctx.font = `${isBar ? 700 : 500} 10px 'SF Mono', monospace`;
+        ctx.fillText(label, x + 4, 12);
+      }
+      t += interval;
+    }
+
+    // clips + waveforms + fades
+    tracks.forEach((track, i) => {
+      const ry = RULER_H + i * trackHeight;
+      track.clips.forEach(clip => {
+        const cx = clip.startSec * zoom - scrollLeft;
+        const cw = clip.durationSec * zoom;
+        if (cx + cw < 0 || cx > W) return;
+
+        const color = clip.color ?? track.color;
+        const isMuted = track.muted;
+        const alpha = isMuted ? 0.4 : 1;
+        const top = ry + 4;
+        const bh = trackHeight - 8;
+        const HDR = 15;   // clip header strip height
+
+        ctx.globalAlpha = alpha;
+
+        // drop shadow under clip for depth
+        ctx.fillStyle = "rgba(0,0,0,0.35)";
+        roundRect(ctx, cx + 1, top + 2, cw, bh, 4);
+        ctx.fill();
+
+        // clip body — vertical gradient of the muted color (Ableton style)
+        const bodyGrad = ctx.createLinearGradient(0, top, 0, top + bh);
+        bodyGrad.addColorStop(0, withAlpha(color, 0.42));
+        bodyGrad.addColorStop(1, withAlpha(color, 0.24));
+        ctx.fillStyle = bodyGrad;
+        roundRect(ctx, cx, top, cw, bh, 4);
+        ctx.fill();
+
+        // header strip (brighter band at top, where the label sits)
+        if (cw > 14) {
+          ctx.save();
+          roundRect(ctx, cx, top, cw, bh, 4);
+          ctx.clip();
+          ctx.fillStyle = withAlpha(color, 0.7);
+          ctx.fillRect(cx, top, cw, HDR);
+          ctx.fillStyle = "rgba(0,0,0,0.18)";
+          ctx.fillRect(cx, top + HDR - 1, cw, 1);
+          ctx.restore();
+        }
+
+        // crisp 1px border
+        ctx.strokeStyle = withAlpha(color, 0.9);
+        ctx.lineWidth = 1;
+        roundRect(ctx, cx + 0.5, top + 0.5, cw - 1, bh - 1, 4);
+        ctx.stroke();
+
+        // label in header strip
+        if (cw > 34) {
+          ctx.fillStyle = "rgba(0,0,0,0.78)";
+          ctx.font = "700 9px 'Inter', system-ui";
+          ctx.fillText(track.label.toUpperCase(), cx + 6, top + 11);
+          if ((clip.gain ?? 1) !== 1 && cw > 90) {
+            const gdb = 20 * Math.log10(clip.gain ?? 1);
+            ctx.fillStyle = "rgba(0,0,0,0.55)";
+            ctx.font = "600 8px 'SF Mono', monospace";
+            ctx.fillText(`${gdb > 0 ? "+" : ""}${gdb.toFixed(1)}`, cx + cw - 30, top + 11);
+          }
+        }
+
+        // waveform (below header strip)
+        if (track.peakData && cw > 8) {
+          drawWaveform(ctx, clip, track.peakData, color, cx, ry + HDR, cw, trackHeight - HDR);
+        }
+
+        // fade-in triangle
+        const fiW = (clip.fadeInSec ?? 0) * zoom;
+        if (fiW > 1) {
+          ctx.fillStyle = "rgba(10,10,12,0.55)";
+          ctx.beginPath();
+          ctx.moveTo(cx, top);
+          ctx.lineTo(cx + fiW, top);
+          ctx.lineTo(cx, top + bh);
+          ctx.closePath();
+          ctx.fill();
+          ctx.strokeStyle = "rgba(255,255,255,0.3)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(cx, top + bh);
+          ctx.lineTo(cx + fiW, top);
+          ctx.stroke();
+        }
+        // fade-out triangle
+        const foW = (clip.fadeOutSec ?? 0) * zoom;
+        if (foW > 1) {
+          ctx.fillStyle = "rgba(10,10,12,0.55)";
+          ctx.beginPath();
+          ctx.moveTo(cx + cw, top);
+          ctx.lineTo(cx + cw - foW, top);
+          ctx.lineTo(cx + cw, top + bh);
+          ctx.closePath();
+          ctx.fill();
+          ctx.strokeStyle = "rgba(255,255,255,0.3)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(cx + cw - foW, top);
+          ctx.lineTo(cx + cw, top + bh);
+          ctx.stroke();
+        }
+
+        // fade handles (small squares in top corners)
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        sq(ctx, cx + Math.max(fiW, 3), top + 2, 3);
+        sq(ctx, cx + cw - Math.max(foW, 3), top + 2, 3);
+
+        ctx.globalAlpha = 1;
+      });
+    });
+
+    // markers
+    markers.forEach(m => {
+      const mx = m.sec * zoom - scrollLeft;
+      if (mx < -10 || mx > W + 10) return;
+      // flag pennant
+      ctx.fillStyle = m.color;
+      ctx.beginPath();
+      ctx.moveTo(mx, 0);
+      ctx.lineTo(mx + 8, 0);
+      ctx.lineTo(mx + 8, MARKER_H - 5);
+      ctx.lineTo(mx, MARKER_H);
+      ctx.closePath();
+      ctx.fill();
+      // guide line
+      ctx.strokeStyle = withAlpha(m.color, 0.28);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(mx + 0.5, MARKER_H);
+      ctx.lineTo(mx + 0.5, H);
+      ctx.stroke();
+      if (m.label) {
+        ctx.fillStyle = C.text;
+        ctx.font = "700 9px 'Inter', system-ui";
+        ctx.fillText(m.label, mx + 11, MARKER_H - 3);
+      }
+    });
+
+    // region selection highlight (committed or in-progress marquee)
+    const sel = marqueeRef.current ?? stateRef.current.selection;
+    if (sel && sel.endSec > sel.startSec) {
+      const ti = tracks.findIndex(t => t.id === sel.trackId);
+      if (ti >= 0) {
+        const sx = sel.startSec * zoom - scrollLeft;
+        const sw = (sel.endSec - sel.startSec) * zoom;
+        const sy = RULER_H + ti * trackHeight;
+        ctx.fillStyle = withAlpha(C.accent, 0.18);
+        ctx.fillRect(sx, sy, sw, trackHeight);
+        ctx.strokeStyle = C.accent;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(sx + 0.5, sy + 0.5, sw - 1, trackHeight - 1);
+        ctx.setLineDash([]);
+        // edge handles
+        ctx.fillStyle = C.accent;
+        ctx.fillRect(sx - 1, sy, 2, trackHeight);
+        ctx.fillRect(sx + sw - 1, sy, 2, trackHeight);
+      }
+    }
+
+    // automation overlay (volume/pan curve per track)
+    const lane = stateRef.current.automationLane;
+    if (lane) {
+      tracks.forEach((track, i) => {
+        const pts = track.automation?.[lane];
+        const y0 = RULER_H + i * trackHeight;
+        const h = trackHeight;
+        // value→y: volume 0..1 (1 at top), pan -1..1 (top = +1)
+        const valToY = (v: number) => lane === "volume"
+          ? y0 + h - v * h
+          : y0 + h / 2 - (v * h / 2);
+        const color = lane === "volume" ? "#4fd1a5" : "#c4a96e";
+        // faint lane bg tint
+        ctx.fillStyle = withAlpha(color, 0.04);
+        ctx.fillRect(0, y0, W, h);
+        if (lane === "pan") { // center line
+          ctx.strokeStyle = withAlpha(color, 0.2); ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(0, y0 + h / 2 + 0.5); ctx.lineTo(W, y0 + h / 2 + 0.5); ctx.stroke();
+        }
+        const sorted = pts && pts.length ? [...pts].sort((a, b) => a.sec - b.sec)
+          : [{ sec: 0, value: lane === "volume" ? track.volume : track.pan }];
+        ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        sorted.forEach((pt, k) => {
+          const x = pt.sec * zoom - scrollLeft;
+          const y = valToY(pt.value);
+          if (k === 0) { ctx.moveTo(0, y); ctx.lineTo(x, y); } else ctx.lineTo(x, y);
+        });
+        const last = sorted[sorted.length - 1];
+        ctx.lineTo(W, valToY(last.value));
+        ctx.stroke();
+        // points
+        (pts ?? []).forEach(pt => {
+          const x = pt.sec * zoom - scrollLeft;
+          const y = valToY(pt.value);
+          ctx.fillStyle = color;
+          ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = "#0c1714"; ctx.lineWidth = 1; ctx.stroke();
+        });
+      });
+    }
+
+    // playhead
+    const px = Math.round(positionSec * zoom - scrollLeft);
+    if (px >= 0 && px <= W) {
+      const grad = ctx.createLinearGradient(px - 8, 0, px + 8, 0);
+      grad.addColorStop(0, "rgba(255,255,255,0)");
+      grad.addColorStop(0.5, withAlpha(C.accent, 0.12));
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(px - 8, RULER_H, 16, H - RULER_H);
+      ctx.strokeStyle = C.accent;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(px + 0.5, RULER_H);
+      ctx.lineTo(px + 0.5, H);
+      ctx.stroke();
+      // playhead head triangle
+      ctx.fillStyle = C.accent;
+      ctx.beginPath();
+      ctx.moveTo(px - 5, RULER_H - 7);
+      ctx.lineTo(px + 5, RULER_H - 7);
+      ctx.lineTo(px, RULER_H);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }, []);
+
+  // rAF loop during playback
+  useEffect(() => {
+    const loop = () => {
+      render();
+      if (stateRef.current.transport.playing) rafRef.current = requestAnimationFrame(loop);
+    };
+    if (transport.playing) rafRef.current = requestAnimationFrame(loop);
+    else render();
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [transport.playing, render]);
+
+  useEffect(() => {
+    if (!transport.playing) render();
+  }, [tracks, transport, view, positionSec, markers, render]);
+
+  // resize
+  useEffect(() => {
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
+    const ro = new ResizeObserver(() => {
+      const { width, height } = container.getBoundingClientRect();
+      canvas.width = width;
+      canvas.height = height;
+      render();
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, [render]);
+
+  const onScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    onScrollLeft((e.target as HTMLDivElement).scrollLeft);
+  }, [onScrollLeft]);
+
+  // wheel: ctrl = zoom, over clip = gain, else scroll (native)
+  const onWheel = useCallback((e: React.WheelEvent) => {
+    const { tracks, transport, view } = stateRef.current;
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      const delta = -e.deltaY * 0.003;
+      onZoom(Math.max(30, Math.min(600, transport.zoom * (1 + delta))));
+      return;
+    }
+    // gain adjust if hovering a clip and holding shift
+    if (e.shiftKey) {
+      const oy = e.nativeEvent.offsetY;
+      if (oy < RULER_H) return;
+      const ti = Math.floor((oy - RULER_H) / view.trackHeight);
+      const track = tracks[ti];
+      if (!track) return;
+      const sec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
+      const clip = track.clips.find(c => sec >= c.startSec && sec <= c.startSec + c.durationSec);
+      if (clip) {
+        e.preventDefault();
+        onClipGain(track.id, clip.id, e.deltaY < 0 ? 0.05 : -0.05);
+      }
+    }
+  }, [onZoom, onClipGain]);
+
+  const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const { tracks, transport, view, positionSec } = stateRef.current;
+    const { zoom, bpm, snap } = transport;
+    const { scrollLeft, trackHeight } = view;
+    const ox = e.nativeEvent.offsetX;
+    const oy = e.nativeEvent.offsetY;
+    const rawSec = (ox + scrollLeft) / zoom;
+
+    // marker click (top band)
+    if (oy < MARKER_H) {
+      const hit = stateRef.current.markers.find(m => {
+        const mx = m.sec * zoom - scrollLeft;
+        return ox >= mx - 2 && ox <= mx + 11;
+      });
+      if (hit) { onMarkerClick(hit); return; }
+    }
+
+    // ruler (below marker band) — left = seek, with drag = loop range
+    if (oy < RULER_H) {
+      if (e.shiftKey) {
+        loopDragRef.current = { start: snapSec(rawSec, snap, bpm), end: snapSec(rawSec, snap, bpm) };
+        onGestureStart({
+          type: "loop-range", clipId: "", trackId: "",
+          startClientX: e.clientX, startClientY: e.clientY,
+          origStartSec: rawSec, origDurSec: 0, origOffsetSec: 0,
+          origFadeInSec: 0, origFadeOutSec: 0,
+        });
+        return;
+      }
+      onSeek(snapSec(rawSec, snap, bpm));
+      return;
+    }
+
+    const ti = Math.floor((oy - RULER_H) / trackHeight);
+    const track = tracks[ti];
+    if (!track) { onSeek(snapSec(rawSec, snap, bpm)); return; }
+
+    // automation editing: click on a lane adds/moves a point at this time+value
+    const lane = stateRef.current.automationLane;
+    if (lane && e.button === 0) {
+      const y0 = RULER_H + ti * trackHeight;
+      const rel = (oy - y0) / trackHeight;            // 0 top .. 1 bottom
+      const value = lane === "volume"
+        ? Math.max(0, Math.min(1, 1 - rel))
+        : Math.max(-1, Math.min(1, 1 - rel * 2));
+      onAutomationEdit(track.id, snapSec(rawSec, snap, bpm), value);
+      return;
+    }
+
+    // right-click = split at playhead
+    if (e.button === 2) {
+      const clip = track.clips.find(c => positionSec > c.startSec && positionSec < c.startSec + c.durationSec);
+      if (clip) onClipSplit(track.id, clip.id);
+      return;
+    }
+
+    const clip = track.clips.find(c => rawSec >= c.startSec && rawSec <= c.startSec + c.durationSec);
+    if (!clip) { onSeek(snapSec(rawSec, snap, bpm)); onSelectRegion(null); return; }
+
+    // marquee region-select: in select mode, or holding Alt/Option, drag picks
+    // a time range on this clip instead of moving it.
+    if (selectMode || e.altKey) {
+      const s = snapSec(rawSec, snap, bpm);
+      marqueeRef.current = { trackId: track.id, clipId: clip.id, startSec: s, endSec: s };
+      onGestureStart({
+        type: "marquee", clipId: clip.id, trackId: track.id,
+        startClientX: e.clientX, startClientY: e.clientY,
+        origStartSec: s, origDurSec: 0, origOffsetSec: 0, origFadeInSec: 0, origFadeOutSec: 0,
+      });
+      return;
+    }
+
+    const clipX = clip.startSec * zoom - scrollLeft;
+    const clipRight = (clip.startSec + clip.durationSec) * zoom - scrollLeft;
+    const top = RULER_H + ti * trackHeight + 3;
+    const fiW = (clip.fadeInSec ?? 0) * zoom;
+    const foW = (clip.fadeOutSec ?? 0) * zoom;
+
+    const g: Gesture = {
+      clipId: clip.id, trackId: track.id,
+      startClientX: e.clientX, startClientY: e.clientY,
+      origStartSec: clip.startSec, origDurSec: clip.durationSec, origOffsetSec: clip.offsetSec,
+      origFadeInSec: clip.fadeInSec ?? 0, origFadeOutSec: clip.fadeOutSec ?? 0,
+      type: "idle",
+    };
+
+    const nearTop = oy - top < FADE_PX;
+    // fade handles (top corners) take priority near the top edge
+    if (nearTop && Math.abs(ox - (clipX + Math.max(fiW, 4))) < FADE_PX) g.type = "fade-in";
+    else if (nearTop && Math.abs(ox - (clipRight - Math.max(foW, 4))) < FADE_PX) g.type = "fade-out";
+    else if (ox - clipX < EDGE_PX) g.type = "trim-left";
+    else if (clipRight - ox < EDGE_PX) g.type = "trim-right";
+    else g.type = "dragging";
+
+    onGestureStart(g);
+  }, [onSeek, onGestureStart, onClipSplit, onMarkerClick, onSelectRegion, selectMode, onAutomationEdit]);
+
+  const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (gesture?.type === "loop-range") {
+      const { transport, view } = stateRef.current;
+      const rawSec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
+      const snapped = snapSec(rawSec, transport.snap, transport.bpm);
+      if (loopDragRef.current) {
+        const startSec = snapSec(loopDragRef.current.start, transport.snap, transport.bpm);
+        loopDragRef.current = { start: Math.min(startSec, snapped), end: Math.max(startSec, snapped) };
+        render();
+      }
+      return;
+    }
+    if (gesture?.type === "marquee" && marqueeRef.current) {
+      const { transport, view } = stateRef.current;
+      const rawSec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
+      const snapped = snapSec(rawSec, transport.snap, transport.bpm);
+      const anchor = gesture.origStartSec;
+      // clamp to the clip bounds
+      const clip = stateRef.current.tracks.find(t => t.id === gesture.trackId)?.clips.find(c => c.id === gesture.clipId);
+      const lo = clip ? clip.startSec : 0;
+      const hi = clip ? clip.startSec + clip.durationSec : snapped;
+      marqueeRef.current = {
+        trackId: gesture.trackId, clipId: gesture.clipId,
+        startSec: Math.max(lo, Math.min(anchor, snapped)),
+        endSec: Math.min(hi, Math.max(anchor, snapped)),
+      };
+      render();
+      return;
+    }
+    onGestureMove(e.clientX, e.clientY);
+  }, [onGestureMove, gesture, render]);
+
+  const onMouseUp = useCallback(() => {
+    if (gesture?.type === "loop-range" && loopDragRef.current) {
+      const { start, end } = loopDragRef.current;
+      if (end - start > 0.05) onLoopRange(start, end);
+      loopDragRef.current = null;
+    }
+    if (gesture?.type === "marquee") {
+      const m = marqueeRef.current;
+      marqueeRef.current = null;
+      onSelectRegion(m && m.endSec - m.startSec > 0.02 ? m : null);
+    }
+    onGestureEnd();
+  }, [onGestureEnd, gesture, onLoopRange, onSelectRegion]);
+
+  const totalDur = Math.max(60, ...tracks.flatMap(t => t.clips.map(c => c.startSec + c.durationSec)));
+  const contentW = totalDur * transport.zoom + 200;
+
+  const cursor = gesture
+    ? (gesture.type === "trim-left" || gesture.type === "trim-right" ? "ew-resize"
+       : gesture.type === "marquee" ? "crosshair" : "grabbing")
+    : (selectMode ? "crosshair" : "default");
+
+  return (
+    <div ref={containerRef} style={{ flex: 1, overflow: "hidden", position: "relative" }}>
+      <div
+        style={{ width: "100%", height: "100%", overflowX: "auto", overflowY: "hidden" }}
+        onScroll={onScroll}
+        onWheel={onWheel}
+      >
+        <div style={{ width: contentW, height: "100%", position: "relative" }}>
+          <canvas
+            ref={canvasRef}
+            style={{ position: "absolute", top: 0, left: 0, cursor }}
+            onMouseDown={onMouseDown}
+            onMouseMove={onMouseMove}
+            onMouseUp={onMouseUp}
+            onMouseLeave={onMouseUp}
+            onContextMenu={e => e.preventDefault()}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function sq(ctx: CanvasRenderingContext2D, x: number, y: number, s: number) {
+  ctx.fillRect(x - s / 2, y, s, s);
+}
+
+function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+  if (w < 2 * r) r = w / 2;
+  if (h < 2 * r) r = h / 2;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawWaveform(
+  ctx: CanvasRenderingContext2D,
+  clip: { offsetSec: number; durationSec: number },
+  peaks: Float32Array,
+  color: string,
+  cx: number, cy: number, cw: number, ch: number,
+) {
+  const mid = cy + ch / 2;
+  const halfH = ch / 2 - 4;
+  // peaks span the full source duration; map clip's [offset, offset+dur] into peak indices
+  const totalDur = peaks.length / 200; // peaks decoded at ~200/sec
+  const startFrac = clip.offsetSec / totalDur;
+  const endFrac = (clip.offsetSec + clip.durationSec) / totalDur;
+  const i0 = Math.floor(startFrac * peaks.length);
+  const i1 = Math.floor(endFrac * peaks.length);
+  const span = Math.max(1, i1 - i0);
+
+  // filled mirrored waveform — brighter near center, like real DAWs
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(cx, mid);
+  for (let px = 0; px < cw; px++) {
+    const idx = i0 + Math.floor((px / cw) * span);
+    const h = (peaks[Math.min(idx, peaks.length - 1)] ?? 0) * halfH;
+    ctx.lineTo(cx + px, mid - h);
+  }
+  for (let px = cw - 1; px >= 0; px--) {
+    const idx = i0 + Math.floor((px / cw) * span);
+    const h = (peaks[Math.min(idx, peaks.length - 1)] ?? 0) * halfH;
+    ctx.lineTo(cx + px, mid + h);
+  }
+  ctx.closePath();
+  const wg = ctx.createLinearGradient(0, mid - halfH, 0, mid + halfH);
+  wg.addColorStop(0, withAlpha(color, 0.55));
+  wg.addColorStop(0.5, "rgba(255,255,255,0.85)");
+  wg.addColorStop(1, withAlpha(color, 0.55));
+  ctx.fillStyle = wg;
+  ctx.fill();
+  // center line
+  ctx.strokeStyle = "rgba(0,0,0,0.15)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx, mid + 0.5);
+  ctx.lineTo(cx + cw, mid + 0.5);
+  ctx.stroke();
+  ctx.restore();
+}

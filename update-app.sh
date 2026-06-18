@@ -20,6 +20,13 @@ if [ ! -d "$APP" ]; then
   exit 0
 fi
 
+# Ensure libintl is in place (required by the engine's Python runtime)
+LIBINTL_SRC="/opt/homebrew/lib/libintl.8.dylib"
+LIBINTL_DST="$APP/Contents/libintl.8.dylib"
+if [ -f "$LIBINTL_SRC" ] && [ ! -f "$LIBINTL_DST" ]; then
+  cp "$LIBINTL_SRC" "$LIBINTL_DST"
+fi
+
 echo "[3/5] Repacking app.asar..."
 pkill -f "StemAI" 2>/dev/null || true
 sleep 1

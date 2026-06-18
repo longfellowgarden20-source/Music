@@ -16,17 +16,13 @@ export default function ShareTrack({ track }: { track: Track }) {
     setOpen(true);
     setStatus("uploading");
     try {
-      // Fetch the audio blob from the local engine
-      const res = await fetch(`${API}/api/audio/${track.id}`);
-      if (!res.ok) throw new Error("Could not read audio file");
-      const blob = await res.blob();
-
-      // Upload to 0x0.st (free, no account, 365-day retention for files <512MB)
-      const form = new FormData();
-      form.append("file", blob, `${track.title}.wav`);
-      const up = await fetch("https://0x0.st", { method: "POST", body: form });
-      if (!up.ok) throw new Error("Upload failed");
-      const url = (await up.text()).trim();
+      // Upload via backend — avoids browser CSP restrictions on direct uploads
+      const res = await fetch(`${API}/api/track/${track.id}/share`, { method: "POST" });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.detail || "Upload failed");
+      }
+      const { url } = await res.json();
       setShareUrl(url);
       setStatus("done");
     } catch (e) {
@@ -141,7 +137,7 @@ export default function ShareTrack({ track }: { track: Track }) {
               </div>
 
               <p style={{ fontSize: 11, color: "var(--muted2)", margin: 0, lineHeight: 1.5 }}>
-                Link hosted on 0x0.st · valid for 365 days · no account needed
+                Link hosted on catbox.moe · no account needed · direct audio URL
               </p>
             </>
           )}
