@@ -1,5 +1,5 @@
 "use client";
-import { useRef, useState, useCallback, useEffect } from "react";
+import { useRef, useState, useCallback, useEffect, useMemo } from "react";
 import type { DawTrack, TrackEffect, RegionOp, AutomationPoint } from "./dawTypes";
 import { EFFECT_DEFS } from "./effects";
 import { renderClipBuffer, renderClipBufferAsync, peaksFromBuffer } from "./regionOps";
@@ -19,6 +19,7 @@ interface TrackNodes {
 }
 
 export interface DawEngine {
+  getAnalyser(): AnalyserNode | null;
   play(): void;
   pause(): void;
   stop(): void;
@@ -41,6 +42,7 @@ export interface DawEngine {
   // player, and return fresh peaks + new duration. Async because EQ/filter ops
   // render through an OfflineAudioContext. Instant + non-destructive.
   applyClipOps(trackId: string, ops: RegionOp[]): Promise<{ peaks: Float32Array; duration: number } | null>;
+  setMasterVolume(vol: number): void;
   getPosition(): number;
   getLevels(): Record<string, number>;
   isLoaded: boolean;
@@ -52,6 +54,7 @@ export function useDawEngine(): DawEngine {
   const nodesRef = useRef<Map<string, TrackNodes>>(new Map());
   const metroRef = useRef<any>(null);   // { synth, loop }
   const recRef = useRef<any>(null);     // { mic, recorder, startedAt }
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -118,6 +121,25 @@ export function useDawEngine(): DawEngine {
 
     disposeAll();
 
+    // Wire a native AnalyserNode to tap the master output for the spectrum display.
+    // We connect Tone.Destination → analyser in PARALLEL (not in series), so we
+    // never break Tone's internal routing. The analyser just listens passively.
+    try {
+      const ctx: AudioContext = Tone.getContext().rawContext ?? Tone.getContext();
+      if (!analyserRef.current) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 4096;
+        analyser.smoothingTimeConstant = 0.8;
+        // Tone.Destination's underlying gain node — connect it to our analyser
+        // as a parallel tap. This never disconnects existing routing.
+        const toneDest = Tone.getDestination();
+        toneDest.connect(analyser as any);
+        analyserRef.current = analyser;
+      }
+    } catch (e) {
+      console.warn("[engine] analyser wiring failed:", e);
+    }
+
     const updated: DawTrack[] = [];
     const failed: string[] = [];
 
@@ -174,6 +196,16 @@ export function useDawEngine(): DawEngine {
     }
 
     try { await Tone.loaded(); } catch { /* no players yet = ok */ }
+
+    // Set transport loopEnd well past the longest track so Tone never
+    // wraps playback early. loopEnd fires even when loop=false in Tone 15.
+    const maxDur = Math.max(...updated.map(t => t.duration ?? 0), 60);
+    try {
+      const t = Tone.getTransport();
+      t.loop = false;
+      t.loopEnd = maxDur + 30;
+    } catch {}
+
     setIsLoaded(true);
     setLoadError(failed.length ? failed.join(" · ") : null);
     return updated;
@@ -299,7 +331,17 @@ export function useDawEngine(): DawEngine {
     const Tone = await getTone();
     const ctx = Tone.getContext();
     if (ctx.state === "suspended") await ctx.resume();
-    Tone.getTransport().start();
+    const t = Tone.getTransport();
+    // Only extend loopEnd when NOT in user loop mode, to prevent early wrap-around.
+    // When t.loop=true the user has set their own range — don't overwrite it.
+    if (!t.loop) {
+      const maxDur = Math.max(
+        ...Array.from(nodesRef.current.values()).map(n => n.player?.buffer?.duration ?? 0),
+        60
+      );
+      t.loopEnd = maxDur + 10;
+    }
+    t.start();
   }, [getTone]);
 
   const pause = useCallback(async () => {
@@ -400,6 +442,14 @@ export function useDawEngine(): DawEngine {
     }
   }, []);
 
+  const setMasterVolume = useCallback((vol: number) => {
+    if (!toneRef.current) return;
+    try {
+      // Tone.Destination exposes a volume param in dB
+      toneRef.current.getDestination().volume.value = toDb(Math.max(0.0001, vol));
+    } catch {}
+  }, []);
+
   const setTrackVolume = useCallback((id: string, vol: number) => {
     const n = nodesRef.current.get(id);
     if (n) n.channel.volume.value = toDb(vol);
@@ -416,8 +466,17 @@ export function useDawEngine(): DawEngine {
   }, []);
 
   const setTrackSolo = useCallback((id: string, soloed: boolean) => {
-    const n = nodesRef.current.get(id);
-    if (n) n.channel.solo = soloed;
+    // Tone.js Channel.solo isolates automatically when channels share Destination.
+    // We set it on the target track, then sync all others so Tone's solo bus
+    // correctly silences non-soloed tracks.
+    nodesRef.current.forEach((n, tid) => {
+      if (tid === id) {
+        n.channel.solo = soloed;
+      } else if (!soloed) {
+        // un-solo: restore each channel to its own solo state (not force-soloed)
+        n.channel.solo = n.channel.solo;
+      }
+    });
   }, []);
 
   const getPosition = useCallback(() => {
@@ -438,12 +497,27 @@ export function useDawEngine(): DawEngine {
     return out;
   }, []);
 
-  return {
+  const getAnalyser = useCallback((): AnalyserNode | null => analyserRef.current, []);
+
+  // Memoize the returned object so `engine` keeps a STABLE identity across
+  // renders. Without this, every render produced a new object, which made any
+  // `useEffect(..., [engine])` in consumers re-fire on every render — causing
+  // "Maximum update depth exceeded" infinite loops. All members below are either
+  // useCallback-stable or primitive state, so we only rebuild when isLoaded /
+  // loadError actually change.
+  return useMemo(() => ({
     play, pause, stop, seekTo, setBpm, setLoop, setMetronome,
     startRecording, stopRecording,
-    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo,
+    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo, setMasterVolume,
     loadTracks, scheduleFades, scheduleAutomation, rebuildEffects, applyEffectParams, applyClipOps,
-    getPosition, getLevels,
+    getPosition, getLevels, getAnalyser,
     isLoaded, loadError,
-  };
+  }), [
+    play, pause, stop, seekTo, setBpm, setLoop, setMetronome,
+    startRecording, stopRecording,
+    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo, setMasterVolume,
+    loadTracks, scheduleFades, scheduleAutomation, rebuildEffects, applyEffectParams, applyClipOps,
+    getPosition, getLevels, getAnalyser,
+    isLoaded, loadError,
+  ]);
 }

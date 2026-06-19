@@ -22,8 +22,8 @@ export default function EffectsRack({ track, aiBusy, onAddEffect, onRemoveEffect
 
   if (!track) {
     return (
-      <div style={{ ...wrap, alignItems: "center", justifyContent: "center", color: C.text4, fontSize: 12 }}>
-        Select a track to edit its effects rack
+      <div style={{ ...wrap, alignItems: "center", justifyContent: "center", color: C.text4, fontSize: 11, letterSpacing: 0.5 }}>
+        Select a track then add effects with the + button
       </div>
     );
   }
@@ -63,7 +63,7 @@ export default function EffectsRack({ track, aiBusy, onAddEffect, onRemoveEffect
         )}
         {adding && (
           <div style={{
-            position: "absolute", bottom: "calc(100% + 6px)", left: 12, zIndex: 10,
+            position: "absolute", bottom: "calc(100% + 6px)", left: 12, zIndex: 60,
             background: C.bg2, border: `1px solid ${C.line}`, borderRadius: 8,
             boxShadow: "0 8px 24px rgba(0,0,0,0.5)", padding: 4, minWidth: 150,
           }}>
@@ -160,6 +160,6 @@ function EffectUnit({ eff, color, onToggle, onRemove, onParam }: {
 }
 
 const wrap: React.CSSProperties = {
-  height: "100%", display: "flex", alignItems: "stretch",
-  background: C.bg1, overflowX: "auto", fontFamily: ui,
+  flex: 1, display: "flex", alignItems: "stretch",
+  background: C.bg1, overflowX: "auto", overflowY: "visible", fontFamily: ui,
 };

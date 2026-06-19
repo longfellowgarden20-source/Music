@@ -59,10 +59,16 @@ export default function ArrangementCanvas({
     const { tracks, transport, view, positionSec, markers } = stateRef.current;
     const { zoom, bpm } = transport;
     const { scrollLeft, trackHeight } = view;
-    const W = canvas.width;
-    const H = canvas.height;
+    // Use CSS pixel dimensions (the DPR transform is already applied to ctx)
+    const W = parseFloat(canvas.style.width) || canvas.width;
+    const H = parseFloat(canvas.style.height) || canvas.height;
 
-    ctx.clearRect(0, 0, W, H);
+    // Clear uses the raw pixel buffer size (before the DPR transform)
+    const dpr = window.devicePixelRatio || 1;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.restore();
     ctx.fillStyle = C.arrange;
     ctx.fillRect(0, 0, W, H);
 
@@ -206,7 +212,25 @@ export default function ArrangementCanvas({
 
         // waveform (below header strip)
         if (track.peakData && cw > 8) {
-          drawWaveform(ctx, clip, track.peakData, color, cx, ry + HDR, cw, trackHeight - HDR);
+          const maxPeak = track.peakData.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+          if (maxPeak > 0.001) {
+            drawWaveform(ctx, clip, track.peakData, color, cx, ry + HDR, cw, trackHeight - HDR);
+          } else if (cw > 60) {
+            // stem is silent for this track (e.g. no guitar in an electronic track)
+            const mid = ry + HDR + (trackHeight - HDR) / 2;
+            ctx.strokeStyle = withAlpha(color, 0.25);
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 6]);
+            ctx.beginPath(); ctx.moveTo(cx + 4, mid); ctx.lineTo(cx + cw - 4, mid); ctx.stroke();
+            ctx.setLineDash([]);
+            if (cw > 100) {
+              ctx.fillStyle = withAlpha(color, 0.35);
+              ctx.font = "700 8px 'Inter', system-ui";
+              ctx.textAlign = "center";
+              ctx.fillText("SILENT", cx + cw / 2, mid + 3);
+              ctx.textAlign = "left";
+            }
+          }
         }
 
         // fade-in triangle
@@ -385,26 +409,27 @@ export default function ArrangementCanvas({
     if (!transport.playing) render();
   }, [tracks, transport, view, positionSec, markers, render]);
 
-  // resize
+  // resize — scale canvas for HiDPI/Retina so pixels aren't blurry
   useEffect(() => {
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
     const ro = new ResizeObserver(() => {
       const { width, height } = container.getBoundingClientRect();
-      canvas.width = width;
-      canvas.height = height;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      canvas.style.width = width + "px";
+      canvas.style.height = height + "px";
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       render();
     });
     ro.observe(container);
     return () => ro.disconnect();
   }, [render]);
 
-  const onScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
-    onScrollLeft((e.target as HTMLDivElement).scrollLeft);
-  }, [onScrollLeft]);
-
-  // wheel: ctrl = zoom, over clip = gain, else scroll (native)
+  // wheel: ctrl = zoom, shift+over clip = gain, else horizontal scroll the timeline
   const onWheel = useCallback((e: React.WheelEvent) => {
     const { tracks, transport, view } = stateRef.current;
     if (e.ctrlKey || e.metaKey) {
@@ -416,18 +441,29 @@ export default function ArrangementCanvas({
     // gain adjust if hovering a clip and holding shift
     if (e.shiftKey) {
       const oy = e.nativeEvent.offsetY;
-      if (oy < RULER_H) return;
-      const ti = Math.floor((oy - RULER_H) / view.trackHeight);
-      const track = tracks[ti];
-      if (!track) return;
-      const sec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
-      const clip = track.clips.find(c => sec >= c.startSec && sec <= c.startSec + c.durationSec);
-      if (clip) {
-        e.preventDefault();
-        onClipGain(track.id, clip.id, e.deltaY < 0 ? 0.05 : -0.05);
+      if (oy >= RULER_H) {
+        const ti = Math.floor((oy - RULER_H) / view.trackHeight);
+        const track = tracks[ti];
+        if (track) {
+          const sec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
+          const clip = track.clips.find(c => sec >= c.startSec && sec <= c.startSec + c.durationSec);
+          if (clip) { e.preventDefault(); onClipGain(track.id, clip.id, e.deltaY < 0 ? 0.05 : -0.05); return; }
+        }
       }
     }
-  }, [onZoom, onClipGain]);
+    // otherwise: pan the timeline. Trackpads give deltaX; mice give deltaY — use
+    // whichever is larger so a vertical wheel also scrolls the (horizontal) song.
+    const container = containerRef.current;
+    const vw = container?.getBoundingClientRect().width ?? 0;
+    const total = Math.max(60, ...stateRef.current.tracks.flatMap(t => t.clips.map(c => c.startSec + c.durationSec)));
+    const cW = total * transport.zoom + 200;
+    const maxS = Math.max(0, cW - vw);
+    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (maxS > 0 && d !== 0) {
+      e.preventDefault();
+      onScrollLeft(Math.max(0, Math.min(maxS, view.scrollLeft + d)));
+    }
+  }, [onZoom, onClipGain, onScrollLeft]);
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const { tracks, transport, view, positionSec } = stateRef.current;
@@ -580,25 +616,58 @@ export default function ArrangementCanvas({
        : gesture.type === "marquee" ? "crosshair" : "grabbing")
     : (selectMode ? "crosshair" : "default");
 
+  // viewport width drives the scrollbar thumb size + max scroll
+  const viewW = containerRef.current?.getBoundingClientRect().width ?? 0;
+  const maxScroll = Math.max(0, contentW - viewW);
+  const curScroll = Math.min(view.scrollLeft, maxScroll);
+  const thumbFrac = contentW > 0 ? Math.min(1, viewW / contentW) : 1;
+  const thumbW = Math.max(40, thumbFrac * viewW);
+  const thumbX = maxScroll > 0 ? (curScroll / maxScroll) * (viewW - thumbW) : 0;
+
   return (
     <div ref={containerRef} style={{ flex: 1, overflow: "hidden", position: "relative" }}>
-      <div
-        style={{ width: "100%", height: "100%", overflowX: "auto", overflowY: "hidden" }}
-        onScroll={onScroll}
+      {/* Canvas is PINNED to the viewport and pans by redrawing with a scrollLeft
+          offset (all the draw + hit-test math already subtracts scrollLeft). It is
+          NOT placed inside a scrolling element — doing so made it scroll away and
+          only span one screen-width, leaving everything past it black. Scrolling is
+          driven by the wheel and the custom scrollbar below. */}
+      <canvas
+        ref={canvasRef}
+        style={{ position: "absolute", top: 0, left: 0, cursor }}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseUp}
         onWheel={onWheel}
-      >
-        <div style={{ width: contentW, height: "100%", position: "relative" }}>
-          <canvas
-            ref={canvasRef}
-            style={{ position: "absolute", top: 0, left: 0, cursor }}
-            onMouseDown={onMouseDown}
-            onMouseMove={onMouseMove}
-            onMouseUp={onMouseUp}
-            onMouseLeave={onMouseUp}
-            onContextMenu={e => e.preventDefault()}
-          />
+        onContextMenu={e => e.preventDefault()}
+      />
+      {/* custom horizontal scrollbar — only shown when content exceeds the viewport */}
+      {maxScroll > 0 && (
+        <div
+          style={{
+            position: "absolute", left: 0, right: 0, bottom: 0, height: 10,
+            background: "rgba(0,0,0,0.25)", zIndex: 5,
+          }}
+          onMouseDown={(e) => {
+            const bar = e.currentTarget.getBoundingClientRect();
+            const seekTo = (clientX: number) => {
+              const frac = Math.max(0, Math.min(1, (clientX - bar.left - thumbW / 2) / (viewW - thumbW)));
+              onScrollLeft(frac * maxScroll);
+            };
+            seekTo(e.clientX);
+            const move = (ev: MouseEvent) => seekTo(ev.clientX);
+            const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+            window.addEventListener("mousemove", move);
+            window.addEventListener("mouseup", up);
+          }}
+        >
+          <div style={{
+            position: "absolute", top: 1, height: 8, borderRadius: 4,
+            width: thumbW, left: thumbX,
+            background: "rgba(255,255,255,0.22)", cursor: "grab",
+          }} />
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -627,42 +696,92 @@ function drawWaveform(
   cx: number, cy: number, cw: number, ch: number,
 ) {
   const mid = cy + ch / 2;
-  const halfH = ch / 2 - 4;
-  // peaks span the full source duration; map clip's [offset, offset+dur] into peak indices
-  const totalDur = peaks.length / 200; // peaks decoded at ~200/sec
+  const halfH = ch / 2 - 3;
+  // peaks decoded at ~200/sec; map clip window into peak index range
+  const totalDur = peaks.length / 200;
   const startFrac = clip.offsetSec / totalDur;
   const endFrac = (clip.offsetSec + clip.durationSec) / totalDur;
   const i0 = Math.floor(startFrac * peaks.length);
   const i1 = Math.floor(endFrac * peaks.length);
   const span = Math.max(1, i1 - i0);
 
-  // filled mirrored waveform — brighter near center, like real DAWs
+  // Per-pixel min/max: for each screen pixel column, find the true peak
+  // across all source samples that map into it — gives sharp "filled oscilloscope" look.
+  const cols = Math.ceil(cw);
+  const peakPos = new Float32Array(cols); // max amplitude (always ≥0)
+  const rmsVal  = new Float32Array(cols); // RMS for the softer body layer
+
+  for (let col = 0; col < cols; col++) {
+    const f0 = col / cols;
+    const f1 = (col + 1) / cols;
+    const s0 = i0 + Math.floor(f0 * span);
+    const s1 = i0 + Math.ceil(f1 * span);
+    let maxAmp = 0;
+    let sumSq = 0;
+    let count = 0;
+    for (let s = s0; s <= s1 && s < peaks.length; s++) {
+      const v = Math.abs(peaks[s] ?? 0);
+      if (v > maxAmp) maxAmp = v;
+      sumSq += v * v;
+      count++;
+    }
+    peakPos[col] = maxAmp;
+    rmsVal[col]  = count > 0 ? Math.sqrt(sumSq / count) : 0;
+  }
+
   ctx.save();
+
+  // Layer 1 — soft RMS body (filled polygon, low alpha)
+  const bodyGrad = ctx.createLinearGradient(0, mid - halfH, 0, mid + halfH);
+  bodyGrad.addColorStop(0,   withAlpha(color, 0.25));
+  bodyGrad.addColorStop(0.5, withAlpha(color, 0.45));
+  bodyGrad.addColorStop(1,   withAlpha(color, 0.25));
+  ctx.fillStyle = bodyGrad;
   ctx.beginPath();
   ctx.moveTo(cx, mid);
-  for (let px = 0; px < cw; px++) {
-    const idx = i0 + Math.floor((px / cw) * span);
-    const h = (peaks[Math.min(idx, peaks.length - 1)] ?? 0) * halfH;
-    ctx.lineTo(cx + px, mid - h);
+  for (let col = 0; col < cols; col++) {
+    ctx.lineTo(cx + col, mid - rmsVal[col] * halfH);
   }
-  for (let px = cw - 1; px >= 0; px--) {
-    const idx = i0 + Math.floor((px / cw) * span);
-    const h = (peaks[Math.min(idx, peaks.length - 1)] ?? 0) * halfH;
-    ctx.lineTo(cx + px, mid + h);
+  for (let col = cols - 1; col >= 0; col--) {
+    ctx.lineTo(cx + col, mid + rmsVal[col] * halfH);
   }
   ctx.closePath();
-  const wg = ctx.createLinearGradient(0, mid - halfH, 0, mid + halfH);
-  wg.addColorStop(0, withAlpha(color, 0.55));
-  wg.addColorStop(0.5, "rgba(255,255,255,0.85)");
-  wg.addColorStop(1, withAlpha(color, 0.55));
-  ctx.fillStyle = wg;
   ctx.fill();
+
+  // Layer 2 — sharp peak outline (top + bottom, 1px stroke)
+  const peakGrad = ctx.createLinearGradient(0, mid - halfH, 0, mid + halfH);
+  peakGrad.addColorStop(0,   withAlpha(color, 0.85));
+  peakGrad.addColorStop(0.5, "rgba(255,255,255,0.95)");
+  peakGrad.addColorStop(1,   withAlpha(color, 0.85));
+  ctx.strokeStyle = peakGrad;
+  ctx.lineWidth = 1;
+  ctx.lineJoin = "round";
+
+  // top edge
+  ctx.beginPath();
+  for (let col = 0; col < cols; col++) {
+    const y = mid - peakPos[col] * halfH;
+    if (col === 0) ctx.moveTo(cx + col, y);
+    else ctx.lineTo(cx + col, y);
+  }
+  ctx.stroke();
+
+  // bottom edge (mirror)
+  ctx.beginPath();
+  for (let col = 0; col < cols; col++) {
+    const y = mid + peakPos[col] * halfH;
+    if (col === 0) ctx.moveTo(cx + col, y);
+    else ctx.lineTo(cx + col, y);
+  }
+  ctx.stroke();
+
   // center line
-  ctx.strokeStyle = "rgba(0,0,0,0.15)";
+  ctx.strokeStyle = "rgba(0,0,0,0.12)";
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(cx, mid + 0.5);
   ctx.lineTo(cx + cw, mid + 0.5);
   ctx.stroke();
+
   ctx.restore();
 }

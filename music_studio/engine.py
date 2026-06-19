@@ -59,11 +59,11 @@ DEVICE = _pick_device()
 # float16 halves model RAM and speeds up MPS; CPU stays float32 (no fp16 speedup there).
 DTYPE = torch.float16 if DEVICE == "mps" else torch.float32
 
-# Limit MPS to 60% of unified memory so the OS and UI stay responsive.
-# Without this, MusicGen can claim all shared GPU/CPU RAM and crash the system.
+# Allow MPS up to 85% of unified memory. 60% was too tight — auto_finish
+# (6 sequential generations) OOMs before completing all sections.
 if DEVICE == "mps":
     try:
-        torch.mps.set_per_process_memory_fraction(0.6)
+        torch.mps.set_per_process_memory_fraction(0.85)
     except Exception:
         pass
 
@@ -155,7 +155,7 @@ def _generate_tokens(**kwargs):
 # Tuned a touch optimistic — these run in slightly less once weights are loaded.
 MODEL_RAM_GB = {"small": 1.6, "medium": 3.6, "large": 7.5}
 # Hard duration caps so a long clip on a big model can't blow memory.
-MODEL_MAX_DURATION = {"small": 30, "medium": 18, "large": 10}
+MODEL_MAX_DURATION = {"small": 30, "medium": 30, "large": 15}
 
 
 def _prep_inputs(inputs):
@@ -329,7 +329,9 @@ def extend(prompt: str, prior_audio: np.ndarray, prior_sr: int,
         import librosa
         prime = librosa.resample(prior_audio, orig_sr=prior_sr, target_sr=target_sr)
     # condition on the last ~4s for continuity
-    tail = prime[-int(target_sr * 4):]
+    tail_sec = 4.0
+    tail_len = int(target_sr * tail_sec)
+    tail = prime[-tail_len:]
 
     inputs = _prep_inputs(_processor(
         audio=[tail], sampling_rate=target_sr,
@@ -340,8 +342,16 @@ def extend(prompt: str, prior_audio: np.ndarray, prior_sr: int,
                               guidance_scale=guidance, do_sample=True,
                               temperature=float(temperature))
     new_part = out[0, 0].cpu().numpy().astype(np.float32)
-    # crossfade the seam so it sounds continuous
-    combined = _seam(prime, new_part, target_sr, 0.15)
+
+    # MusicGen audio-conditioning PREPENDS the (Encodec-resynthesized) priming
+    # tail to its output. If we kept it, every seam would contain the original
+    # clean tail immediately followed by a codec-degraded copy of the same 4s —
+    # the source of the smeared, muddy, "doubled" transitions in long builds.
+    # Drop the primed portion and keep only the genuinely-new audio, then
+    # crossfade it onto the clean original with a longer fade for a smooth seam.
+    if len(new_part) > tail_len + int(target_sr * 0.5):
+        new_part = new_part[tail_len:]
+    combined = _seam(prime, new_part, target_sr, 0.4)
     return target_sr, combined, used_seed
 
 
@@ -369,25 +379,72 @@ def auto_finish(prompt: str, prior_audio: np.ndarray, prior_sr: int,
                 on_progress=None):
     """One-click: build a short take into a full arranged song that *flows* from
     the original. Each section CONTINUES from the running song (via extend), so it
-    grows rather than restarting. Returns (sample_rate, full_audio, roles_list)."""
+    grows rather than restarting. Returns (sample_rate, full_audio, roles_list).
+
+    Runs on the GPU (MPS) when available — ~3-4x faster than CPU. The earlier
+    6-pass OOM was MPS *caching* transient buffers across passes until it hit the
+    memory cap; fix is empty_cache() after each section so peak memory stays flat.
+    Per-section CPU fallback if MPS still OOMs, with a finally that restores the
+    original device. Input size is bounded (only ever conditions on a 4s tail)."""
     arrangement = arrangement or AUTO_ARRANGEMENT
     base = (prompt or "continue the music").strip()
     full = prior_audio
     sr = prior_sr
     roles = []
     n = len(arrangement)
-    for i, (role, dur) in enumerate(arrangement):
-        if _cancel.is_set():
-            raise _CancelledError("generation cancelled")
-        if on_progress:
-            on_progress(i, n, role)
-        recipe = SECTION_RECIPES.get(role, "")
-        sec_prompt = f"{base.rstrip('.')}, {recipe}" if recipe else base
-        sr, full, _ = extend(sec_prompt, full, sr, add_duration=dur,
-                             model_size=model_size, guidance=guidance)
-        roles.append(role)
-    full = auto_master(full, sr)
-    return sr, full, roles
+    orig_device, orig_dtype = DEVICE, DTYPE
+
+    def _drain_cache():
+        # Release transient MPS/CUDA allocations between passes WITHOUT unloading
+        # the model — this is what keeps peak memory flat across all 6 sections.
+        import gc
+        gc.collect()
+        try:
+            if DEVICE == "mps":
+                torch.mps.empty_cache()
+            elif DEVICE == "cuda":
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    try:
+        for i, (role, dur) in enumerate(arrangement):
+            if _cancel.is_set():
+                raise _CancelledError("generation cancelled")
+            if on_progress:
+                on_progress(i, n, role)
+            recipe = SECTION_RECIPES.get(role, "")
+            sec_prompt = f"{base.rstrip('.')}, {recipe}" if recipe else base
+            try:
+                sr, full, _ = extend(sec_prompt, full, sr, add_duration=dur,
+                                     model_size=model_size, guidance=guidance)
+            except RuntimeError as e:
+                # If MPS still runs out of memory on this machine, fall back to CPU
+                # for the REST of the build rather than failing the whole feature.
+                if DEVICE == "mps" and "memory" in str(e).lower():
+                    print(f"[engine] auto_finish: MPS OOM on section {i+1}, falling back to CPU")
+                    globals()["DEVICE"], globals()["DTYPE"] = "cpu", torch.float32
+                    free_memory()
+                    sr, full, _ = extend(sec_prompt, full, sr, add_duration=dur,
+                                         model_size=model_size, guidance=guidance)
+                else:
+                    raise
+            roles.append(role)
+            _drain_cache()
+
+        # Gentler master for the assembled song: it's already 6 passes of
+        # codec-processed audio with seams, so a strong tanh drive (default
+        # strength 1.0 → drive 2.3) piles harmonic distortion on top and makes
+        # it muddy/harsh. Light EQ + glue only.
+        full = auto_master(full, sr, strength=0.5)
+        _drain_cache()
+        return sr, full, roles
+    finally:
+        # If we fell back to CPU mid-build, restore the original (MPS) device so
+        # future generations are fast again.
+        if (DEVICE, DTYPE) != (orig_device, orig_dtype):
+            globals()["DEVICE"], globals()["DTYPE"] = orig_device, orig_dtype
+            free_memory()
 
 
 def _seam(a: np.ndarray, b: np.ndarray, sr: int, xfade: float) -> np.ndarray:
@@ -892,36 +949,27 @@ def separate_stems(filepath: str, out_dir: str = None) -> dict:
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
-    demucs_device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"[engine] Demucs running on {demucs_device}")
+    # Demucs needs ~8 GB of GPU memory for a full-length track — more than the
+    # M-series shared MPS limit (6.4 GB). Always run on CPU to avoid OOM.
+    demucs_device = "cpu"
+    print(f"[engine] Demucs running on {demucs_device} (forced; MPS OOMs on long tracks)")
     with torch.no_grad():
         sources = apply_model(_demucs, wav[None], device=demucs_device,
                               progress=True)[0]
     sources = sources * ref.std() + ref.mean()
 
     # htdemucs_6s produces: drums, bass, guitar, piano, other, vocals
-    # DAW expects exactly: drums, bass, other, vocals
-    # Merge guitar + piano + other → "other" so nothing is lost
+    # Return all 6 as separate stems — the DAW handles dynamic track counts.
     names = _demucs.sources
     out_dir = out_dir or OUT_DIR
     base = os.path.splitext(os.path.basename(filepath))[0]
 
-    stem_arrays: dict[str, np.ndarray] = {}
+    out = {}
     for name, src in zip(names, sources):
         mono = src.mean(0).cpu().numpy().astype(np.float32)
-        daw_name = name if name in ("drums", "bass", "vocals") else "other"
-        if daw_name in stem_arrays:
-            stem_arrays[daw_name] += mono   # sum extras into other
-        else:
-            stem_arrays[daw_name] = mono
-
-    out = {}
-    for daw_name, arr in stem_arrays.items():
-        # soft-clip after summing to prevent clipping when guitar+piano+other add up
-        arr = np.tanh(arr)
-        path = os.path.join(out_dir, f"{base}_{daw_name}.wav")
-        sf.write(path, arr, sr)
-        out[daw_name] = path
+        path = os.path.join(out_dir, f"{base}_{name}.wav")
+        sf.write(path, mono, sr)
+        out[name] = path
     return out
 
 
@@ -944,11 +992,13 @@ def analyze(audio: np.ndarray, sr: int) -> dict:
 
 
 # ── Export ──────────────────────────────────────────────────────────────────────
-def save_wav(audio: np.ndarray, sr: int, prompt: str) -> str:
+def save_wav(audio: np.ndarray, sr: int, prompt: str, target_dir: str | None = None) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     safe = "".join(ch if ch.isalnum() or ch in " -_" else "" for ch in prompt)[:40]
     safe = safe.strip().replace(" ", "_") or "track"
-    path = os.path.join(OUT_DIR, f"{ts}_{safe}.wav")
+    d = target_dir if target_dir else OUT_DIR
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{ts}_{safe}.wav")
     sf.write(path, audio, sr)
     return path
 

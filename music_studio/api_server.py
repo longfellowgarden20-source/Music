@@ -48,6 +48,7 @@ Stems (DAW):
 """
 from __future__ import annotations
 import os
+import threading
 import numpy as np
 import asyncio
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -92,7 +93,12 @@ def _track_json(t: dict) -> dict:
         "id":         t["id"],
         "title":      t["title"] or t["prompt"] or f"Track #{t['id']}",
         "prompt":     t["prompt"] or "",
+        "negative":   t.get("negative") or "",
         "model":      t["model"] or "",
+        "guidance":   t.get("guidance"),
+        "temperature": t.get("temperature"),
+        "seed":       t.get("seed"),
+        "sample_rate": t.get("sample_rate"),
         "duration":   t["duration"] or 0,
         "bpm":        t["bpm"],
         "key":        t["musical_key"],
@@ -138,7 +144,7 @@ def _save_version(audio, sr, t, edit_label, title=None, collection=None):
     audio = engine.normalize(audio)
     mono = audio.mean(axis=1) if getattr(audio, "ndim", 1) > 1 else audio
     an = engine.analyze(np.ascontiguousarray(mono), sr)
-    path = engine.save_wav(audio, sr, (title or t["title"] or t["prompt"] or "edit")[:60])
+    path = engine.save_wav(audio, sr, (title or t["title"] or t["prompt"] or "edit")[:60], target_dir=library.AUDIO_DIR)
     base = os.path.splitext(path)[0]
     cv = ""
     try:
@@ -158,6 +164,25 @@ def _save_version(audio, sr, t, edit_label, title=None, collection=None):
         cover_path=cv, bpm=an["bpm"], musical_key=an["key"],
         collection=(collection or t.get("collection") or "Edited"))
     return new_id
+
+
+def _ffmpeg_exe() -> str:
+    """Resolve an ffmpeg binary — prefer the bundled one (works on packaged app),
+    fall back to a system install."""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        import shutil
+        exe = shutil.which("ffmpeg")
+        if not exe:
+            raise HTTPException(415, "ffmpeg not found — install ffmpeg to export this format")
+        return exe
+
+
+def _safe_filename(t: dict) -> str:
+    base = (t.get("title") or t.get("prompt") or f"track_{t['id']}")[:60]
+    return "".join(c if c.isalnum() or c in " _-" else "_" for c in base).strip() or f"track_{t['id']}"
 
 
 # ── tracks / data ────────────────────────────────────────────────────────────
@@ -188,6 +213,34 @@ def get_audio(track_id: int):
         raise HTTPException(404, "Audio file not found")
     return FileResponse(t["filepath"], media_type="audio/wav",
                         headers={"Accept-Ranges": "bytes"})
+
+
+@app.get("/api/download/{track_id}")
+def download_audio(track_id: int):
+    t = _require(track_id)
+    if not t["filepath"] or not os.path.exists(t["filepath"]):
+        raise HTTPException(404, "Audio file not found")
+    safe_title = (t.get("title") or t.get("prompt") or f"track_{track_id}")[:60]
+    safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in safe_title).strip()
+    filename = f"{safe_title}.wav"
+    return FileResponse(t["filepath"], media_type="audio/wav",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.post("/api/add-to-apple-music/{track_id}")
+def add_to_apple_music(track_id: int):
+    import subprocess, platform
+    if platform.system() != "Darwin":
+        raise HTTPException(400, "Apple Music is only available on macOS")
+    t = _require(track_id)
+    if not t["filepath"] or not os.path.exists(t["filepath"]):
+        raise HTTPException(404, "Audio file not found")
+    abs_path = os.path.abspath(t["filepath"])
+    script = f'tell application "Music" to add POSIX file "{abs_path}"'
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        raise HTTPException(500, f"Apple Music import failed: {result.stderr.strip()}")
+    return {"ok": True, "message": "Added to Apple Music library"}
 
 
 @app.get("/api/cover/{track_id}")
@@ -324,6 +377,83 @@ def delete(track_id: int):
     return {"ok": True}
 
 
+@app.post("/api/import")
+async def import_audio(file: UploadFile = File(...)):
+    """Import any audio file (WAV, MP3, FLAC, OGG, M4A, AIFF, AAC, etc.)
+    into the library. Converts to WAV, analyzes BPM/key, saves as a new track."""
+    import tempfile, shutil, soundfile as sf
+
+    original_name = file.filename or "imported"
+    stem = os.path.splitext(original_name)[0][:60] or "imported"
+
+    # Write upload to a temp file preserving the original extension so
+    # soundfile / ffmpeg can detect the format correctly.
+    suffix = os.path.splitext(original_name)[1].lower() or ".audio"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        # Try soundfile first (handles WAV, FLAC, OGG, AIFF natively).
+        # Fall back to ffmpeg for MP3, M4A, AAC and anything else.
+        try:
+            audio, sr = sf.read(tmp_path, dtype="float32")
+        except Exception:
+            try:
+                import subprocess
+                wav_tmp = tmp_path + "_conv.wav"
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-i", tmp_path, "-ac", "1", "-ar", "44100",
+                     "-sample_fmt", "flt", wav_tmp],
+                    capture_output=True, timeout=120
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.decode()[-300:])
+                audio, sr = sf.read(wav_tmp, dtype="float32")
+                os.unlink(wav_tmp)
+            except FileNotFoundError:
+                raise HTTPException(415, "ffmpeg not found — install ffmpeg to import MP3/M4A/AAC files")
+            except Exception as e:
+                raise HTTPException(415, f"Could not decode audio: {e}")
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        audio = engine.normalize(audio)
+        an = engine.analyze(audio, sr)
+
+        out_path = engine.save_wav(audio, sr, stem, target_dir=library.AUDIO_DIR)
+
+        # auto-backup
+        try:
+            import shutil as _sh
+            _bd = os.path.join(os.path.expanduser("~"), "Downloads", "StemAI Backups")
+            os.makedirs(_bd, exist_ok=True)
+            _sh.copy2(out_path, os.path.join(_bd, os.path.basename(out_path)))
+        except Exception:
+            pass
+
+        title = stem.replace("_", " ").replace("-", " ").strip().title() or "Imported"
+        track_id = library.add_track(
+            title=title,
+            prompt=f"imported: {original_name}",
+            negative="", duration=len(audio) / sr,
+            model="IMPORT", guidance=0, temperature=0,
+            seed=0, filepath=out_path, cover_path="",
+            sample_rate=sr, bpm=an.get("bpm"), musical_key=an.get("key"),
+            collection="Imports")
+
+        return {"ok": True, "id": track_id, "title": title,
+                "bpm": an.get("bpm"), "key": an.get("key"),
+                "duration": len(audio) / sr,
+                "track": _track_json(_require(track_id))}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 # ── kill switch ───────────────────────────────────────────────────────────────
 @app.post("/api/cancel")
 def cancel_generation():
@@ -420,7 +550,18 @@ def generate(body: GenerateBody):
         audio = engine.normalize(audio)
 
     an = engine.analyze(audio, sr)
-    path = engine.save_wav(audio, sr, body.prompt)
+    path = engine.save_wav(audio, sr, body.prompt, target_dir=library.AUDIO_DIR)
+
+    # Auto-backup every generated track to ~/Downloads/StemAI Backups/
+    # so tracks survive even if the app data directory is accidentally deleted.
+    try:
+        import shutil as _shutil
+        _backup_dir = os.path.join(os.path.expanduser("~"), "Downloads", "StemAI Backups")
+        os.makedirs(_backup_dir, exist_ok=True)
+        _shutil.copy2(path, os.path.join(_backup_dir, os.path.basename(path)))
+    except Exception:
+        pass  # backup failure must never block generation
+
     base = os.path.splitext(path)[0]
     cv = ""
     try:
@@ -575,6 +716,174 @@ def complete_song(track_id: int, body: CompleteBody):
                            title=t["title"], collection="Full Songs")
     return {"ok": True, "id": new_id, "structure": structure,
             "track": _track_json(_require(new_id))}
+
+
+# ── "Complete the song": background job + polling ────────────────────────────
+# A long SSE/streaming connection through MusicGen's GIL-heavy compute drops with
+# ERR_INCOMPLETE_CHUNKED_ENCODING (the event loop is starved during the ~50s GPU
+# passes, so keepalives stop and the chunked response times out). Instead we run
+# the build in a daemon thread and expose its live progress via a tiny in-memory
+# job record the frontend POLLS. No long-lived connection = nothing to drop.
+_complete_jobs: dict = {}        # job_id -> {state, pct, section, total, role, id?, error?}
+_complete_lock = threading.Lock()
+# Single-generation guard. Only ONE heavy build may run at a time so two fast
+# clicks can't run auto_finish on the same model at once (overlapping runs
+# corrupt/free each other's model and stall the engine). We track the running
+# worker THREAD rather than holding a plain Lock: a Lock left locked by a crashed
+# job stays "busy" forever, whereas checking thread.is_alive() self-heals — if the
+# previous worker is dead, a new build is allowed even if cleanup was skipped.
+_active_complete: dict = {"thread": None}
+
+
+def _run_complete_job(job_id: str, track_id: int, prompt: str,
+                      model_size: str, guidance: float):
+    def on_progress(i: int, n: int, role: str):
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "running", "section": i + 1, "total": n, "role": role,
+                "pct": round(5 + (i / max(1, n)) * 88, 1),
+            })
+    try:
+        sr, audio, t = _load_arr(track_id)
+        with engine.generation_session():
+            sr2, full, roles = engine.auto_finish(
+                prompt, audio, sr, model_size=model_size,
+                guidance=guidance, on_progress=on_progress)
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "mastering", "pct": 95})
+        structure = "intro → " + " → ".join(roles)
+        new_id = _save_version(full, sr2, t, "full song",
+                               title=t["title"], collection="Full Songs")
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "done", "pct": 100, "id": new_id, "structure": structure,
+                "track": _track_json(_require(new_id)),
+            })
+    except engine._CancelledError:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "cancelled", "error": "Song build cancelled"})
+    except MemoryError as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Out of memory: {e}"})
+    except Exception as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Complete failed: {e}"})
+    finally:
+        # Clear the active-thread slot so the next build can start. (The start
+        # endpoint also self-heals via is_alive(), so this is belt-and-suspenders.)
+        with _complete_lock:
+            if _active_complete.get("thread") is threading.current_thread():
+                _active_complete["thread"] = None
+
+
+@app.post("/api/track/{track_id}/complete-start")
+def complete_song_start(track_id: int, body: CompleteBody):
+    """Kick off a 'complete the song' build in the background. Returns a job_id
+    immediately; poll /api/complete-status/{job_id} for progress + result."""
+    import uuid
+    _require(track_id)  # 404 early if the track is missing
+    # Single-generation guard with self-healing: only block if a build worker is
+    # ACTUALLY still alive. A dead/crashed previous worker (or one that skipped
+    # cleanup) no longer wedges the feature on "busy".
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy with another generation — wait for it to finish.")
+        prompt = body.prompt.strip() or _require(track_id)["prompt"] or "continue the music"
+        arrangement = getattr(engine, "AUTO_ARRANGEMENT", [])
+        n_sections = len(arrangement) or 6
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 3, "section": 0,
+                                  "total": n_sections, "role": "starting"}
+        thread = threading.Thread(target=_run_complete_job, daemon=True,
+                                  args=(job_id, track_id, prompt, body.model_size,
+                                        body.guidance))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id, "total": n_sections}
+
+
+@app.get("/api/complete-status/{job_id}")
+def complete_song_status(job_id: str):
+    with _complete_lock:
+        job = _complete_jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        snapshot = dict(job)
+        # Once the client has seen a terminal state, let it be GC'd on next poll.
+        if job["state"] in ("done", "error", "cancelled"):
+            _complete_jobs.pop(job_id, None)
+    return snapshot
+
+
+# ── Add an AI instrument layer (e.g. "add drums") ────────────────────────────
+# Reuses the same job dict / single-generation guard / status endpoint as
+# complete-the-song, so only one heavy generation runs at a time and the frontend
+# polls the same /api/complete-status/{job_id}.
+class AddInstrumentBody(BaseModel):
+    prompt: str                       # what to add, e.g. "drums", "a walking bass line"
+    model_size: str = "small"
+    guidance: float = 3.0
+    volume: float = 0.7               # how loud the new layer sits under the track
+    blend: str = "smart"             # "smart" matches the track's feel; "simple" = prompt-only
+
+
+def _run_add_instrument_job(job_id: str, track_id: int, prompt: str,
+                            model_size: str, guidance: float, volume: float, blend: str):
+    def progress(state, pct):
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": state, "pct": pct})
+    try:
+        sr, audio, t = _load_arr(track_id)
+        progress("running", 15)
+        with engine.generation_session():
+            sr2, mixed, _ = engine.add_layer(
+                audio, sr, instrument_prompt=prompt, blend=blend,
+                volume=volume, model_size=model_size, guidance=guidance)
+        progress("mixing", 90)
+        short = prompt.strip()[:24]
+        new_id = _save_version(mixed, sr2, t, f"+ {short}",
+                               title=t["title"], collection=t.get("collection") or "All Tracks")
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "done", "pct": 100, "id": new_id,
+                "track": _track_json(_require(new_id)),
+            })
+    except engine._CancelledError:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "cancelled", "error": "Cancelled"})
+    except MemoryError as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Out of memory: {e}"})
+    except Exception as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Add instrument failed: {e}"})
+    finally:
+        with _complete_lock:
+            if _active_complete.get("thread") is threading.current_thread():
+                _active_complete["thread"] = None
+
+
+@app.post("/api/track/{track_id}/add-instrument-start")
+def add_instrument_start(track_id: int, body: AddInstrumentBody):
+    """Kick off 'add an instrument' (e.g. drums) in the background. Returns a
+    job_id; poll /api/complete-status/{job_id} for progress + the new track."""
+    import uuid
+    _require(track_id)
+    if not body.prompt.strip():
+        raise HTTPException(400, "Say what to add (e.g. 'drums')")
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy with another generation — wait for it to finish.")
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 5}
+        thread = threading.Thread(target=_run_add_instrument_job, daemon=True,
+                                  args=(job_id, track_id, body.prompt.strip(),
+                                        body.model_size, body.guidance, body.volume, body.blend))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id}
 
 
 class SoundsLikeBody(BaseModel):
@@ -845,14 +1154,17 @@ def _stem_path(t, name):
     return os.path.join(os.path.dirname(t["filepath"]), f"{src_name}_{name}.wav")
 
 
+ALL_STEM_NAMES = ["drums", "bass", "guitar", "piano", "other", "vocals"]
+
+
 @app.get("/api/stems/{track_id}")
 def get_stems(track_id: int):
     t = _require(track_id)
     if not t["filepath"] or not os.path.exists(t["filepath"]):
         raise HTTPException(404, "Track not found")
-    names = ["drums", "bass", "other", "vocals"]
-    existing = {n: _stem_path(t, n) for n in names if os.path.exists(_stem_path(t, n))}
-    return {"track_id": track_id, "separated": len(existing) == 4,
+    existing = {n: _stem_path(t, n) for n in ALL_STEM_NAMES if os.path.exists(_stem_path(t, n))}
+    # fully separated = at least 4 stems present (handles both 4-stem legacy and 6-stem)
+    return {"track_id": track_id, "separated": len(existing) >= 4,
             "stems": existing, "source": t["filepath"]}
 
 
@@ -1021,6 +1333,149 @@ def get_layers(track_id: int, stem_name: str, start: float = 0.0, end: float = 0
             "start": round(s, 4), "end": round(e, 4), "layers": layers}
 
 
+def _clean_notes(raw: list, note_names: list, bpm: float = 120.0) -> list:
+    """Turn raw basic-pitch output into a readable, rhythmically-quantized melody.
+
+    basic-pitch over-detects (harmonics/overtones as extra simultaneous notes,
+    sustains as one giant note) AND its timing is "humanly" off-grid, so notating
+    it raw looks like slop. Standard audio-to-score pipelines (see Spotify
+    basic-pitch docs) detect first, then quantize to a rhythmic grid as a separate
+    step. We do exactly that:
+
+      1. Cap runaway sustains.
+      2. Monophonic reduction: one (loudest) note per ~60ms onset moment.
+      3. Trim overlaps.
+      4. QUANTIZE to a musical grid (1/16 notes at the track BPM): snap each
+         note's start and length to the grid so notes land on real beats — this
+         is what makes the score legible and the piano-roll grid-aligned.
+    """
+    if not raw:
+        return []
+
+    # 1. cap runaway durations
+    for n in raw:
+        if n["end"] - n["start"] > 2.0:
+            n["end"] = round(n["start"] + 2.0, 3)
+
+    # 2. group by quantized onset (60ms buckets) and keep the loudest per bucket
+    raw.sort(key=lambda n: (n["start"], -n["vel"]))
+    DETECT_GRID = 0.06
+    best_by_bucket: dict = {}
+    for n in raw:
+        bucket = round(n["start"] / DETECT_GRID)
+        cur = best_by_bucket.get(bucket)
+        if cur is None or n["vel"] > cur["vel"]:
+            best_by_bucket[bucket] = n
+
+    kept = sorted(best_by_bucket.values(), key=lambda n: n["start"])
+
+    # 3. trim overlaps so each note ends before the next begins (clean melody)
+    trimmed = []
+    for i, n in enumerate(kept):
+        end = n["end"]
+        if i + 1 < len(kept):
+            end = min(end, kept[i + 1]["start"])
+        if end - n["start"] < 0.05:
+            continue
+        trimmed.append({**n, "end": end})
+
+    # 4. rhythmic quantization to a 1/16-note grid at the track tempo.
+    bpm = max(40.0, min(240.0, float(bpm or 120.0)))
+    sec_per_beat = 60.0 / bpm
+    grid = sec_per_beat / 4.0          # 1/16 note
+    min_len = grid                     # shortest renderable note = one 1/16
+
+    out = []
+    prev_end = -1.0
+    for n in trimmed:
+        # snap start to nearest grid line
+        q_start = round(n["start"] / grid) * grid
+        # snap length to a whole number of grid units (>= 1)
+        raw_len = max(n["end"] - n["start"], min_len)
+        units = max(1, round(raw_len / grid))
+        q_end = q_start + units * grid
+        # avoid overlap with the previous quantized note
+        if q_start < prev_end:
+            q_start = prev_end
+            q_end = max(q_start + min_len, q_end)
+        prev_end = q_end
+
+        pitch = n["pitch"]
+        octave = (pitch // 12) - 1
+        out.append({
+            "pitch": pitch,
+            "note_name": note_names[pitch % 12] + str(octave),
+            "start_sec": round(q_start, 3),
+            "end_sec": round(q_end, 3),
+            "velocity": n["vel"],
+            "confidence": 1.0,
+        })
+    return out
+
+
+@app.get("/api/notes/{track_id}/{stem_name}")
+def get_notes(track_id: int, stem_name: str):
+    """Run basic-pitch on a stem to get MIDI note events.
+    Returns {notes: [{pitch, note_name, start_sec, end_sec, velocity, confidence}]}
+    Results are cached per stem file so the slow ML inference only runs once."""
+    import soundfile as sf, json, hashlib
+    t = _require(track_id)
+    path = t["filepath"] if stem_name == "master" else _stem_path(t, stem_name)
+    if not os.path.exists(path):
+        raise HTTPException(404, f"Audio not found for '{stem_name}'")
+
+    # Cache key = file mtime + size so we recompute if the file changes
+    stat = os.stat(path)
+    cache_key = hashlib.md5(f"{path}{stat.st_mtime}{stat.st_size}".encode()).hexdigest()
+    cache_path = os.path.join(_OUT_DIR, f"notes_{cache_key}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return json.load(f)
+
+    try:
+        # scipy 1.12 moved gaussian out of signal → patch for basic-pitch compat
+        import scipy.signal, scipy.signal.windows
+        if not hasattr(scipy.signal, "gaussian"):
+            scipy.signal.gaussian = scipy.signal.windows.gaussian
+        from basic_pitch.inference import predict
+        from basic_pitch import ICASSP_2022_MODEL_PATH as _bp_path
+        # Use ONNX model — avoids TF 2.16 SavedModel breakage
+        onnx_path = str(_bp_path) + ".onnx"
+        model_path = onnx_path if os.path.exists(onnx_path) else _bp_path
+
+        # Stricter thresholds so we get a clean melody instead of every
+        # overtone/harmonic. Defaults (0.5/0.3/127.7) over-detect badly on
+        # sustained/poly material, producing hundreds of bogus notes.
+        _, midi_data, _ = predict(
+            path, model_path,
+            onset_threshold=0.7,        # higher = fewer spurious note starts
+            frame_threshold=0.5,        # higher = fewer ghost frames
+            minimum_note_length=120,    # ms — drop blips shorter than this
+            minimum_frequency=55.0,     # A1 — kill sub-bass rumble/overtones
+            maximum_frequency=2093.0,   # C7 — kill high harmonic squeal
+            melodia_trick=True,
+        )
+
+        note_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+        raw = []
+        # midi_data.instruments[0].notes gives clean Note objects with .start/.end/.pitch/.velocity
+        if midi_data and midi_data.instruments:
+            for note in midi_data.instruments[0].notes:
+                raw.append({
+                    "pitch": int(note.pitch),
+                    "start": round(float(note.start), 3),
+                    "end": round(float(note.end), 3),
+                    "vel": round(float(note.velocity) / 127.0, 3),
+                })
+        notes = _clean_notes(raw, note_names, bpm=t.get("bpm") or 120.0)
+        result = {"track_id": track_id, "stem": stem_name, "notes": notes}
+        with open(cache_path, "w") as f:
+            json.dump(result, f)
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Note detection failed: {e}")
+
+
 class MixdownBody(BaseModel):
     # per-stem settings: {drums: {vol, mute, pan}, bass: {...}, ...}
     stems: dict
@@ -1032,7 +1487,7 @@ def mixdown(track_id: int, body: MixdownBody):
     """Combine stem files at given volumes/pans (respecting mutes) → new version."""
     import soundfile as sf
     t = _require(track_id)
-    order = ["drums", "bass", "other", "vocals"]
+    order = ALL_STEM_NAMES
     arrays: dict[str, np.ndarray] = {}
     sr_out = None
     for name in order:
@@ -1073,9 +1528,9 @@ def mixdown(track_id: int, body: MixdownBody):
 
 # ── DAW non-destructive clip editing + history ───────────────────────────────────
 def _stem_arrays(t: dict):
-    """Load all 4 stems as mono float32 at a common sr. Requires a prior split."""
+    """Load all stems as mono float32 at a common sr. Requires a prior split."""
     import soundfile as sf
-    order = ["drums", "bass", "other", "vocals"]
+    order = ALL_STEM_NAMES
     stems, sr_out = {}, None
     for name in order:
         path = _stem_path(t, name)
@@ -1384,6 +1839,236 @@ def daw_project_save(track_id: int, body: ProjectBody):
     """Auto-save: merge a partial state patch over the saved project."""
     _require(track_id)
     return project.save(track_id, body.state or {})
+
+
+# ── Export in different audio formats (MP3 / FLAC / AIFF / WAV) ──────────────
+_EXPORT_FORMATS = {
+    # ext: (ffmpeg args after -i, mime type)
+    "mp3":  (["-codec:a", "libmp3lame", "-q:a", "2"], "audio/mpeg"),
+    "flac": (["-codec:a", "flac"], "audio/flac"),
+    "aiff": (["-codec:a", "pcm_s16be"], "audio/aiff"),
+    "m4a":  (["-codec:a", "aac", "-b:a", "256k"], "audio/mp4"),
+    "ogg":  (["-codec:a", "libvorbis", "-q:a", "6"], "audio/ogg"),
+    "wav":  ([], "audio/wav"),
+}
+
+
+@app.get("/api/export/{track_id}.{fmt}")
+def export_track(track_id: int, fmt: str):
+    """Transcode a track to mp3/flac/aiff/m4a/ogg/wav and stream it as a download."""
+    import tempfile, subprocess
+    from fastapi.responses import FileResponse
+    fmt = fmt.lower()
+    if fmt not in _EXPORT_FORMATS:
+        raise HTTPException(400, f"Unsupported format '{fmt}'. Use one of: {', '.join(_EXPORT_FORMATS)}")
+    t = _require(track_id)
+    if not t["filepath"] or not os.path.exists(t["filepath"]):
+        raise HTTPException(404, "Audio file not found")
+    name = _safe_filename(t)
+
+    # WAV is already on disk — serve directly, no transcode.
+    if fmt == "wav":
+        return FileResponse(t["filepath"], media_type="audio/wav",
+                            headers={"Content-Disposition": f'attachment; filename="{name}.wav"'})
+
+    args, mime = _EXPORT_FORMATS[fmt]
+    out_path = os.path.join(tempfile.gettempdir(), f"export_{track_id}_{os.getpid()}.{fmt}")
+    proc = subprocess.run(
+        [_ffmpeg_exe(), "-y", "-i", t["filepath"], *args, out_path],
+        capture_output=True, timeout=120)
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        raise HTTPException(500, f"Export failed: {proc.stderr.decode()[-300:]}")
+    return FileResponse(out_path, media_type=mime,
+                        headers={"Content-Disposition": f'attachment; filename="{name}.{fmt}"'},
+                        background=_unlink_later(out_path))
+
+
+def _unlink_later(path: str):
+    """A starlette BackgroundTask that deletes a temp file after the response is sent."""
+    from starlette.background import BackgroundTask
+    def _rm():
+        try: os.unlink(path)
+        except Exception: pass
+    return BackgroundTask(_rm)
+
+
+# ── MIDI export (.mid from detected notes) ───────────────────────────────────
+@app.get("/api/midi/{track_id}/{stem_name}.mid")
+def export_midi(track_id: int, stem_name: str):
+    """Run note detection on a stem (cached) and return a downloadable .mid file."""
+    import pretty_midi, tempfile
+    from fastapi.responses import FileResponse
+    t = _require(track_id)
+    detected = get_notes(track_id, stem_name)  # reuses cache + 404s if missing
+    notes = detected.get("notes", [])
+    if not notes:
+        raise HTTPException(404, "No notes detected for this stem")
+
+    pm = pretty_midi.PrettyMIDI(initial_tempo=float(t.get("bpm") or 120.0))
+    inst = pretty_midi.Instrument(program=0, name=stem_name)
+    for n in notes:
+        inst.notes.append(pretty_midi.Note(
+            velocity=max(1, min(127, int(round((n.get("velocity") or 0.7) * 127)))),
+            pitch=int(n["pitch"]),
+            start=float(n["start_sec"]),
+            end=max(float(n["end_sec"]), float(n["start_sec"]) + 0.05),
+        ))
+    pm.instruments.append(inst)
+    name = _safe_filename(t)
+    out_path = os.path.join(tempfile.gettempdir(), f"midi_{track_id}_{stem_name}_{os.getpid()}.mid")
+    pm.write(out_path)
+    return FileResponse(out_path, media_type="audio/midi",
+                        headers={"Content-Disposition": f'attachment; filename="{name}_{stem_name}.mid"'},
+                        background=_unlink_later(out_path))
+
+
+# ── Chord progression detection ──────────────────────────────────────────────
+_CHORD_TEMPLATES = None
+
+
+def _build_chord_templates():
+    """12 major + 12 minor triad chroma templates (root-relative)."""
+    import numpy as np
+    names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    templates = []
+    labels = []
+    maj = [0, 4, 7]
+    minor = [0, 3, 7]
+    for root in range(12):
+        for intervals, suffix in [(maj, ""), (minor, "m")]:
+            vec = np.zeros(12)
+            for iv in intervals:
+                vec[(root + iv) % 12] = 1.0
+            templates.append(vec / np.linalg.norm(vec))
+            labels.append(names[root] + suffix)
+    return np.array(templates), labels
+
+
+@app.get("/api/chords/{track_id}")
+def get_chords(track_id: int):
+    """Estimate the chord progression via chroma + triad-template matching.
+    Cached per audio file (mtime+size). Returns a deduped sequence of chords
+    with timestamps, plus a compact `progression` string like 'C – Am – F – G'."""
+    import json, hashlib, numpy as np, librosa
+    t = _require(track_id)
+    path = t["filepath"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Audio file not found")
+
+    stat = os.stat(path)
+    cache_key = hashlib.md5(f"chords{path}{stat.st_mtime}{stat.st_size}".encode()).hexdigest()
+    cache_path = os.path.join(_OUT_DIR, f"chords_{cache_key}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return json.load(f)
+
+    global _CHORD_TEMPLATES
+    if _CHORD_TEMPLATES is None:
+        _CHORD_TEMPLATES = _build_chord_templates()
+    templates, labels = _CHORD_TEMPLATES
+
+    y, sr = librosa.load(path, sr=22050, mono=True)
+    bpm = float(t.get("bpm") or 120.0)
+    # one chord guess per beat
+    hop = 512
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    try:
+        beats = librosa.beat.beat_track(y=y, sr=sr, bpm=bpm, hop_length=hop, units="frames")[1]
+    except Exception:
+        beats = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 32))
+    if len(beats) < 2:
+        beats = np.arange(0, chroma.shape[1], max(1, chroma.shape[1] // 32))
+
+    seq = []
+    for i in range(len(beats)):
+        a = beats[i]
+        b = beats[i + 1] if i + 1 < len(beats) else chroma.shape[1]
+        if b <= a:
+            continue
+        seg = chroma[:, a:b].mean(axis=1)
+        norm = np.linalg.norm(seg)
+        if norm < 1e-6:
+            continue
+        seg = seg / norm
+        scores = templates @ seg
+        best = int(np.argmax(scores))
+        t_sec = float(librosa.frames_to_time(a, sr=sr, hop_length=hop))
+        seq.append((labels[best], round(t_sec, 2), float(scores[best])))
+
+    # merge consecutive identical chords
+    merged = []
+    for label, t_sec, conf in seq:
+        if merged and merged[-1]["chord"] == label:
+            continue
+        merged.append({"chord": label, "start_sec": t_sec, "confidence": round(conf, 3)})
+
+    progression = " – ".join(m["chord"] for m in merged[:16])
+    result = {"track_id": track_id, "chords": merged, "progression": progression}
+    with open(cache_path, "w") as f:
+        json.dump(result, f)
+    return result
+
+
+# ── Tags + bulk operations ───────────────────────────────────────────────────
+class TagsBody(BaseModel):
+    tags: str  # comma-separated
+
+
+@app.post("/api/track/{track_id}/tags")
+def set_tags(track_id: int, body: TagsBody):
+    _require(track_id)
+    cleaned = ",".join(s.strip() for s in body.tags.split(",") if s.strip())[:200]
+    library.update_track(track_id, tags=cleaned)
+    return {"ok": True, "tags": cleaned}
+
+
+@app.get("/api/tags")
+def list_all_tags():
+    """Distinct tags across the library, with counts, for the filter UI."""
+    rows = library.list_tracks()
+    counts: dict[str, int] = {}
+    for r in rows:
+        for tag in (r.get("tags") or "").split(","):
+            tag = tag.strip()
+            if tag:
+                counts[tag] = counts.get(tag, 0) + 1
+    return [{"tag": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: -x[1])]
+
+
+class BulkBody(BaseModel):
+    ids: list[int]
+    op: str                      # "delete" | "collection" | "favorite" | "add_tag" | "remove_tag"
+    value: Optional[str] = None  # collection name / tag / "1"|"0" for favorite
+
+
+@app.post("/api/tracks/bulk")
+def bulk_op(body: BulkBody):
+    """Apply one operation to many tracks at once."""
+    done = 0
+    for tid in body.ids:
+        t = library.get_track(tid)
+        if not t:
+            continue
+        if body.op == "delete":
+            library.delete_track(tid, remove_file=True)
+        elif body.op == "collection":
+            library.update_track(tid, collection=(body.value or "All Tracks"))
+        elif body.op == "favorite":
+            library.update_track(tid, favorite=1 if body.value == "1" else 0)
+        elif body.op in ("add_tag", "remove_tag"):
+            cur = [s.strip() for s in (t.get("tags") or "").split(",") if s.strip()]
+            tag = (body.value or "").strip()
+            if not tag:
+                continue
+            if body.op == "add_tag" and tag not in cur:
+                cur.append(tag)
+            elif body.op == "remove_tag":
+                cur = [c for c in cur if c != tag]
+            library.update_track(tid, tags=",".join(cur)[:200])
+        else:
+            raise HTTPException(400, f"Unknown bulk op '{body.op}'")
+        done += 1
+    return {"ok": True, "affected": done}
 
 
 # ── Export all edited stems as a zip ─────────────────────────────────────────

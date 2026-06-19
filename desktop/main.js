@@ -151,9 +151,9 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      // Required for getUserMedia (mic + webcam) inside the embedded web view.
-      // Without this, Chromium silently blocks all media device access.
       audioCapture: true,
+      // Disable disk cache so updates are always picked up immediately.
+      partition: `nopersist:stemai-${Date.now()}`,
     },
     show: false,
   });

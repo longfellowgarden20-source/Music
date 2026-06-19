@@ -7,7 +7,12 @@ export interface Track {
   id: number;
   title: string;
   prompt: string;
+  negative?: string;
   model: string;
+  guidance?: number | null;
+  temperature?: number | null;
+  seed?: number | null;
+  sample_rate?: number | null;
   duration: number;
   bpm: number | null;
   key: string | null;
@@ -65,6 +70,9 @@ export const api = {
   waveform: (id: number, points = 1400) =>
     req<{ peaks: number[]; duration: number; sr: number }>(`/api/waveform/${id}?points=${points}`),
 
+  downloadUrl: (id: number) => `${API}/api/download/${id}`,
+  addToAppleMusic: (id: number) => req<{ ok: boolean; message: string }>(`/api/add-to-apple-music/${id}`, { method: "POST" }),
+
   // management
   rename: (id: number, title: string) =>
     req(`/api/track/${id}/rename`, { method: "POST", body: JSON.stringify({ title }) }),
@@ -91,6 +99,101 @@ export const api = {
     req<{ id: number; track: Track }>(`/api/track/${id}/extend`, { method: "POST", body: JSON.stringify(body) }),
   complete: (id: number, body: Record<string, unknown>) =>
     req<{ id: number; structure: string; track: Track }>(`/api/track/${id}/complete`, { method: "POST", body: JSON.stringify(body) }),
+
+  // "Complete the song" — start a background build, then poll for progress.
+  // Polling (not a long SSE connection) is robust: MusicGen's GIL-heavy compute
+  // would starve a streaming connection and drop it mid-build.
+  completeStream: (
+    id: number,
+    body: Record<string, unknown>,
+    onProgress: (p: { pct: number; section: number; total: number; role: string; msg?: string }) => void,
+  ): Promise<{ id: number; structure: string; track: Track }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const start = await fetch(`${API}/api/track/${id}/complete-start`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id } = await start.json();
+
+        // Poll every 1.5s. Tolerate transient fetch failures (don't abort the
+        // whole build just because one poll hiccuped).
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) {
+              // 404 after a terminal poll is expected (job GC'd) — only fail if we
+              // never saw a result.
+              if (++misses > 5) { reject(new Error("Lost track of the build")); return; }
+              setTimeout(poll, 1500); return;
+            }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") {
+              resolve({ id: s.id, structure: s.structure, track: s.track }); return;
+            }
+            if (s.state === "error" || s.state === "cancelled") {
+              reject(new Error(s.error || "Complete failed")); return;
+            }
+            onProgress({ pct: s.pct ?? 5, section: s.section ?? 0, total: s.total ?? 6,
+                         role: s.role ?? "working", msg: s.state });
+            setTimeout(poll, 1500);
+          } catch {
+            if (++misses > 8) { reject(new Error("Connection lost during build")); return; }
+            setTimeout(poll, 1500);
+          }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
+
+  // "Add an instrument" (e.g. drums) — same start+poll pattern as completeStream,
+  // sharing the backend's single-generation guard + status endpoint.
+  addInstrument: (
+    id: number,
+    body: { prompt: string; volume?: number; blend?: string; model_size?: string; guidance?: number },
+    onProgress: (p: { pct: number; state: string }) => void,
+  ): Promise<{ id: number; track: Track }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const start = await fetch(`${API}/api/track/${id}/add-instrument-start`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id } = await start.json();
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) {
+              if (++misses > 5) { reject(new Error("Lost track of the job")); return; }
+              setTimeout(poll, 1500); return;
+            }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") { resolve({ id: s.id, track: s.track }); return; }
+            if (s.state === "error" || s.state === "cancelled") { reject(new Error(s.error || "Failed")); return; }
+            onProgress({ pct: s.pct ?? 10, state: s.state ?? "working" });
+            setTimeout(poll, 1500);
+          } catch {
+            if (++misses > 8) { reject(new Error("Connection lost")); return; }
+            setTimeout(poll, 1500);
+          }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
   cancel: () =>
     req<{ ok: boolean; was_running: boolean }>(`/api/cancel`, { method: "POST" }),
   status: () => req<{ generating: boolean }>(`/api/status`),
@@ -131,6 +234,8 @@ export const api = {
   mixdown: (id: number, mixer: Record<string, { volume: number; muted: boolean; pan?: number }>) =>
     req<{ id: number; track: Track }>(`/api/stems/${id}/mixdown`, { method: "POST", body: JSON.stringify({ mixer }) }),
   stemAudioUrl: (id: number, stem: string) => `${API}/api/stem-audio/${id}/${stem}`,
+  stemNotes: (id: number, stem: string) =>
+    req<{ track_id: number; stem: string; notes: Array<{ pitch: number; note_name: string; start_sec: number; end_sec: number; velocity: number; confidence: number }> }>(`/api/notes/${id}/${stem}`),
 
   // AI stem ops (DAW)
   stemRegenerate: (id: number, stem: string, body: Record<string, unknown>) =>
@@ -142,8 +247,35 @@ export const api = {
   stemRevert: (id: number, stem: string) =>
     req<{ ok: boolean; stem: string }>(`/api/daw/${id}/stem-revert/${stem}`, { method: "POST" }),
 
+  importAudio: async (file: File): Promise<{ id: number; title: string; bpm: number | null; key: string | null; duration: number; track: Track }> => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${API}/api/import`, { method: "POST", body: form });
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { const j = await res.json(); msg = j.detail || msg; } catch {}
+      throw new Error(msg);
+    }
+    return res.json();
+  },
+
   audioUrl: (id: number) => `${API}/api/audio/${id}`,
   coverUrl: (id: number) => `${API}/api/cover/${id}`,
+
+  // export formats
+  exportUrl: (id: number, fmt: string) => `${API}/api/export/${id}.${fmt}`,
+  midiUrl: (id: number, stem: string) => `${API}/api/midi/${id}/${stem}.mid`,
+
+  // chord progression
+  chords: (id: number) =>
+    req<{ track_id: number; progression: string; chords: Array<{ chord: string; start_sec: number; confidence: number }> }>(`/api/chords/${id}`),
+
+  // tags + bulk ops
+  setTags: (id: number, tags: string) =>
+    req<{ ok: boolean; tags: string }>(`/api/track/${id}/tags`, { method: "POST", body: JSON.stringify({ tags }) }),
+  allTags: () => req<Array<{ tag: string; count: number }>>(`/api/tags`),
+  bulk: (ids: number[], op: string, value?: string) =>
+    req<{ ok: boolean; affected: number }>(`/api/tracks/bulk`, { method: "POST", body: JSON.stringify({ ids, op, value }) }),
 
   // licensing
   licenseStatus: () =>

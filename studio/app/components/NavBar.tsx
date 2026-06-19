@@ -7,6 +7,7 @@ const LINKS = [
   { href: "/generate", label: "Generate" },
   { href: "/vocals",   label: "Vocals"   },
   { href: "/youtube",  label: "YouTube"  },
+  { href: "/guide",    label: "Guide"    },
 ];
 
 export default function NavBar() {

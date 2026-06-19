@@ -2,37 +2,64 @@
 import { useRef, useCallback } from "react";
 import type { DawTrack } from "./dawTypes";
 import { C, ui, mono, withAlpha } from "./theme";
+import SpectrumAnalyzer from "./SpectrumAnalyzer";
+import TrackInfoPanel from "./TrackInfoPanel";
+import LufsMeter from "./LufsMeter";
 
 interface Props {
   tracks: DawTrack[];
   levels: Record<string, number>;
   selectedId: string | null;
+  masterVolume: number;
+  playing: boolean;
+  bpm: number;
+  trackKey: string | null;
+  getAnalyser: () => AnalyserNode | null;
   onVolume: (id: string, v: number) => void;
   onPan: (id: string, v: number) => void;
   onMute: (id: string) => void;
   onSolo: (id: string) => void;
   onSelect: (id: string) => void;
+  onMasterVolume: (v: number) => void;
 }
 
-export default function MixerPanel({ tracks, levels, selectedId, onVolume, onPan, onMute, onSolo, onSelect }: Props) {
-  // master level = max of all track levels (rough but reads right)
-  const masterLevel = Math.max(0, ...Object.values(levels));
+export default function MixerPanel({ tracks, levels, selectedId, masterVolume, playing, bpm, trackKey, getAnalyser, onVolume, onPan, onMute, onSolo, onSelect, onMasterVolume }: Props) {
+  const masterLevel = Math.min(1, Object.values(levels).reduce((s, v) => s + v, 0));
+  const selectedTrack = tracks.find(t => t.id === selectedId) ?? null;
+  const totalDuration = Math.max(...tracks.map(t => t.duration ?? 0), 30);
+
   return (
     <div style={{
       height: 210, background: `linear-gradient(180deg, ${C.bg1}, ${C.bg0})`,
       borderTop: `1px solid ${C.line}`, display: "flex", alignItems: "stretch",
-      overflowX: "auto", flexShrink: 0, fontFamily: ui,
+      flexShrink: 0, fontFamily: ui, overflow: "hidden",
     }}>
-      {tracks.map(track => (
-        <Channel key={track.id} track={track} level={levels[track.id] ?? 0} selected={track.id === selectedId}
-          onVolume={v => onVolume(track.id, v)} onPan={v => onPan(track.id, v)}
-          onMute={() => onMute(track.id)} onSolo={() => onSolo(track.id)} onSelect={() => onSelect(track.id)} />
-      ))}
-      {/* Master */}
-      <div style={{ width: 1, background: C.line, margin: "10px 0", flexShrink: 0 }} />
-      <Channel master track={{ id: "__master", label: "Master", color: C.accent, volume: 0.85, pan: 0, muted: false, soloed: false } as any}
-        level={masterLevel} selected={false}
-        onVolume={() => {}} onPan={() => {}} onMute={() => {}} onSolo={() => {}} onSelect={() => {}} />
+      {/* ── Mixer channels (scrollable) ── */}
+      <div style={{ display: "flex", alignItems: "stretch", overflowX: "auto", flexShrink: 0 }}>
+        {tracks.map(track => (
+          <Channel key={track.id} track={track} level={levels[track.id] ?? 0} selected={track.id === selectedId}
+            onVolume={v => onVolume(track.id, v)} onPan={v => onPan(track.id, v)}
+            onMute={() => onMute(track.id)} onSolo={() => onSolo(track.id)} onSelect={() => onSelect(track.id)} />
+        ))}
+        {/* Master */}
+        <div style={{ width: 1, background: C.line, margin: "10px 0", flexShrink: 0 }} />
+        <Channel master track={{ id: "__master", label: "Master", color: C.accent, volume: masterVolume, pan: 0, muted: false, soloed: false } as any}
+          level={masterLevel} selected={false}
+          onVolume={onMasterVolume} onPan={() => {}} onMute={() => {}} onSolo={() => {}} onSelect={() => {}} />
+        <LufsMeter playing={playing} getAnalyser={getAnalyser} />
+        <div style={{ width: 1, background: C.line, margin: "10px 0", flexShrink: 0 }} />
+      </div>
+
+      {/* ── Spectrum analyzer (fills remaining space) ── */}
+      <SpectrumAnalyzer playing={playing} getAnalyser={getAnalyser} />
+
+      {/* ── Track info panel (fixed right column) ── */}
+      <TrackInfoPanel
+        track={selectedTrack}
+        bpm={bpm}
+        trackKey={trackKey}
+        duration={totalDuration}
+      />
     </div>
   );
 }
@@ -72,7 +99,7 @@ function Channel({ track, level, selected, master, onVolume, onPan, onMute, onSo
 
       {/* fader + meter */}
       <div style={{ flex: 1, display: "flex", alignItems: "stretch", justifyContent: "center", width: "100%", gap: 5 }}>
-        <Fader value={track.volume} color={track.color} disabled={master} onChange={onVolume} />
+        <Fader value={track.volume} color={track.color} onChange={onVolume} />
         <StereoMeter level={track.muted ? 0 : level} />
       </div>
 
@@ -90,7 +117,7 @@ function Channel({ track, level, selected, master, onVolume, onPan, onMute, onSo
 }
 
 // Custom vertical fader: an inset track with a draggable cap. Drag to set.
-function Fader({ value, color, disabled, onChange }: { value: number; color: string; disabled?: boolean; onChange: (v: number) => void }) {
+function Fader({ value, color, onChange }: { value: number; color: string; onChange: (v: number) => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const dragRef = useRef(false);
 
@@ -102,12 +129,11 @@ function Fader({ value, color, disabled, onChange }: { value: number; color: str
   }, [onChange]);
 
   const onDown = useCallback((e: React.PointerEvent) => {
-    if (disabled) return;
     e.stopPropagation();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     dragRef.current = true;
     setFromY(e.clientY);
-  }, [disabled, setFromY]);
+  }, [setFromY]);
 
   const onMove = useCallback((e: React.PointerEvent) => { if (dragRef.current) setFromY(e.clientY); }, [setFromY]);
   const onUp = useCallback(() => { dragRef.current = false; }, []);
@@ -115,7 +141,7 @@ function Fader({ value, color, disabled, onChange }: { value: number; color: str
   return (
     <div ref={ref} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}
       style={{
-        width: 20, position: "relative", cursor: disabled ? "default" : "ns-resize",
+        width: 20, position: "relative", cursor: "ns-resize",
         background: C.bg0, borderRadius: 4, boxShadow: "inset 0 1px 3px rgba(0,0,0,0.6)",
         border: `1px solid ${C.lineSoft}`, touchAction: "none",
       }}>

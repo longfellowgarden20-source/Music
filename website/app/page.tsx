@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
+import Image from "next/image";
 import { T, Logo, BeatPlayer, Reveal } from "./_shared/ui";
 
 // animated waveform band that drifts across the hero
@@ -260,6 +261,60 @@ export default function Home() {
               </div>
             </Reveal>
           ))}
+        </div>
+      </section>
+
+      {/* DAW SCREENSHOT SHOWCASE */}
+      <section style={{ padding: "80px max(24px,5vw) 100px", background: T.bg1, borderTop: `1px solid ${T.line}` }}>
+        <div style={{ maxWidth: 1080, margin: "0 auto" }}>
+          <Reveal>
+            <div style={{ textAlign: "center", marginBottom: 48 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: T.green, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>The Studio</div>
+              <h2 style={{ fontSize: "clamp(28px,4vw,48px)", fontWeight: 900, letterSpacing: -1.5, lineHeight: 1.05, marginBottom: 16 }}>
+                A real DAW, not a toy
+              </h2>
+              <p style={{ fontSize: 16, color: T.muted, maxWidth: 520, margin: "0 auto", lineHeight: 1.6 }}>
+                Four stem tracks, a full mixer, per-stem effects rack, automation lanes, region editing — all running locally on your machine.
+              </p>
+            </div>
+          </Reveal>
+          <Reveal delay={80}>
+            <div style={{
+              position: "relative", borderRadius: 16, overflow: "hidden",
+              border: `1px solid ${T.line}`,
+              boxShadow: `0 32px 80px rgba(0,0,0,.6), 0 0 0 1px ${T.green}18`,
+            }}>
+              {/* fake window chrome */}
+              <div style={{ height: 36, background: "#111", borderBottom: `1px solid ${T.line}`, display: "flex", alignItems: "center", gap: 7, padding: "0 14px", flexShrink: 0 }}>
+                <span style={{ width: 11, height: 11, borderRadius: "50%", background: "#ef4444" }} />
+                <span style={{ width: 11, height: 11, borderRadius: "50%", background: "#fbbf24" }} />
+                <span style={{ width: 11, height: 11, borderRadius: "50%", background: "#22c55e" }} />
+                <span style={{ marginLeft: 10, fontSize: 11, fontWeight: 600, color: T.faint }}>StemAI · Studio</span>
+              </div>
+              <Image
+                src="/daw-screenshot.png"
+                alt="StemAI DAW — stem tracks with waveforms, mixer panel, and effects rack"
+                width={1180}
+                height={737}
+                style={{ width: "100%", height: "auto", display: "block" }}
+                priority
+              />
+              {/* caption pills */}
+              <div style={{ position: "absolute", bottom: 20, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
+                {["Vocals", "Drums", "Bass", "Other"].map((stem, i) => {
+                  const colors = ["#4fd1a5", "#e07070", "#8b8bdb", "#c4a96e"];
+                  return (
+                    <span key={stem} style={{
+                      fontSize: 11, fontWeight: 800, letterSpacing: 0.5,
+                      background: "rgba(10,10,10,.82)", backdropFilter: "blur(8px)",
+                      border: `1px solid ${colors[i]}55`, color: colors[i],
+                      padding: "5px 13px", borderRadius: 500,
+                    }}>{stem}</span>
+                  );
+                })}
+              </div>
+            </div>
+          </Reveal>
         </div>
       </section>
 

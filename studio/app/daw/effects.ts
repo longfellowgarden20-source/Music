@@ -28,9 +28,9 @@ export const EFFECT_DEFS: Record<EffectType, EffectDef> = {
   eq3: {
     type: "eq3", name: "EQ Three", short: "EQ",
     params: [
-      { key: "low", label: "Low", min: -24, max: 12, step: 0.5, default: 0, unit: "dB" },
+      { key: "low", label: "Low", min: -24, max: 12, step: 0.5, default: -5, unit: "dB" },
       { key: "mid", label: "Mid", min: -24, max: 12, step: 0.5, default: 0, unit: "dB" },
-      { key: "high", label: "High", min: -24, max: 12, step: 0.5, default: 0, unit: "dB" },
+      { key: "high", label: "High", min: -24, max: 12, step: 0.5, default: 2.5, unit: "dB" },
       { key: "lowFreq", label: "Lo X", min: 50, max: 600, step: 10, default: 250, unit: "Hz", curve: "log" },
       { key: "highFreq", label: "Hi X", min: 1000, max: 8000, step: 100, default: 2500, unit: "Hz", curve: "log" },
     ],
@@ -43,9 +43,9 @@ export const EFFECT_DEFS: Record<EffectType, EffectDef> = {
   compressor: {
     type: "compressor", name: "Compressor", short: "CMP",
     params: [
-      { key: "threshold", label: "Thresh", min: -60, max: 0, step: 1, default: -24, unit: "dB" },
-      { key: "ratio", label: "Ratio", min: 1, max: 20, step: 0.5, default: 4, unit: ":1" },
-      { key: "attack", label: "Attack", min: 0.001, max: 1, step: 0.001, default: 0.01, unit: "s", curve: "log" },
+      { key: "threshold", label: "Thresh", min: -60, max: 0, step: 1, default: -18, unit: "dB" },
+      { key: "ratio", label: "Ratio", min: 1, max: 20, step: 0.5, default: 3, unit: ":1" },
+      { key: "attack", label: "Attack", min: 0.001, max: 1, step: 0.001, default: 0.02, unit: "s", curve: "log" },
       { key: "release", label: "Release", min: 0.01, max: 1, step: 0.01, default: 0.25, unit: "s", curve: "log" },
     ],
     build: (Tone, p) => new Tone.Compressor({ threshold: p.threshold, ratio: p.ratio, attack: p.attack, release: p.release }),

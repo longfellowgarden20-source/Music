@@ -9,15 +9,17 @@ import TrackHeaders from "./TrackHeaders";
 import ArrangementCanvas from "./ArrangementCanvas";
 import MixerPanel from "./MixerPanel";
 import EffectsRack from "./EffectsRack";
+import PianoRoll from "./PianoRoll";
+import ScoreView from "./ScoreView";
 import SelectionToolbar from "./SelectionToolbar";
 import FileMenu from "./FileMenu";
 import { makeEffect } from "./effects";
 import { makeOp, OP_META, peaksFromBuffer } from "./regionOps";
 import { renderMixdown, audioBufferToWav, downloadBlob, serializeProject, type ProjectFile } from "./exporter";
-import { C, STEM_COLORS, MARKER_COLORS } from "./theme";
+import { C, STEM_COLORS, MARKER_COLORS, mono, ui } from "./theme";
 import type { DawTrack, DawClip, TransportState, ViewState, Gesture, Marker, SnapResolution, EffectType, TimeSelection, RegionOp, RegionOpType } from "./dawTypes";
 
-const STEM_ORDER = ["vocals", "drums", "bass", "other"];
+const STEM_ORDER = ["vocals", "drums", "bass", "guitar", "piano", "other"];
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
 
@@ -55,12 +57,17 @@ export default function DAWStudio() {
   const [splitStatus, setSplitStatus] = useState<"idle" | "splitting" | "done" | "error">("idle");
   const [statusMsg, setStatusMsg] = useState("Loading track…");
   const [trackTitle, setTrackTitle] = useState("DAW");
-  const [bottomPanel, setBottomPanel] = useState<"mixer" | "effects" | null>("mixer");
+  const [bottomPanel, setBottomPanel] = useState<"mixer" | "effects" | "piano-roll" | "score" | null>("mixer");
+  const [masterVolume, setMasterVolume] = useState(1);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selection, setSelection] = useState<TimeSelection | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [automationLane, setAutomationLane] = useState<"volume" | "pan" | null>(null);
+  const [trackKey, setTrackKey] = useState<string | null>(null);
+  const [chordProg, setChordProg] = useState<string | null>(null);
+  const [chordsLoading, setChordsLoading] = useState(false);
+
 
   const positionRef = useRef(0);
   const rafRef = useRef<number>(0);
@@ -122,11 +129,22 @@ export default function DAWStudio() {
     api.track(id).then(async t => {
       setTrackTitle(t.title || t.prompt || "Untitled");
       setTransport(tr => ({ ...tr, bpm: t.bpm || 120 }));
+      setTrackKey(t.key ?? null);
+
+      // Track file missing on disk — audio was never generated or was deleted.
+      if (!t.has_audio) {
+        setSplitStatus("error");
+        setStatusMsg("Audio file not found — this track was never generated or was deleted.");
+        return;
+      }
 
       const stemInfo = await api.stems(id).catch(() => null);
 
       if (stemInfo?.separated && stemInfo.stems) {
-        await loadStemTracks(id, t.duration ?? 30);
+        setStatusMsg("Loading stems into DAW…");
+        await loadStemTracks(id, t.duration ?? 30, Object.keys(stemInfo.stems));
+        setSplitStatus("idle");
+        setStatusMsg("");
       } else {
         const masterUrl = `${API}/api/audio/${id}`;
         const masterTrack = makeDawTrack("master", "Master", masterUrl, t.duration ?? 30);
@@ -136,9 +154,10 @@ export default function DAWStudio() {
         setSplitStatus("splitting");
         setStatusMsg("Separating into stems — this takes ~30s on CPU…");
         try {
-          await api.splitStems(id);
-          await loadStemTracks(id, t.duration ?? 30);
-          setSplitStatus("done");
+          const splitResult = await api.splitStems(id);
+          const stemNames = splitResult?.stems ? Object.keys(splitResult.stems) : undefined;
+          await loadStemTracks(id, t.duration ?? 30, stemNames);
+          setSplitStatus("idle");
           setStatusMsg("");
         } catch (e: any) {
           setSplitStatus("error");
@@ -150,9 +169,13 @@ export default function DAWStudio() {
     });
   }, [trackId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function loadStemTracks(trackId: number, duration: number) {
+  async function loadStemTracks(trackId: number, duration: number, availableStems?: string[]) {
     setStatusMsg("Loading stems into DAW…");
-    const dawTracks = STEM_ORDER.map(stem =>
+    // Use only stems that actually exist on disk, in canonical order
+    const stemNames = availableStems
+      ? STEM_ORDER.filter(s => availableStems.includes(s))
+      : STEM_ORDER;
+    const dawTracks = stemNames.map(stem =>
       makeDawTrack(stem, stem.charAt(0).toUpperCase() + stem.slice(1),
         api.stemAudioUrl(trackId, stem), duration)
     );
@@ -221,6 +244,18 @@ export default function DAWStudio() {
     engine.setBpm(bpm);
     setTransport(t => ({ ...t, bpm }));
   }, [engine]);
+
+  const handleDetectChords = useCallback(async () => {
+    if (!trackId || chordsLoading) return;
+    setChordsLoading(true);
+    try {
+      const r = await api.chords(parseInt(trackId));
+      setChordProg(r.progression || "—");
+    } catch {
+      setChordProg("detection failed");
+    }
+    setChordsLoading(false);
+  }, [trackId, chordsLoading]);
 
   const handleLoopToggle = useCallback(() => {
     setTransport(t => {
@@ -299,6 +334,11 @@ export default function DAWStudio() {
     setTracks(ts => ts.map(t => t.id === id ? { ...t, pan } : t));
   }, [engine]);
 
+  const handleMasterVolume = useCallback((vol: number) => {
+    engine.setMasterVolume(vol);
+    setMasterVolume(vol);
+  }, [engine]);
+
   const handleArm = useCallback((id: string) => {
     setTracks(ts => ts.map(t => t.id === id ? { ...t, armed: !t.armed } : t));
   }, []);
@@ -310,6 +350,14 @@ export default function DAWStudio() {
       const [moved] = next.splice(from, 1);
       next.splice(to, 0, moved);
       history.push(next, markersRef.current, "Reorder tracks");
+      return next;
+    });
+  }, [history]);
+
+  const handleColor = useCallback((id: string, color: string) => {
+    setTracks(ts => {
+      const next = ts.map(t => t.id === id ? { ...t, color } : t);
+      history.push(next, markersRef.current, "Recolor track");
       return next;
     });
   }, [history]);
@@ -464,11 +512,11 @@ export default function DAWStudio() {
   const handleExportMix = useCallback(async () => {
     setStatusMsg("Rendering mixdown…");
     try {
-      const mix = await renderMixdown(tracksRef.current);
+      const mix = await renderMixdown(tracksRef.current, masterVolume);
       downloadBlob(audioBufferToWav(mix), `${safeName}_mix.wav`);
       setStatusMsg("");
     } catch (e: any) { setStatusMsg(`Export failed: ${e.message}`); }
-  }, [safeName]);
+  }, [safeName, masterVolume]);
 
   const handleExportStems = useCallback(async () => {
     setStatusMsg("Exporting stems…");
@@ -568,7 +616,7 @@ export default function DAWStudio() {
     }
   }, [commitHistory]);
 
-  const handleGestureMove = useCallback((clientX: number) => {
+  const handleGestureMove = useCallback((clientX: number, _clientY?: number) => {
     const g = gestureRef.current;
     if (!g || g.type === "idle" || g.type === "seeking" || g.type === "loop-range") return;
     const deltaSec = (clientX - g.startClientX) / transport.zoom;
@@ -692,24 +740,42 @@ export default function DAWStudio() {
         onAddMarker={handleAddMarker}
         onUndo={handleUndo}
         onRedo={handleRedo}
-        onBack={() => router.push("/")}
+        onBack={() => { try { router.push("/"); } catch { window.location.href = "/"; } }}
       />
 
-      {(statusMsg || engine.loadError) && (
+      {(statusMsg || (engine.loadError && tracks.length > 0)) && (
         <div style={{
           padding: "6px 16px", background: C.bg2, fontSize: 12,
-          color: (splitStatus === "error" || engine.loadError) ? C.rec : C.accent,
+          color: (splitStatus === "error") ? C.rec : engine.loadError ? C.warn : C.accent,
           borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 8,
         }}>
           {splitStatus === "splitting" && <span className="spinner" />}
-          {engine.loadError ? `Audio load issue — ${engine.loadError}` : statusMsg}
+          {statusMsg || (engine.loadError ? `One or more stems had load issues: ${engine.loadError}` : "")}
         </div>
       )}
+
+      {/* chord progression strip */}
+      <div style={{
+        padding: "4px 16px", background: C.bg1, fontSize: 11,
+        borderBottom: `1px solid ${C.line}`, display: "flex", alignItems: "center", gap: 10,
+        fontFamily: mono, color: C.text3, minHeight: 26,
+      }}>
+        <span style={{ fontSize: 9, fontWeight: 800, letterSpacing: 1, color: C.text4 }}>CHORDS</span>
+        {chordProg ? (
+          <span style={{ color: C.accent, letterSpacing: 0.5 }}>{chordProg}</span>
+        ) : (
+          <button onClick={handleDetectChords} disabled={chordsLoading} style={{
+            fontSize: 10, fontFamily: ui, background: "none", border: `1px solid ${C.line}`,
+            color: C.text3, padding: "2px 8px", borderRadius: 4, cursor: chordsLoading ? "default" : "pointer",
+          }}>{chordsLoading ? "Detecting…" : "Detect chord progression"}</button>
+        )}
+      </div>
 
       {/* Region edit bar: file menu + select-mode toggle + op toolbar */}
       <div style={{
         height: 38, flexShrink: 0, display: "flex", alignItems: "stretch",
         borderBottom: `1px solid ${C.line}`, background: C.bg1,
+        overflow: "visible", position: "relative", zIndex: 20,
       }}>
         <FileMenu
           onSave={handleSaveProject} onLoad={handleLoadProject}
@@ -762,6 +828,7 @@ export default function DAWStudio() {
           onMute={handleMute} onSolo={handleSolo}
           onVolume={handleVolume} onPan={handlePan} onArm={handleArm}
           onReorder={handleReorder} onSelect={setSelectedId}
+          onColor={handleColor}
         />
         <ArrangementCanvas
           tracks={tracks}
@@ -788,13 +855,13 @@ export default function DAWStudio() {
         />
       </div>
 
-      <div style={{ flexShrink: 0 }}>
+      <div style={{ flexShrink: 0, position: "relative", zIndex: 10 }}>
         <div style={{
           height: 30, background: `linear-gradient(180deg, ${C.bg2}, ${C.bg1})`,
           borderTop: `1px solid ${C.line}`,
           display: "flex", alignItems: "center", gap: 4, padding: "0 12px",
         }}>
-          {(["mixer", "effects"] as const).map(tab => {
+          {(["mixer", "effects", "piano-roll", "score"] as const).map(tab => {
             const active = bottomPanel === tab;
             return (
               <button key={tab}
@@ -814,12 +881,18 @@ export default function DAWStudio() {
         {bottomPanel === "mixer" && (
           <MixerPanel
             tracks={tracks} levels={levels} selectedId={selectedId}
+            masterVolume={masterVolume}
+            playing={transport.playing}
+            bpm={transport.bpm}
+            trackKey={trackKey}
+            getAnalyser={engine.getAnalyser}
             onVolume={handleVolume} onPan={handlePan}
             onMute={handleMute} onSolo={handleSolo} onSelect={setSelectedId}
+            onMasterVolume={handleMasterVolume}
           />
         )}
         {bottomPanel === "effects" && (
-          <div style={{ height: 210, borderTop: `1px solid ${C.line}` }}>
+          <div style={{ height: 210, borderTop: `1px solid ${C.line}`, display: "flex", overflow: "visible", position: "relative", zIndex: 30 }}>
             <EffectsRack
               track={selectedTrack}
               aiBusy={aiBusy}
@@ -828,6 +901,25 @@ export default function DAWStudio() {
               onToggleEffect={handleToggleEffect}
               onParamChange={handleEffectParam}
               onStemOp={runStemOp}
+            />
+          </div>
+        )}
+        {bottomPanel === "piano-roll" && (
+          <div style={{ height: 260, borderTop: `1px solid ${C.line}`, display: "flex" }}>
+            <PianoRoll
+              track={selectedTrack}
+              trackId={trackId ? parseInt(trackId) : null}
+              positionSec={positionSec}
+              playing={transport.playing}
+            />
+          </div>
+        )}
+        {bottomPanel === "score" && (
+          <div style={{ height: 260, borderTop: `1px solid ${C.line}`, display: "flex" }}>
+            <ScoreView
+              track={selectedTrack}
+              trackId={trackId ? parseInt(trackId) : null}
+              bpm={transport.bpm}
             />
           </div>
         )}

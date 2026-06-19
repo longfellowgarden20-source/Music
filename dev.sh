@@ -22,7 +22,7 @@ sleep 0.5
 
 echo "Starting engine on port 8765..."
 cd "$ROOT"
-STEMAI_DEV=1 music_env/bin/python -m uvicorn music_studio.api_server:app \
+music_env/bin/python -m uvicorn music_studio.api_server:app \
   --port 8765 --host 127.0.0.1 --log-level warning &
 ENGINE_PID=$!
 
@@ -37,7 +37,7 @@ done
 
 echo "Launching app..."
 cd "$ROOT/desktop"
-env -u ELECTRON_RUN_AS_NODE ELECTRON_DEV=1 ./node_modules/.bin/electron .
+env -u ELECTRON_RUN_AS_NODE ELECTRON_DEV=1 UI_DEV_PORT=3001 ./node_modules/.bin/electron .
 
 # When Electron exits, kill the engine too
 kill $ENGINE_PID 2>/dev/null

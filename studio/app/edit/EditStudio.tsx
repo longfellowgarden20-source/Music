@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState, useCallback } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import { api, API, fmtTime, type Track, type EffectDef } from "../lib/api";
+import { api, fmtTime, type Track, type EffectDef } from "../lib/api";
 import { usePlayer } from "../components/PlayerProvider";
 import { useProgress } from "../components/ProgressContext";
 import Waveform from "../components/Waveform";
@@ -66,18 +66,75 @@ export default function EditStudio() {
 
   const onStop = async () => { setStatus("🛑 Stopping…"); try { await api.cancel(); } catch { /* ignore */ } };
 
-  // Kill switch: if an op is running and the tab is closed/left, tell the backend
-  // to stop so generation doesn't keep churning after we're gone.
-  useEffect(() => {
-    if (!busy) return;
-    const stop = () => { try { navigator.sendBeacon(`${API}/api/cancel`); } catch { /* ignore */ } };
-    window.addEventListener("pagehide", stop);
-    window.addEventListener("beforeunload", stop);
-    return () => {
-      window.removeEventListener("pagehide", stop);
-      window.removeEventListener("beforeunload", stop);
-    };
-  }, [busy]);
+  // Streaming "complete the song" — real per-section progress on the top bar.
+  const runComplete = async (prompt: string) => {
+    if (!track) return;
+    setBusy("complete");
+    setStatus("Building full song…");
+    progress.set(3, "Complete the song · warming up…");
+    try {
+      const r = await api.completeStream(
+        track.id,
+        { prompt, model_size: track.model || "small" },
+        (p) => {
+          const label = p.role === "starting"
+            ? "Complete the song · warming up…"
+            : `Complete the song · ${p.role} (${p.section}/${p.total})`;
+          progress.set(p.pct, label);
+        },
+      );
+      setStatus(`✅ Full song → #${r.id}`);
+      router.replace(`/edit?id=${r.id}`);
+      setTrack(r.track);
+      setNotes(r.track.notes || "");
+      api.versions(r.id).then(setVersions).catch(() => {});
+      play(r.track);
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      setStatus(/cancel/i.test(msg) ? "🛑 Stopped" : `❌ ${msg}`);
+    } finally {
+      setBusy(null);
+      progress.finish();
+    }
+  };
+
+  // Add an AI instrument layer (drums/bass/keys/custom). Same poll pattern.
+  const runAddInstrument = async (prompt: string, label: string) => {
+    if (!track) return;
+    setBusy("add_instrument");
+    setStatus(`Adding ${label}…`);
+    progress.set(8, `Adding ${label}…`);
+    try {
+      const r = await api.addInstrument(
+        track.id,
+        { prompt, model_size: track.model || "small", blend: "smart", volume: 0.7 },
+        (p) => progress.set(p.pct, `Adding ${label}… (${p.state})`),
+      );
+      setStatus(`✅ Added ${label} → #${r.id}`);
+      router.replace(`/edit?id=${r.id}`);
+      setTrack(r.track);
+      setNotes(r.track.notes || "");
+      api.versions(r.id).then(setVersions).catch(() => {});
+      play(r.track);
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      setStatus(/cancel/i.test(msg) ? "🛑 Stopped" : `❌ ${msg}`);
+    } finally {
+      setBusy(null);
+      progress.finish();
+    }
+  };
+
+  // NOTE: there used to be a "kill switch" here that fired /api/cancel on
+  // `pagehide`/`beforeunload`. With "Complete the song" now running as a DETACHED
+  // background job (start + poll), that handler killed legitimate builds — it
+  // fires on tab backgrounding / refresh, not just real navigation, silently
+  // cancelling a build mid-section (the "it stops at Verse 1/6" bug). The build
+  // is meant to survive page changes; the explicit Stop button is the only way it
+  // should be cancelled. So the auto-kill-switch is intentionally removed.
+  //
+  // (Short single-shot ops like tweak/extend finish in seconds, so there's no
+  // real "churning after we're gone" cost to dropping it.)
 
   if (!track) {
     return (
@@ -126,7 +183,7 @@ export default function EditStudio() {
           alignItems: "center", gap: 10,
           color: status.startsWith("✅") ? "var(--green)" : status.startsWith("❌") ? "var(--red)" : "var(--muted)" }}>
           <span style={{ flex: 1 }}>{status}</span>
-          {["tweak", "region", "extend", "complete"].includes(busy || "") && (
+          {["tweak", "region", "extend", "complete", "add_instrument"].includes(busy || "") && (
             <button onClick={onStop} title="Stop now"
               style={{ padding: "5px 12px", fontSize: 12, fontWeight: 700, borderRadius: 6,
                 background: "var(--red, #ef4444)", color: "#fff", border: "none", cursor: "pointer" }}>
@@ -151,7 +208,12 @@ export default function EditStudio() {
 
         {/* COMPLETE THE SONG */}
         <Panel title="🎼 Complete the song — build a full arrangement">
-          <CompleteBox track={track} busy={busy} run={run} />
+          <CompleteBox track={track} busy={busy} onRun={runComplete} />
+        </Panel>
+
+        {/* ADD INSTRUMENT */}
+        <Panel title="🥁 Add an instrument — let AI play along">
+          <AddInstrumentBox busy={busy} onRun={runAddInstrument} />
         </Panel>
 
         {/* QUICK PRESETS */}
@@ -345,7 +407,48 @@ function ExtendBox({ track, busy, run }: { track: Track; busy: Busy; run: RunFn 
   );
 }
 
-function CompleteBox({ track, busy, run }: { track: Track; busy: Busy; run: RunFn }) {
+const INSTRUMENT_PRESETS: { key: string; label: string; emoji: string; prompt: string }[] = [
+  { key: "drums", label: "Drums", emoji: "🥁", prompt: "add a tight drum kit and groove that locks to this track's tempo and feel" },
+  { key: "bass",  label: "Bass",  emoji: "🎸", prompt: "add a bass line that follows this track's groove and key" },
+  { key: "keys",  label: "Keys",  emoji: "🎹", prompt: "add a complementary piano / keys part that fits this track's chords and mood" },
+];
+
+function AddInstrumentBox({ busy, onRun }: { busy: Busy; onRun: (prompt: string, label: string) => void }) {
+  const [custom, setCustom] = useState("");
+  const disabled = !!busy;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ fontSize: 12, color: "var(--muted)" }}>
+        No drummer? No bassist? AI listens to your track and plays along — matching the
+        tempo and feel — then mixes the new part in. Saves as a new version.
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {INSTRUMENT_PRESETS.map(p => (
+          <button key={p.key} className="btn" disabled={disabled}
+            style={{ flex: "1 1 90px", padding: "10px 0", fontSize: 13, fontWeight: 600,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+            onClick={() => onRun(p.prompt, p.label)}>
+            {busy === "add_instrument" ? <span className="spinner" /> : <>{p.emoji} {p.label}</>}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input className="input" value={custom} onChange={e => setCustom(e.target.value)}
+          placeholder='or describe it — e.g. "add a saxophone solo", "add strings"'
+          onKeyDown={e => { if (e.key === "Enter" && custom.trim() && !disabled) onRun(`add ${custom.trim()} that fits this track`, custom.trim()); }} />
+        <button className="btn btn-primary" disabled={disabled || !custom.trim()}
+          onClick={() => onRun(`add ${custom.trim()} that fits this track`, custom.trim())}>
+          {busy === "add_instrument" ? <span className="spinner" /> : "Add"}
+        </button>
+      </div>
+      <div style={{ fontSize: 11, color: "var(--muted)", opacity: .8 }}>
+        Takes a minute or two — watch the top bar. Works best on tracks with a clear groove.
+      </div>
+    </div>
+  );
+}
+
+function CompleteBox({ track, busy, onRun }: { track: Track; busy: Busy; onRun: (prompt: string) => void }) {
   const [prompt, setPrompt] = useState("");
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -356,12 +459,12 @@ function CompleteBox({ track, busy, run }: { track: Track; busy: Busy; run: RunF
       <input className="input" value={prompt} onChange={e => setPrompt(e.target.value)}
         placeholder="any direction for the full song? (blank = same vibe)" />
       <button className="btn btn-primary" disabled={!!busy}
-        onClick={() => run("complete", () => api.complete(track.id,
-          { prompt, model_size: track.model || "small" }), "Completed song")}>
+        onClick={() => onRun(prompt)}>
         {busy === "complete" ? <span className="spinner" /> : "🎼 Complete the song"}
       </button>
       <div style={{ fontSize: 11, color: "var(--muted)", opacity: .8 }}>
-        Generates 6 sections — takes a few minutes on CPU. Saves to “Full Songs”.
+        Generates 6 sections — takes a few minutes. Watch the top bar for
+        real progress. Saves to “Full Songs”.
       </div>
     </div>
   );

@@ -2,9 +2,8 @@
 // an OfflineAudioContext from the exact buffers the user hears (region ops baked
 // in), so the export is WYSIWYG. Projects serialize the editable state to JSON
 // (audio is re-fetched by URL on load, so files stay small).
-import type { DawTrack, Marker, TransportState, RegionOp, AutomationLane, AutomationPoint } from "./dawTypes";
+import type { DawTrack, Marker, TransportState, RegionOp, AutomationLane, AutomationPoint, TrackEffect } from "./dawTypes";
 import { renderClipBufferAsync } from "./regionOps";
-import { EFFECT_DEFS } from "./effects";
 
 // ── WAV encoding ────────────────────────────────────────────────────────────────
 export function audioBufferToWav(buf: AudioBuffer): Blob {
@@ -63,10 +62,112 @@ async function renderTrackBuffer(ctx: BaseAudioContext, track: DawTrack): Promis
   } catch { return null; }
 }
 
+// ── effects baking (native Web Audio equivalents of the Tone.js rack) ───────────
+// Tone.js nodes can't be used inside OfflineAudioContext, so we re-implement each
+// effect type with standard Web Audio API nodes. Only enabled effects are applied.
+function buildNativeEffect(oac: OfflineAudioContext, eff: TrackEffect): AudioNode[] {
+  const p = eff.params;
+  switch (eff.type) {
+    case "eq3": {
+      const lo = oac.createBiquadFilter(); lo.type = "lowshelf"; lo.frequency.value = p.lowFreq ?? 250; lo.gain.value = p.low ?? 0;
+      const mid = oac.createBiquadFilter(); mid.type = "peaking"; mid.frequency.value = 1000; mid.Q.value = 0.8; mid.gain.value = p.mid ?? 0;
+      const hi = oac.createBiquadFilter(); hi.type = "highshelf"; hi.frequency.value = p.highFreq ?? 2500; hi.gain.value = p.high ?? 0;
+      lo.connect(mid); mid.connect(hi);
+      return [lo, hi];  // [input, output]
+    }
+    case "compressor": {
+      const comp = oac.createDynamicsCompressor();
+      comp.threshold.value = p.threshold ?? -24;
+      comp.ratio.value = p.ratio ?? 4;
+      comp.attack.value = p.attack ?? 0.01;
+      comp.release.value = p.release ?? 0.25;
+      comp.knee.value = 6;
+      return [comp, comp];
+    }
+    case "reverb": {
+      // convolution reverb using a synthetic impulse response
+      const wet = p.wet ?? 0.3;
+      const decay = p.decay ?? 2.5;
+      const sr = oac.sampleRate;
+      const len = Math.ceil(decay * sr);
+      const ir = oac.createBuffer(2, len, sr);
+      for (let c = 0; c < 2; c++) {
+        const d = ir.getChannelData(c);
+        for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2);
+      }
+      const conv = oac.createConvolver(); conv.buffer = ir;
+      const dryGain = oac.createGain(); dryGain.gain.value = 1 - wet;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet;
+      const merge = oac.createGain();
+      // we return [inputNode, outputNode]; caller connects: prev->input, output->next
+      // internally: input splits to dryGain and conv->wetGain, both merge
+      // We wire dry and wet through a merger gain:
+      dryGain.connect(merge); wetGain.connect(merge); conv.connect(wetGain);
+      // The "input" is dryGain (caller connects source to dryGain AND to conv).
+      // We use a splitter gain as the real entry point:
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(conv);
+      return [entry, merge];
+    }
+    case "delay": {
+      const wet = p.wet ?? 0.25;
+      const time = Math.min(p.delayTime ?? 0.25, 1.0);
+      const fb = Math.min(p.feedback ?? 0.3, 0.95);
+      const delay = oac.createDelay(2.0); delay.delayTime.value = time;
+      const fbGain = oac.createGain(); fbGain.gain.value = fb;
+      const dryGain = oac.createGain(); dryGain.gain.value = 1 - wet;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet;
+      const merge = oac.createGain();
+      delay.connect(fbGain); fbGain.connect(delay);
+      delay.connect(wetGain); wetGain.connect(merge); dryGain.connect(merge);
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(delay);
+      return [entry, merge];
+    }
+    case "chorus": {
+      // chorus = short modulated delay. OfflineAudioContext can't modulate in time,
+      // so bake as a slight pitch detune (static double with tiny delay = thickening).
+      const wet = p.wet ?? 0.4;
+      const time = 0.02; // fixed 20ms for offline
+      const delay = oac.createDelay(0.1); delay.delayTime.value = time;
+      const dryGain = oac.createGain(); dryGain.gain.value = 1 - wet * 0.5;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet * 0.5;
+      const merge = oac.createGain();
+      delay.connect(wetGain); wetGain.connect(merge); dryGain.connect(merge);
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(delay);
+      return [entry, merge];
+    }
+    case "distortion": {
+      const amount = p.amount ?? 0.3;
+      const wet = p.wet ?? 0.5;
+      const ws = oac.createWaveShaper();
+      // hard-clip waveshaper curve
+      const n = 256, curve = new Float32Array(n);
+      const k = amount * 100 + 1;
+      for (let i = 0; i < n; i++) {
+        const x = (i * 2) / n - 1;
+        curve[i] = Math.max(-1, Math.min(1, (k * x) / (1 + (k - 1) * Math.abs(x))));
+      }
+      ws.curve = curve; ws.oversample = "4x";
+      const dryGain = oac.createGain(); dryGain.gain.value = 1 - wet;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet;
+      const merge = oac.createGain();
+      ws.connect(wetGain); wetGain.connect(merge); dryGain.connect(merge);
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(ws);
+      return [entry, merge];
+    }
+    default:
+      return [];
+  }
+}
+
 // ── full mixdown ────────────────────────────────────────────────────────────────
 // Builds an offline graph: each track's processed buffer -> gain(vol) -> pan ->
-// its effect chain -> master. Honors mute/solo. Returns the rendered stereo mix.
-export async function renderMixdown(tracks: DawTrack[]): Promise<AudioBuffer> {
+// native effect chain -> master gain -> destination.
+// Honors mute/solo. masterVolume is 0..1 (default 1).
+export async function renderMixdown(tracks: DawTrack[], masterVolume = 1): Promise<AudioBuffer> {
   const decodeCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
   const buffers = await Promise.all(tracks.map(t => renderTrackBuffer(decodeCtx, t)));
   await decodeCtx.close();
@@ -80,6 +181,10 @@ export async function renderMixdown(tracks: DawTrack[]): Promise<AudioBuffer> {
   const OAC: typeof OfflineAudioContext = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
   const oac = new OAC(2, Math.ceil(maxDur * sr), sr);
 
+  const masterGain = oac.createGain();
+  masterGain.gain.value = Math.max(0, Math.min(2, masterVolume));
+  masterGain.connect(oac.destination);
+
   const anySolo = tracks.some(t => t.soloed);
   tracks.forEach((track, i) => {
     const buf = buffers[i];
@@ -91,12 +196,19 @@ export async function renderMixdown(tracks: DawTrack[]): Promise<AudioBuffer> {
     const gain = oac.createGain(); gain.gain.value = track.volume;
     const panner = oac.createStereoPanner(); panner.pan.value = track.pan;
 
-    // effects chain (best-effort — Tone effects don't run offline; approximate
-    // EQ/filter with native nodes, skip the rest so the mix still renders).
-    let tail: AudioNode = src;
-    tail.connect(gain); tail = gain;
-    tail.connect(panner); tail = panner;
-    tail.connect(oac.destination);
+    src.connect(gain); gain.connect(panner);
+
+    // bake enabled effects into the offline graph
+    let tail: AudioNode = panner;
+    for (const eff of track.effects ?? []) {
+      if (!eff.enabled) continue;
+      try {
+        const [input, output] = buildNativeEffect(oac, eff);
+        if (input && output) { tail.connect(input); tail = output; }
+      } catch { /* skip bad effect */ }
+    }
+
+    tail.connect(masterGain);
     src.start(track.clips[0]?.startSec ?? 0);
   });
 

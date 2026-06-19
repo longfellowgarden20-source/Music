@@ -1,8 +1,15 @@
 "use client";
+import { useState, useEffect, useRef } from "react";
 import type { DawTrack, ViewState } from "./dawTypes";
 import { C, ui, mono, withAlpha } from "./theme";
 
 const RULER_H = 30;
+
+// Curated palette — distinct hues that read well on the dark canvas.
+export const TRACK_PALETTE = [
+  "#4fd1a5", "#5b9bd5", "#c47b6e", "#c4a96e", "#b06ec4",
+  "#6ec4b0", "#d56b8a", "#9bc45b", "#e0954f", "#7a8ad5",
+];
 
 interface Props {
   tracks: DawTrack[];
@@ -16,13 +23,23 @@ interface Props {
   onArm: (id: string) => void;
   onReorder: (from: number, to: number) => void;
   onSelect: (id: string) => void;
+  onColor?: (id: string, color: string) => void;
 }
 
 export default function TrackHeaders({
   tracks, view, levels, selectedId,
-  onMute, onSolo, onVolume, onPan, onArm, onReorder, onSelect,
+  onMute, onSolo, onVolume, onPan, onArm, onReorder, onSelect, onColor,
 }: Props) {
   const { headerWidth, trackHeight } = view;
+  const [colorPickId, setColorPickId] = useState<string | null>(null);
+  const pickRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!colorPickId) return;
+    const close = (e: MouseEvent) => { if (pickRef.current && !pickRef.current.contains(e.target as Node)) setColorPickId(null); };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [colorPickId]);
 
   return (
     <div style={{
@@ -54,12 +71,35 @@ export default function TrackHeaders({
               background: selected ? withAlpha(track.color, 0.09) : (i % 2 === 0 ? C.rowA : C.rowB),
               cursor: "pointer",
             }}>
-            {/* color strip on left edge */}
-            <div style={{
-              width: 4, flexShrink: 0,
-              background: track.muted ? C.text4 : track.color,
-              boxShadow: selected ? `0 0 8px ${track.color}` : "none",
-            }} />
+            {/* color strip on left edge — click to recolor */}
+            <div
+              onMouseDown={e => { e.stopPropagation(); }}
+              onClick={e => { e.stopPropagation(); if (onColor) setColorPickId(id => id === track.id ? null : track.id); }}
+              title="Click to change track color"
+              style={{
+                width: 7, flexShrink: 0, position: "relative",
+                background: track.muted ? C.text4 : track.color,
+                boxShadow: selected ? `0 0 8px ${track.color}` : "none",
+                cursor: onColor ? "pointer" : "default",
+              }}>
+              {colorPickId === track.id && (
+                <div ref={pickRef} style={{
+                  position: "absolute", left: 10, top: 4, zIndex: 100,
+                  background: C.bg2, border: `1px solid ${C.line}`, borderRadius: 8, padding: 8,
+                  display: "grid", gridTemplateColumns: "repeat(5, 18px)", gap: 6,
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                }}>
+                  {TRACK_PALETTE.map(c => (
+                    <button key={c}
+                      onClick={e => { e.stopPropagation(); onColor?.(track.id, c); setColorPickId(null); }}
+                      style={{
+                        width: 18, height: 18, borderRadius: 4, cursor: "pointer", padding: 0,
+                        background: c, border: c === track.color ? "2px solid #fff" : "1px solid rgba(0,0,0,0.4)",
+                      }} />
+                  ))}
+                </div>
+              )}
+            </div>
 
             <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", padding: "6px 8px 6px 9px", gap: 5, minWidth: 0 }}>
               {/* top row: name + reorder */}

@@ -49,7 +49,7 @@ export default function SelectionToolbar({ selection, track, aiBusy, onApplyOp, 
   return (
     <div ref={rootRef} style={{
       display: "flex", alignItems: "center", gap: 8, padding: "0 12px", height: "100%",
-      fontFamily: ui, overflowX: "auto", overflowY: "visible", position: "relative",
+      fontFamily: ui, overflow: "visible", position: "relative", flex: 1, minWidth: 0,
     }}>
       <span style={{ fontSize: 9, fontWeight: 800, color: C.accent, letterSpacing: 1, whiteSpace: "nowrap" }}>SELECTION</span>
       <span style={{ fontSize: 10, fontFamily: mono, color: C.text3, whiteSpace: "nowrap" }}>

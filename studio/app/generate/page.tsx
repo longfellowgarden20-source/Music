@@ -1,28 +1,80 @@
 "use client";
 import { useState, useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { api, API, fmtTime, type Track } from "../lib/api";
 import { usePlayer } from "../components/PlayerProvider";
 import { useProgress } from "../components/ProgressContext";
 import Waveform from "../components/Waveform";
 
-const GENRES = ["lo-fi hip hop", "cinematic orchestral", "synthwave", "acoustic folk",
-  "deep house", "ambient", "trap beat", "jazz", "rock", "classical piano"];
-const MOODS = ["chill", "energetic", "dark", "happy", "dreamy", "epic", "melancholic", "aggressive"];
+const GENRE_GROUPS: { name: string; genres: string[] }[] = [
+  {
+    name: "Electronic",
+    genres: [
+      "synthwave", "deep house", "tech house", "progressive house", "electro",
+      "daft punk style", "french house", "nu disco", "drum and bass", "dubstep",
+      "ambient techno", "IDM", "trance", "hardstyle", "garage",
+      "chillwave", "vaporwave", "retrowave", "darksynth", "outrun",
+    ],
+  },
+  {
+    name: "Hip-Hop / Beat",
+    genres: [
+      "lo-fi hip hop", "trap beat", "boom bap", "cloud rap beat", "drill beat",
+      "phonk", "jersey club", "afrobeats", "grime beat",
+    ],
+  },
+  {
+    name: "Live Instruments",
+    genres: [
+      "acoustic folk", "jazz", "blues", "funk", "soul", "R&B",
+      "classical piano", "cinematic orchestral", "string quartet", "flamenco",
+      "bossa nova", "reggae", "afro-cuban", "bluegrass",
+    ],
+  },
+  {
+    name: "Rock / Metal",
+    genres: [
+      "rock", "indie rock", "punk rock", "post-rock", "shoegaze",
+      "metal", "doom metal", "prog rock", "surf rock", "psychedelic rock",
+    ],
+  },
+  {
+    name: "Chill / Atmospheric",
+    genres: [
+      "ambient", "dark ambient", "new age", "meditation", "nature sounds",
+      "film score", "video game OST", "anime OST",
+    ],
+  },
+];
+const MOODS = [
+  "chill", "energetic", "dark", "happy", "dreamy", "epic",
+  "melancholic", "aggressive", "romantic", "mysterious", "euphoric",
+  "nostalgic", "tense", "uplifting", "hypnotic", "raw", "playful", "ethereal",
+];
+const INSTRUMENTS = [
+  "electric guitar", "distorted guitar", "bass guitar", "drum machine",
+  "analog synth", "moog synth", "808 bass", "vocoder", "talk box",
+  "electric piano", "Rhodes", "strings", "brass section", "flute",
+  "theremin", "sitar", "marimba", "vinyl crackle", "sub bass",
+];
 const KEYS = ["", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 export default function GeneratePage() {
   const router = useRouter();
+  const params = useSearchParams();
   const { play } = usePlayer();
   const progress = useProgress();
   const [prompt, setPrompt] = useState("");
   const [negative, setNegative] = useState("");
   const [duration, setDuration] = useState(15);
   const [model, setModel] = useState("small");
-  const [guidance, setGuidance] = useState(3);
-  const [temperature, setTemperature] = useState(1.0);
+  const [guidance, setGuidance] = useState(5);
+  const [temperature, setTemperature] = useState(0.8);
   const [master, setMaster] = useState(true);
+  // Reproduce: when set, generation reuses this exact seed for a deterministic re-roll.
+  const [seed, setSeed] = useState<number | "">("");
   const [moods, setMoods] = useState<string[]>([]);
+  const [instruments, setInstruments] = useState<string[]>([]);
   const [keyRoot, setKeyRoot] = useState("");
   const [bpm, setBpm] = useState<number | "">("");
   const [collections, setCollections] = useState<string[]>([]);
@@ -31,16 +83,36 @@ export default function GeneratePage() {
   const [status, setStatus] = useState("");
   const [result, setResult] = useState<Track | null>(null);
   const [refText, setRefText] = useState("");
+  // Which genre groups are expanded. First group open by default.
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ Electronic: true });
 
   useEffect(() => { api.collections().then(setCollections).catch(() => {}); }, []);
 
+  // Prefill from URL params (used by "Regenerate" / "Reuse prompt" in the library).
+  // The whole prompt is already baked, so put it in the prompt box directly.
+  useEffect(() => {
+    if (!params) return;
+    const p = params.get("prompt"); if (p) setPrompt(p);
+    const n = params.get("negative"); if (n) setNegative(n);
+    const d = params.get("duration"); if (d) setDuration(+d);
+    const m = params.get("model"); if (m) setModel(m);
+    const g = params.get("guidance"); if (g) setGuidance(+g);
+    const tm = params.get("temperature"); if (tm) setTemperature(+tm);
+    const s = params.get("seed"); if (s) setSeed(+s);
+  }, [params]);
+
   const toggleMood = (m: string) =>
     setMoods(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m]);
+  const toggleInstrument = (i: string) =>
+    setInstruments(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]);
+  const toggleGroup = (g: string) =>
+    setOpenGroups(prev => ({ ...prev, [g]: !prev[g] }));
 
   const fullPrompt = () => {
     let p = prompt.trim();
     const extras: string[] = [];
     if (moods.length) extras.push(...moods);
+    if (instruments.length) extras.push(...instruments);
     if (bpm) extras.push(`${bpm} BPM`);
     if (keyRoot) extras.push(`key of ${keyRoot}`);
     if (extras.length) p = p ? `${p}, ${extras.join(", ")}` : extras.join(", ");
@@ -56,6 +128,7 @@ export default function GeneratePage() {
       const r = await api.generate({
         prompt: p, negative, duration, model_size: model, guidance,
         temperature, master, collection,
+        ...(seed !== "" ? { seed } : {}),
       });
       setResult(r.track);
       setStatus(`✅ Saved #${r.id}` + (r.bpm ? ` · ${Math.round(r.bpm)} BPM · ${r.key}` : ""));
@@ -121,14 +194,34 @@ export default function GeneratePage() {
             <button className="btn" onClick={onSoundsLike} disabled={busy}>✨ Suggest</button>
           </div>
 
-          {/* genre chips */}
+          {/* genre chips — collapsible groups */}
           <div>
             <div className="label" style={{ marginBottom: 6 }}>Quick genres</div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {GENRES.map(g => (
-                <button key={g} onClick={() => setPrompt(p => p ? `${p}, ${g}` : g)}
-                  className="btn" style={{ padding: "5px 11px", fontSize: 12 }}>{g}</button>
-              ))}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {GENRE_GROUPS.map(group => {
+                const open = !!openGroups[group.name];
+                return (
+                  <div key={group.name} style={{ border: "1px solid var(--line, #2a2a2a)", borderRadius: 8, overflow: "hidden" }}>
+                    <button onClick={() => toggleGroup(group.name)}
+                      style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+                        padding: "8px 12px", background: "var(--bg3, #1a1a1a)", border: "none", cursor: "pointer",
+                        color: "var(--text, #e5e5e5)", fontSize: 12, fontWeight: 700, textAlign: "left" }}>
+                      <span>{group.name}</span>
+                      <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+                        {group.genres.length} · {open ? "▾" : "▸"}
+                      </span>
+                    </button>
+                    {open && (
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: 10 }}>
+                        {group.genres.map(g => (
+                          <button key={g} onClick={() => setPrompt(p => p ? `${p}, ${g}` : g)}
+                            className="btn" style={{ padding: "5px 11px", fontSize: 12 }}>{g}</button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
 
@@ -142,6 +235,20 @@ export default function GeneratePage() {
                     borderColor: moods.includes(m) ? "var(--accent)" : undefined,
                     color: moods.includes(m) ? "var(--accent)" : undefined,
                     background: moods.includes(m) ? "rgba(139,92,255,.12)" : undefined }}>{m}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* instruments */}
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Instruments & sounds</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {INSTRUMENTS.map(i => (
+                <button key={i} onClick={() => toggleInstrument(i)} className="btn"
+                  style={{ padding: "5px 11px", fontSize: 12,
+                    borderColor: instruments.includes(i) ? "#f59e0b" : undefined,
+                    color: instruments.includes(i) ? "#f59e0b" : undefined,
+                    background: instruments.includes(i) ? "rgba(245,158,11,.12)" : undefined }}>{i}</button>
               ))}
             </div>
           </div>
@@ -201,6 +308,21 @@ export default function GeneratePage() {
           </div>
           <Slider label={`Guidance · ${guidance}`} min={1} max={10} step={0.5} value={guidance} onChange={setGuidance} />
           <Slider label={`Temperature · ${temperature.toFixed(1)}`} min={0.3} max={1.5} step={0.1} value={temperature} onChange={setTemperature} />
+          <div>
+            <div className="label" style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}>
+              Seed
+              {seed !== "" && <span style={{ fontSize: 10, color: "var(--accent)", fontWeight: 700 }}>· reproducing</span>}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input className="input" type="number" placeholder="random" style={{ flex: 1 }}
+                value={seed} onChange={e => setSeed(e.target.value ? +e.target.value : "")} />
+              <button className="btn" title="Randomize (new seed each run)" onClick={() => setSeed("")}
+                style={{ padding: "0 12px" }}>🎲</button>
+            </div>
+            <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 4 }}>
+              {seed !== "" ? "Same seed + same settings = identical track" : "Leave blank for a fresh result each time"}
+            </div>
+          </div>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
             <input type="checkbox" checked={master} onChange={e => setMaster(e.target.checked)}
               style={{ accentColor: "var(--accent)" }} />
