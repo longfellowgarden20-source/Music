@@ -40,6 +40,17 @@ export interface Stats {
   total: number; favorites: number; plays: number; total_seconds: number;
 }
 
+export interface Playlist {
+  id: number;
+  name: string;
+  created_at: string;
+  track_count: number;
+  total_seconds: number;
+}
+export interface PlaylistDetail extends Playlist {
+  tracks: Track[];
+}
+
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     ...opts,
@@ -65,8 +76,25 @@ export const api = {
   },
   track: (id: number) => req<Track>(`/api/track/${id}`),
   versions: (id: number) => req<Track[]>(`/api/track/${id}/versions`),
+  deleteVersion: (trackId: number, versionId: number) =>
+    req<{ ok: boolean; versions: Track[] }>(`/api/track/${trackId}/version/${versionId}`, { method: "DELETE" }),
   collections: () => req<string[]>(`/api/collections`),
   stats: () => req<Stats>(`/api/stats`),
+
+  // playlists
+  playlists: () => req<Playlist[]>(`/api/playlists`),
+  playlist: (id: number) => req<PlaylistDetail>(`/api/playlists/${id}`),
+  createPlaylist: (name: string) =>
+    req<{ id: number }>(`/api/playlists`, { method: "POST", body: JSON.stringify({ name }) }),
+  renamePlaylist: (id: number, name: string) =>
+    req(`/api/playlists/${id}/rename`, { method: "POST", body: JSON.stringify({ name }) }),
+  deletePlaylist: (id: number) => req(`/api/playlists/${id}`, { method: "DELETE" }),
+  addToPlaylist: (playlistId: number, trackId: number) =>
+    req(`/api/playlists/${playlistId}/add/${trackId}`, { method: "POST" }),
+  removeFromPlaylist: (playlistId: number, trackId: number) =>
+    req(`/api/playlists/${playlistId}/remove/${trackId}`, { method: "POST" }),
+  reorderPlaylist: (playlistId: number, trackIds: number[]) =>
+    req(`/api/playlists/${playlistId}/reorder`, { method: "POST", body: JSON.stringify({ track_ids: trackIds }) }),
   waveform: (id: number, points = 1400) =>
     req<{ peaks: number[]; duration: number; sr: number }>(`/api/waveform/${id}?points=${points}`),
 
@@ -95,6 +123,11 @@ export const api = {
   tweak: (id: number, body: Record<string, unknown>) =>
     req<{ id: number; new_prompt: string; track: Track }>(
       `/api/track/${id}/tweak`, { method: "POST", body: JSON.stringify(body) }),
+  // Generate N fresh takes from the track's original prompt (new seed each).
+  // Original is untouched; each variation is saved as a version of the project.
+  variations: (id: number, body: Record<string, unknown>) =>
+    req<{ ok: boolean; variations: Track[]; count: number }>(
+      `/api/track/${id}/variations`, { method: "POST", body: JSON.stringify(body) }),
   extend: (id: number, body: Record<string, unknown>) =>
     req<{ id: number; track: Track }>(`/api/track/${id}/extend`, { method: "POST", body: JSON.stringify(body) }),
   complete: (id: number, body: Record<string, unknown>) =>
@@ -153,6 +186,43 @@ export const api = {
     });
   },
 
+  // Song structure editor — build a song from a custom arrangement of sections.
+  structure: (
+    id: number,
+    sections: { role: string; duration: number }[],
+    prompt: string,
+    onProgress: (p: { pct: number; section: number; total: number; role: string }) => void,
+  ): Promise<{ id: number; structure: string; track: Track }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const start = await fetch(`${API}/api/track/${id}/structure-start`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sections, prompt }),
+        });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id } = await start.json();
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) { if (++misses > 5) { reject(new Error("Lost track of the build")); return; } setTimeout(poll, 1500); return; }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") { resolve({ id: s.id, structure: s.structure, track: s.track }); return; }
+            if (s.state === "error" || s.state === "cancelled") { reject(new Error(s.error || "Failed")); return; }
+            onProgress({ pct: s.pct ?? 5, section: s.section ?? 0, total: s.total ?? 0, role: s.role ?? "working" });
+            setTimeout(poll, 1500);
+          } catch { if (++misses > 8) { reject(new Error("Connection lost")); return; } setTimeout(poll, 1500); }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
+
   // "Add an instrument" (e.g. drums) — same start+poll pattern as completeStream,
   // sharing the backend's single-generation guard + status endpoint.
   addInstrument: (
@@ -194,6 +264,158 @@ export const api = {
       } catch (e) { reject(e); }
     });
   },
+
+  // Producer-mode chat: one message → parsed action → background edit. Resolves
+  // with the assistant reply, the parsed action, and (usually) the new track.
+  chat: (
+    id: number,
+    message: string,
+    onProgress?: (p: { pct: number; state: string }) => void,
+  ): Promise<{ reply: string; action: any; track?: Track; id?: number; no_change?: boolean }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const start = await fetch(`${API}/api/track/${id}/chat`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message }),
+        });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id, action } = await start.json();
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) {
+              if (++misses > 5) { reject(new Error("Lost track of the job")); return; }
+              setTimeout(poll, 1500); return;
+            }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") {
+              resolve({ reply: s.reply || "Done.", action, track: s.track, id: s.id, no_change: s.no_change });
+              return;
+            }
+            if (s.state === "error" || s.state === "cancelled") { reject(new Error(s.error || "Failed")); return; }
+            onProgress?.({ pct: s.pct ?? 10, state: s.state ?? "working" });
+            setTimeout(poll, 1500);
+          } catch {
+            if (++misses > 8) { reject(new Error("Connection lost")); return; }
+            setTimeout(poll, 1500);
+          }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
+  // Reference track matching — upload a song, generate in its style ("restyle")
+  // or continue from it ("continue"). Background job; resolves with the new track.
+  referenceMatch: (
+    file: File,
+    opts: { prompt?: string; mode?: "restyle" | "continue"; duration?: number; model_size?: string },
+    onProgress?: (p: { pct: number; state: string }) => void,
+  ): Promise<{ id: number; track: Track }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("prompt", opts.prompt || "");
+        form.append("mode", opts.mode || "restyle");
+        form.append("duration", String(opts.duration ?? 12));
+        form.append("model_size", opts.model_size || "small");
+        const start = await fetch(`${API}/api/reference-start`, { method: "POST", body: form });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id } = await start.json();
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) { if (++misses > 5) { reject(new Error("Lost track of the job")); return; } setTimeout(poll, 1500); return; }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") { resolve({ id: s.id, track: s.track }); return; }
+            if (s.state === "error" || s.state === "cancelled") { reject(new Error(s.error || "Failed")); return; }
+            onProgress?.({ pct: s.pct ?? 10, state: s.state ?? "working" });
+            setTimeout(poll, 1500);
+          } catch { if (++misses > 8) { reject(new Error("Connection lost")); return; } setTimeout(poll, 1500); }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
+  // Mashup: mix stems from different tracks into one. Background job.
+  mashup: (
+    selections: { track_id: number; stem: string; volume?: number }[],
+    title: string,
+    onProgress?: (p: { pct: number; state: string }) => void,
+  ): Promise<{ id: number; track: Track }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const start = await fetch(`${API}/api/mashup-start`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ selections, title }),
+        });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id } = await start.json();
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) { if (++misses > 5) { reject(new Error("Lost track of the job")); return; } setTimeout(poll, 1500); return; }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") { resolve({ id: s.id, track: s.track }); return; }
+            if (s.state === "error" || s.state === "cancelled") { reject(new Error(s.error || "Failed")); return; }
+            onProgress?.({ pct: s.pct ?? 10, state: s.state ?? "working" });
+            setTimeout(poll, 1500);
+          } catch { if (++misses > 8) { reject(new Error("Connection lost")); return; } setTimeout(poll, 1500); }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
+  // Lyrics → full sung song (ACE-Step). Background job.
+  makeSong: (
+    body: { lyrics?: string; theme?: string; style?: string; duration?: number },
+    onProgress?: (p: { pct: number; state: string }) => void,
+  ): Promise<{ id: number; lyrics: string; track: Track }> => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const start = await fetch(`${API}/api/song-start`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        if (!start.ok) {
+          let msg = `HTTP ${start.status}`;
+          try { const j = await start.json(); msg = j.detail || msg; } catch {}
+          reject(new Error(msg)); return;
+        }
+        const { job_id } = await start.json();
+        let misses = 0;
+        const poll = async () => {
+          try {
+            const res = await fetch(`${API}/api/complete-status/${job_id}`);
+            if (!res.ok) { if (++misses > 5) { reject(new Error("Lost track of the job")); return; } setTimeout(poll, 1500); return; }
+            misses = 0;
+            const s = await res.json();
+            if (s.state === "done") { resolve({ id: s.id, lyrics: s.lyrics, track: s.track }); return; }
+            if (s.state === "error" || s.state === "cancelled") { reject(new Error(s.error || "Failed")); return; }
+            onProgress?.({ pct: s.pct ?? 10, state: s.state ?? "working" });
+            setTimeout(poll, 1500);
+          } catch { if (++misses > 8) { reject(new Error("Connection lost")); return; } setTimeout(poll, 1500); }
+        };
+        poll();
+      } catch (e) { reject(e); }
+    });
+  },
   cancel: () =>
     req<{ ok: boolean; was_running: boolean }>(`/api/cancel`, { method: "POST" }),
   status: () => req<{ generating: boolean }>(`/api/status`),
@@ -214,6 +436,10 @@ export const api = {
     req<{ id: number; track: Track }>(`/api/track/${id}/normalize`, { method: "POST" }),
   preset: (id: number, preset: string) =>
     req<{ id: number; track: Track }>(`/api/track/${id}/preset`, { method: "POST", body: JSON.stringify({ preset }) }),
+  masterPlatforms: () =>
+    req<{ key: string; label: string; lufs: number }[]>(`/api/master-platforms`),
+  master: (id: number, platform: string) =>
+    req<{ id: number; platform: string; track: Track }>(`/api/track/${id}/master`, { method: "POST", body: JSON.stringify({ platform }) }),
   arrange: (id: number, op: string, a = 0, b = 0) =>
     req<{ id: number; track: Track }>(`/api/track/${id}/arrange`, { method: "POST", body: JSON.stringify({ op, a, b }) }),
   region: (id: number, body: Record<string, unknown>) =>
@@ -284,7 +510,20 @@ export const api = {
     req<{ activated: boolean; email: string }>(`/api/license/activate`, {
       method: "POST", body: JSON.stringify({ key }),
     }),
+
+  // Producer AI keys (user's own Groq key(s) — optional; enable full NL understanding).
+  // Multiple keys are supported and rotated through on rate-limit.
+  groqKeyStatus: () =>
+    req<{ configured: boolean; keys: GroqKeyInfo[] }>(`/api/settings/groq`),
+  addGroqKey: (key: string) =>
+    req<{ ok: boolean; configured: boolean; keys: GroqKeyInfo[] }>(
+      `/api/settings/groq`, { method: "POST", body: JSON.stringify({ key }) }),
+  removeGroqKey: (key: string) =>
+    req<{ ok: boolean; configured: boolean; keys: GroqKeyInfo[] }>(
+      `/api/settings/groq`, { method: "DELETE", body: JSON.stringify({ key }) }),
 };
+
+export interface GroqKeyInfo { masked: string; removable: boolean; raw: string | null }
 
 export function fmtTime(s: number): string {
   if (!s || s < 0) return "0:00";

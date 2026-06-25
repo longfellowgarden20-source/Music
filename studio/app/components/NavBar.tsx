@@ -3,11 +3,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const LINKS = [
-  { href: "/",         label: "Library"  },
-  { href: "/generate", label: "Generate" },
-  { href: "/vocals",   label: "Vocals"   },
-  { href: "/youtube",  label: "YouTube"  },
-  { href: "/guide",    label: "Guide"    },
+  { href: "/",          label: "Library"   },
+  { href: "/playlists", label: "Playlists" },
+  { href: "/generate",  label: "Generate"  },
+  { href: "/song",      label: "Song"      },
+  { href: "/mashup",    label: "Mashup"    },
+  { href: "/vocals",    label: "Vocals"    },
+  { href: "/youtube",   label: "YouTube"   },
+  { href: "/guide",     label: "Guide"     },
 ];
 
 export default function NavBar() {
@@ -59,6 +62,14 @@ export default function NavBar() {
           </div>
         )}
       </div>
+
+      {/* Settings — pinned to the far right */}
+      <Link href="/settings" title="Settings" style={{
+        marginLeft: "auto", textDecoration: "none", fontSize: 18, lineHeight: 1,
+        padding: "7px 12px", borderRadius: 8,
+        color: active("/settings") ? "var(--text)" : "var(--muted)",
+        background: active("/settings") ? "var(--bg3)" : "transparent",
+      }}>⚙</Link>
     </nav>
   );
 }

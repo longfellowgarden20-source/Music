@@ -16,6 +16,7 @@ interface Props {
   view: ViewState;
   levels: Record<string, number>;
   selectedId: string | null;
+  scrollTop: number;
   onMute: (id: string) => void;
   onSolo: (id: string) => void;
   onVolume: (id: string, v: number) => void;
@@ -27,7 +28,7 @@ interface Props {
 }
 
 export default function TrackHeaders({
-  tracks, view, levels, selectedId,
+  tracks, view, levels, selectedId, scrollTop,
   onMute, onSolo, onVolume, onPan, onArm, onReorder, onSelect, onColor,
 }: Props) {
   const { headerWidth, trackHeight } = view;
@@ -55,10 +56,14 @@ export default function TrackHeaders({
         fontSize: 9, fontWeight: 800, letterSpacing: 1.5,
         color: C.text3, textTransform: "uppercase",
         background: `linear-gradient(180deg, ${C.bg2}, ${C.bg1})`,
+        flexShrink: 0,
       }}>
         Tracks
       </div>
 
+      {/* scrollable track list — mirrors ArrangementCanvas vertical scroll */}
+      <div style={{ flex: 1, overflowY: "hidden", position: "relative" }}>
+      <div style={{ transform: `translateY(${-scrollTop}px)` }}>
       {tracks.map((track, i) => {
         const selected = track.id === selectedId;
         const lvl = levels[track.id] ?? 0;
@@ -147,6 +152,8 @@ export default function TrackHeaders({
           </div>
         );
       })}
+      </div>{/* end translateY wrapper */}
+      </div>{/* end scroll container */}
     </div>
   );
 }

@@ -130,13 +130,19 @@ function Fader({ value, color, onChange }: { value: number; color: string; onCha
 
   const onDown = useCallback((e: React.PointerEvent) => {
     e.stopPropagation();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    // Capture on the CONTAINER (which owns onPointerMove), not e.target — clicking
+    // the cap/fill child captured the pointer there, so move events never reached
+    // the handler and the fader did nothing. Capturing on ref.current fixes that.
+    try { ref.current?.setPointerCapture(e.pointerId); } catch {}
     dragRef.current = true;
     setFromY(e.clientY);
   }, [setFromY]);
 
   const onMove = useCallback((e: React.PointerEvent) => { if (dragRef.current) setFromY(e.clientY); }, [setFromY]);
-  const onUp = useCallback(() => { dragRef.current = false; }, []);
+  const onUp = useCallback((e: React.PointerEvent) => {
+    dragRef.current = false;
+    try { ref.current?.releasePointerCapture(e.pointerId); } catch {}
+  }, []);
 
   return (
     <div ref={ref} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}

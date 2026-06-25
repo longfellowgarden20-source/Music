@@ -42,6 +42,7 @@ export type RegionOpType =
   | "stutter"     // amount = slices; chop region into repeated grains
   | "tape-stop"   // slow to a halt across the region
   | "pitch-scale" // amount = key root; snap pitch to nearest semitone of scale
+  | "autotune"    // premium pitch correction: params{key,scale,strength,speed}
   | "ai-replace"; // replaced by backend regenerate
 
 export interface RegionOp {
@@ -50,6 +51,7 @@ export interface RegionOp {
   startSec: number;     // region start in clip-source time
   endSec: number;       // region end in clip-source time
   amount: number;       // op-specific scalar
+  params?: Record<string, number>;  // extra params for multi-param ops (e.g. autotune key/scale/strength)
   label?: string;
 }
 
@@ -75,7 +77,10 @@ export interface TimeSelection {
 }
 
 // Per-track effects rack. Each effect maps to a real Tone.js DSP node.
-export type EffectType = "eq3" | "compressor" | "reverb" | "delay" | "chorus" | "distortion";
+export type EffectType =
+  | "eq3" | "compressor" | "reverb" | "delay" | "chorus" | "distortion"
+  | "pitch" | "doubler" | "deesser"
+  | "echo" | "paramEq" | "gate" | "saturation" | "widener";
 
 export interface TrackEffect {
   id: string;
@@ -131,6 +136,7 @@ export interface TransportState {
 
 export interface ViewState {
   scrollLeft: number;
+  scrollTop: number;
   trackHeight: number;  // px per row, default 88
   headerWidth: number;  // always 160
 }

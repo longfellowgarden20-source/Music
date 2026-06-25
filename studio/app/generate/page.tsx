@@ -1,7 +1,7 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { api, API, fmtTime, type Track } from "../lib/api";
+import { api, fmtTime, type Track } from "../lib/api";
 import { usePlayer } from "../components/PlayerProvider";
 import { useProgress } from "../components/ProgressContext";
 import Waveform from "../components/Waveform";
@@ -57,6 +57,16 @@ const INSTRUMENTS = [
   "electric piano", "Rhodes", "strings", "brass section", "flute",
   "theremin", "sitar", "marimba", "vinyl crackle", "sub bass",
 ];
+// Drum / rhythm character. MusicGen responds well to specific drum vocabulary —
+// without it, outputs default to generic beats (hence the "samey drums" problem).
+const DRUMS = [
+  "boom-bap drums", "trap hi-hats and 808s", "drill sliding 808s", "four-on-the-floor kick",
+  "breakbeat", "amen break", "half-time drums", "double-time drums",
+  "lo-fi dusty drums", "punchy acoustic kit", "live jazz brushes", "funk drum groove",
+  "afrobeat percussion", "latin percussion", "reggaeton dembow", "UK garage shuffle",
+  "house clap on 2 and 4", "techno drum machine", "rock drum kit", "blast beats",
+  "trip-hop slow groove", "syncopated percussion", "minimal click rhythm", "tribal drums",
+];
 const KEYS = ["", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 export default function GeneratePage() {
@@ -65,16 +75,19 @@ export default function GeneratePage() {
   const { play } = usePlayer();
   const progress = useProgress();
   const [prompt, setPrompt] = useState("");
-  const [negative, setNegative] = useState("");
   const [duration, setDuration] = useState(15);
-  const [model, setModel] = useState("small");
+  // model size is no longer user-facing (Stable Audio 3 is a single model); kept
+  // as a constant only for the reference-match call which still takes the arg.
+  const model = "small";
   const [guidance, setGuidance] = useState(5);
-  const [temperature, setTemperature] = useState(0.8);
+  // Stable Audio 3 quality dial: diffusion steps. 8 = fast (~3s), higher = cleaner/slower.
+  const [steps, setSteps] = useState(8);
   const [master, setMaster] = useState(true);
   // Reproduce: when set, generation reuses this exact seed for a deterministic re-roll.
   const [seed, setSeed] = useState<number | "">("");
   const [moods, setMoods] = useState<string[]>([]);
   const [instruments, setInstruments] = useState<string[]>([]);
+  const [drums, setDrums] = useState<string[]>([]);
   const [keyRoot, setKeyRoot] = useState("");
   const [bpm, setBpm] = useState<number | "">("");
   const [collections, setCollections] = useState<string[]>([]);
@@ -82,7 +95,15 @@ export default function GeneratePage() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [result, setResult] = useState<Track | null>(null);
+  // Variations of the current result (same prompt, fresh seeds). Original is kept.
+  const [variations, setVariations] = useState<Track[]>([]);
+  const [varying, setVarying] = useState(false);
   const [refText, setRefText] = useState("");
+  const [refMode, setRefMode] = useState<"restyle" | "continue">("restyle");
+  const [recording, setRecording] = useState(false);
+  const mediaRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
   // Which genre groups are expanded. First group open by default.
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ Electronic: true });
 
@@ -93,11 +114,8 @@ export default function GeneratePage() {
   useEffect(() => {
     if (!params) return;
     const p = params.get("prompt"); if (p) setPrompt(p);
-    const n = params.get("negative"); if (n) setNegative(n);
     const d = params.get("duration"); if (d) setDuration(+d);
-    const m = params.get("model"); if (m) setModel(m);
     const g = params.get("guidance"); if (g) setGuidance(+g);
-    const tm = params.get("temperature"); if (tm) setTemperature(+tm);
     const s = params.get("seed"); if (s) setSeed(+s);
   }, [params]);
 
@@ -105,6 +123,8 @@ export default function GeneratePage() {
     setMoods(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m]);
   const toggleInstrument = (i: string) =>
     setInstruments(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i]);
+  const toggleDrum = (d: string) =>
+    setDrums(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]);
   const toggleGroup = (g: string) =>
     setOpenGroups(prev => ({ ...prev, [g]: !prev[g] }));
 
@@ -113,6 +133,7 @@ export default function GeneratePage() {
     const extras: string[] = [];
     if (moods.length) extras.push(...moods);
     if (instruments.length) extras.push(...instruments);
+    if (drums.length) extras.push(...drums);
     if (bpm) extras.push(`${bpm} BPM`);
     if (keyRoot) extras.push(`key of ${keyRoot}`);
     if (extras.length) p = p ? `${p}, ${extras.join(", ")}` : extras.join(", ");
@@ -122,14 +143,15 @@ export default function GeneratePage() {
   const onGenerate = async () => {
     const p = fullPrompt();
     if (!p) { setStatus("⚠️ Enter a prompt"); return; }
-    setBusy(true); setStatus("Generating… (this can take 30–90s on CPU)"); setResult(null);
-    progress.start("Generating track…");
+    setBusy(true); setStatus("Generating… you can navigate away — it keeps running."); setResult(null); setVariations([]);
     try {
-      const r = await api.generate({
-        prompt: p, negative, duration, model_size: model, guidance,
-        temperature, master, collection,
+      // Background job: runs in the provider so you can leave this page. The
+      // global progress bar + kill button follow you anywhere.
+      const r = await progress.runGeneration({
+        prompt: p, duration, model_size: model, guidance,
+        master, collection, steps,
         ...(seed !== "" ? { seed } : {}),
-      });
+      }, "Generating track…");
       setResult(r.track);
       setStatus(`✅ Saved #${r.id}` + (r.bpm ? ` · ${Math.round(r.bpm)} BPM · ${r.key}` : ""));
       play(r.track);
@@ -138,29 +160,84 @@ export default function GeneratePage() {
       setStatus(/cancel/i.test(msg) ? "🛑 Generation stopped" : `❌ ${msg}`);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const onStop = () => { setStatus("🛑 Stopping…"); progress.cancel(); };
+
+  // Create 3 variations of the current result: same prompt, fresh seeds. The
+  // original `result` track is never modified — variations are saved separately
+  // and shown below it so the user can compare and keep whichever they like.
+  const onMakeVariations = async () => {
+    if (!result) return;
+    setVarying(true); setVariations([]);
+    setStatus("Creating 3 variations…");
+    try {
+      const r = await api.variations(result.id, { count: 3, steps });
+      setVariations(r.variations);
+      setStatus(`✅ Created ${r.count} variations`);
+    } catch (e) {
+      setStatus(`❌ ${(e as Error).message || "Variations failed"}`);
+    } finally {
+      setVarying(false);
+    }
+  };
+
+  // Reference track matching: upload a song → generate in its style (or continue it).
+  const onReference = async (file: File) => {
+    setBusy(true); setResult(null);
+    setStatus(refMode === "continue" ? "Continuing from your track…" : "Matching its style…");
+    progress.set(8, "Reference match…");
+    try {
+      const r = await api.referenceMatch(
+        file,
+        { prompt: fullPrompt(), mode: refMode, duration, model_size: model },
+        (p) => progress.set(p.pct, "Reference match…"),
+      );
+      setResult(r.track);
+      setStatus(`✅ Saved #${r.id} → References`);
+      play(r.track);
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      setStatus(/cancel/i.test(msg) ? "🛑 Stopped" : `❌ ${msg}`);
+    } finally {
+      setBusy(false);
       progress.finish();
     }
   };
 
-  const onStop = async () => {
-    setStatus("🛑 Stopping…");
-    try { await api.cancel(); } catch { /* ignore */ }
+  // Quick-capture: hum / beatbox an idea, AI turns it into a track (reference mode).
+  const startHum = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      chunksRef.current = [];
+      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        streamRef.current?.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        if (blob.size < 1000) { setStatus("⚠️ Recording too short — try again."); return; }
+        const file = new File([blob], "hum.webm", { type: "audio/webm" });
+        onReference(file);   // feed the hum into reference generation
+      };
+      mediaRef.current = mr;
+      mr.start();
+      setRecording(true);
+      setStatus("🎤 Recording… hum or beatbox your idea, then Stop.");
+    } catch {
+      setStatus("❌ Microphone unavailable — allow mic access.");
+    }
+  };
+  const stopHum = () => {
+    setRecording(false);
+    try { mediaRef.current?.stop(); } catch { /* ignore */ }
   };
 
-  // Kill switch on tab close / navigate away: tell the backend to stop the
-  // in-flight generation so it doesn't keep churning after we're gone.
-  useEffect(() => {
-    if (!busy) return;
-    const stop = () => {
-      try { navigator.sendBeacon(`${API}/api/cancel`); } catch { /* ignore */ }
-    };
-    window.addEventListener("pagehide", stop);
-    window.addEventListener("beforeunload", stop);
-    return () => {
-      window.removeEventListener("pagehide", stop);
-      window.removeEventListener("beforeunload", stop);
-    };
-  }, [busy]);
+  // NOTE: the old pagehide/beforeunload kill-switch is intentionally gone.
+  // Generation now runs as a detached background job, so navigating away must
+  // NOT cancel it — the global kill button (in the progress pill) is the only
+  // way to stop it.
 
   const onSoundsLike = async () => {
     if (!refText.trim()) return;
@@ -192,6 +269,40 @@ export default function GeneratePage() {
             <input className="input" placeholder='Or: "sounds like Bon Iver" → AI writes the prompt'
               value={refText} onChange={e => setRefText(e.target.value)} />
             <button className="btn" onClick={onSoundsLike} disabled={busy}>✨ Suggest</button>
+          </div>
+
+          {/* reference track matching — upload a song */}
+          <div style={{ border: "1px solid var(--line, #2a2a2a)", borderRadius: 8, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="label">🎧 Match a reference track</div>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: -2 }}>
+              Upload a song you like — AI matches its vibe, tempo, and feel.
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button className="btn" onClick={() => setRefMode("restyle")}
+                style={{ flex: 1, fontSize: 12, borderColor: refMode === "restyle" ? "var(--accent)" : undefined, color: refMode === "restyle" ? "var(--accent)" : "var(--muted)" }}>
+                New in its style
+              </button>
+              <button className="btn" onClick={() => setRefMode("continue")}
+                style={{ flex: 1, fontSize: 12, borderColor: refMode === "continue" ? "var(--accent)" : undefined, color: refMode === "continue" ? "var(--accent)" : "var(--muted)" }}>
+                Continue from it
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <label className="btn" style={{ flex: 1, position: "relative", cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1, textAlign: "center", fontSize: 12 }}>
+                ⬆ Upload audio
+                <input type="file" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.aiff"
+                  disabled={busy || recording}
+                  style={{ position: "absolute", inset: 0, opacity: 0, cursor: "pointer", width: "100%", height: "100%" }}
+                  onChange={e => { if (e.target.files?.[0]) { onReference(e.target.files[0]); e.target.value = ""; } }} />
+              </label>
+              <button className="btn" disabled={busy && !recording}
+                onClick={recording ? stopHum : startHum}
+                style={{ flex: 1, fontSize: 12, fontWeight: 700,
+                  borderColor: recording ? "var(--red, #ef4444)" : undefined,
+                  color: recording ? "var(--red, #ef4444)" : undefined }}>
+                {recording ? "■ Stop & generate" : "🎤 Hum / beatbox an idea"}
+              </button>
+            </div>
           </div>
 
           {/* genre chips — collapsible groups */}
@@ -253,6 +364,20 @@ export default function GeneratePage() {
             </div>
           </div>
 
+          {/* drums / rhythm */}
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Drums & rhythm</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {DRUMS.map(d => (
+                <button key={d} onClick={() => toggleDrum(d)} className="btn"
+                  style={{ padding: "5px 11px", fontSize: 12,
+                    borderColor: drums.includes(d) ? "#4fd1a5" : undefined,
+                    color: drums.includes(d) ? "#4fd1a5" : undefined,
+                    background: drums.includes(d) ? "rgba(79,209,165,.12)" : undefined }}>{d}</button>
+              ))}
+            </div>
+          </div>
+
           {/* key + bpm */}
           <div style={{ display: "flex", gap: 12 }}>
             <div style={{ flex: 1 }}>
@@ -268,11 +393,6 @@ export default function GeneratePage() {
             </div>
           </div>
 
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>Avoid (negative prompt)</div>
-            <input className="input" value={negative} onChange={e => setNegative(e.target.value)}
-              placeholder="e.g. no vocals, no distortion" />
-          </div>
         </div>
 
         {/* preview of merged prompt */}
@@ -291,6 +411,32 @@ export default function GeneratePage() {
               </div>
             </div>
             <Waveform trackId={result.id} height={64} color="#1ed760" />
+
+            {/* Create variations — keeps this original, makes 3 fresh takes below */}
+            <button className="btn" onClick={onMakeVariations} disabled={varying}
+              style={{ width: "100%", marginTop: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              {varying ? <><span className="spinner" /> Creating 3 variations…</> : "🎲 Create 3 variations"}
+            </button>
+
+            {variations.length > 0 && (
+              <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ fontSize: 11, color: "var(--muted2)", fontWeight: 700, letterSpacing: 0.5 }}>
+                  VARIATIONS · same prompt, different takes
+                </div>
+                {variations.map((v, i) => (
+                  <div key={v.id} style={{ display: "flex", alignItems: "center", gap: 10,
+                    padding: "8px 11px", background: "var(--bg, #0b0e13)", border: "1px solid var(--bg3)", borderRadius: 8 }}>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: "var(--accent)", width: 18 }}>{i + 1}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <Waveform trackId={v.id} height={32} color="#8b5cff" />
+                    </div>
+                    <button className="btn" style={{ fontSize: 12, padding: "5px 11px" }} onClick={() => play(v)}>▶</button>
+                    <button className="btn" style={{ fontSize: 12, padding: "5px 11px" }}
+                      onClick={() => router.push(`/edit?id=${v.id}`)}>Edit</button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -299,15 +445,12 @@ export default function GeneratePage() {
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         <div className="card" style={{ padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
           <Slider label={`Duration · ${duration}s`} min={4} max={60} step={1} value={duration} onChange={setDuration} />
-          <div>
-            <div className="label" style={{ marginBottom: 6 }}>Model</div>
-            <select className="input" value={model} onChange={e => setModel(e.target.value)}>
-              <option value="small">Small (fast)</option>
-              <option value="medium">Medium (better)</option>
-            </select>
-          </div>
-          <Slider label={`Guidance · ${guidance}`} min={1} max={10} step={0.5} value={guidance} onChange={setGuidance} />
-          <Slider label={`Temperature · ${temperature.toFixed(1)}`} min={0.3} max={1.5} step={0.1} value={temperature} onChange={setTemperature} />
+          <Slider
+            label={`Quality · ${steps} steps ${steps <= 8 ? "(fastest)" : steps <= 16 ? "(balanced)" : "(best, slower)"}`}
+            min={4} max={25} step={1} value={steps} onChange={setSteps} />
+          <Slider
+            label={`Prompt strength · ${guidance <= 3 ? "Subtle" : guidance >= 8 ? "Bold (more dramatic & varied)" : "Balanced"}`}
+            min={1} max={10} step={0.5} value={guidance} onChange={setGuidance} />
           <div>
             <div className="label" style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}>
               Seed
@@ -334,6 +477,12 @@ export default function GeneratePage() {
               {(collections.length ? collections : ["All Tracks"]).map(c => <option key={c} value={c}>{c}</option>)}
             </select>
           </div>
+        </div>
+
+        {/* Required attribution for the Stable Audio 3 music engine (Stability AI
+            Community License). Shown where generation happens, to be safe. */}
+        <div style={{ fontSize: 10, color: "var(--muted2)", textAlign: "center", marginTop: -4 }}>
+          Powered by Stability AI
         </div>
 
         {busy ? (

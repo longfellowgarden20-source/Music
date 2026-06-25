@@ -10,7 +10,7 @@ function toDb(vol: number) {
 }
 
 interface TrackNodes {
-  player: any;
+  player: any;     // Tone.Player, synced to transport
   fadeGain: any;   // automated for clip fade in/out + clip gain
   channel: any;    // volume / pan / mute / solo
   meter: any;      // for VU metering
@@ -24,19 +24,30 @@ export interface DawEngine {
   pause(): void;
   stop(): void;
   seekTo(sec: number): void;
+  scrubTo(sec: number): void;
   setBpm(bpm: number): void;
   setLoop(on: boolean, start: number, end: number): void;
   setMetronome(on: boolean): void;
-  startRecording(): Promise<boolean>;
+  // ── Recording / mic ──
+  listInputDevices(): Promise<{ id: string; label: string }[]>;
+  openMic(deviceId?: string): Promise<boolean>;      // open mic for monitoring/metering (no capture yet)
+  openMicDetailed(deviceId?: string): Promise<{ ok: boolean; reason?: string }>;
+  closeMic(): void;
+  setMonitoring(on: boolean): void;                  // hear yourself through the speakers
+  getInputLevel(): number;                           // 0..1 live input meter
+  startRecording(opts?: { deviceId?: string; alongTransport?: boolean }): Promise<boolean>;
   stopRecording(): Promise<{ url: string; duration: number } | null>;
   setTrackVolume(id: string, vol: number): void;
   setTrackPan(id: string, pan: number): void;
   setTrackMute(id: string, muted: boolean): void;
   setTrackSolo(id: string, soloed: boolean): void;
+  applySolo(soloedIds: string[], mutedIds: string[]): void;
   loadTracks(tracks: DawTrack[]): Promise<DawTrack[]>;
   scheduleFades(tracks: DawTrack[]): void;
+  rescheduleClips(tracks: DawTrack[]): void;
   scheduleAutomation(tracks: DawTrack[]): void;
   rebuildEffects(track: DawTrack): void;
+  rebuildClips(track: DawTrack): Promise<void>;
   applyEffectParams(trackId: string, effect: TrackEffect): void;
   // Re-render a clip's audio from its original buffer + region ops, swap into the
   // player, and return fresh peaks + new duration. Async because EQ/filter ops
@@ -52,8 +63,16 @@ export interface DawEngine {
 export function useDawEngine(): DawEngine {
   const toneRef = useRef<any>(null);
   const nodesRef = useRef<Map<string, TrackNodes>>(new Map());
+  // Bumped on each loadTracks call. An in-flight (async) load checks this after
+  // every await; if a newer load started, the stale one aborts and cleans up its
+  // players. Without this, React StrictMode's double-invoke (or a fast re-load)
+  // creates a second set of synced players that aren't tracked in nodesRef —
+  // they keep playing and the faders can't touch them (the cross-talk bug).
+  const loadGenRef = useRef(0);
   const metroRef = useRef<any>(null);   // { synth, loop }
-  const recRef = useRef<any>(null);     // { mic, recorder, startedAt }
+  const recRef = useRef<any>(null);     // { recorder, startedAt }
+  // Persistent mic chain: mic -> meter (always) and mic -> monitorGain -> dest (when monitoring)
+  const micRef = useRef<any>(null);     // { mic, meter, monitorGain, deviceId }
   const analyserRef = useRef<AnalyserNode | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -92,7 +111,11 @@ export function useDawEngine(): DawEngine {
       try {
         const node = def.build(Tone, eff.params);
         n.fxNodes.set(eff.id, node);
-        tail.connect(node);
+        // Composite effects (EQ/Echo = multiple internal nodes) expose _head as
+        // the input. Connect the running tail INTO the composite's head; then the
+        // composite itself becomes the new tail (its .connect chains out of _tail).
+        const input = node._isComposite ? node._head : node;
+        tail.connect(input);
         tail = node;
       } catch (e) {
         console.warn(`[daw] failed to build effect ${eff.type}:`, e);
@@ -105,6 +128,11 @@ export function useDawEngine(): DawEngine {
   useEffect(() => {
     return () => {
       disposeAll();
+      // tear down mic/monitor chain if still open
+      if (micRef.current) {
+        try { micRef.current.mic.close(); micRef.current.meter.dispose(); micRef.current.monitorGain.dispose(); } catch {}
+        micRef.current = null;
+      }
       if (toneRef.current) {
         try {
           const t = toneRef.current.getTransport();
@@ -115,9 +143,11 @@ export function useDawEngine(): DawEngine {
   }, [disposeAll]);
 
   const loadTracks = useCallback(async (tracks: DawTrack[]): Promise<DawTrack[]> => {
+    const myGen = ++loadGenRef.current;   // newest load wins
     setIsLoaded(false);
     setLoadError(null);
     const Tone = await getTone();
+    if (myGen !== loadGenRef.current) return [];   // superseded during await
 
     disposeAll();
 
@@ -160,14 +190,16 @@ export function useDawEngine(): DawEngine {
         const original = await ctx.decodeAudioData(arr.slice(0));
 
         // apply any persisted region ops (clip 0) to get the buffer we play
-        const ops = track.clips[0]?.ops;
-        const audioBuf = await renderClipBufferAsync(ctx.rawContext ?? ctx, original, ops);
+        const audioBuf = await renderClipBufferAsync(ctx.rawContext ?? ctx, original, track.clips[0]?.ops);
+
+        // A newer load started while we were fetching/decoding — abort so we don't
+        // create orphan synced players that play untracked (the cross-talk bug).
+        if (myGen !== loadGenRef.current) return [];
 
         const channel = new Tone.Channel(toDb(track.volume), track.pan * 100);
         channel.mute = track.muted;
         const meter = new Tone.Meter({ smoothing: 0.7 });
         const fadeGain = new Tone.Gain(1);
-        // hand the decoded buffer directly to the player (no second network load)
         const player = new Tone.Player(new Tone.ToneAudioBuffer(audioBuf));
         player.loop = false;
 
@@ -179,8 +211,9 @@ export function useDawEngine(): DawEngine {
         const nodes: TrackNodes = { player, fadeGain, channel, meter, fxNodes: new Map(), original };
         wireChain(Tone, nodes, track.effects ?? []);
 
-        // sync() makes the player follow Tone.Transport; start(0) = start at bar 0
-        player.sync().start(0);
+        // sync() makes the player follow Tone.Transport; schedule it at the clip's
+        // arrangement position so a moved clip actually plays at its new spot.
+        player.sync().start(Math.max(0, track.clips[0]?.startSec ?? 0));
 
         nodesRef.current.set(track.id, nodes);
 
@@ -196,6 +229,7 @@ export function useDawEngine(): DawEngine {
     }
 
     try { await Tone.loaded(); } catch { /* no players yet = ok */ }
+    if (myGen !== loadGenRef.current) return [];   // superseded — newer load owns the graph
 
     // Set transport loopEnd well past the longest track so Tone never
     // wraps playback early. loopEnd fires even when loop=false in Tone 15.
@@ -211,6 +245,33 @@ export function useDawEngine(): DawEngine {
     return updated;
   }, [getTone, disposeAll, wireChain]);
 
+  // Re-sync each track's player to its clip's current startSec. Call after a clip
+  // is moved (or trimmed) so the AUDIO follows the block — without this, players
+  // stay scheduled at their original position and a dragged clip plays at the old
+  // spot. Preserves play/position: re-syncing while playing restarts the player at
+  // the right transport offset.
+  const rescheduleClips = useCallback((tracks: DawTrack[]) => {
+    const Tone = toneRef.current;
+    if (!Tone) return;
+    const wasPlaying = Tone.getTransport().state === "started";
+    for (const track of tracks) {
+      const n = nodesRef.current.get(track.id);
+      if (!n?.player) continue;
+      const startSec = Math.max(0, track.clips[0]?.startSec ?? 0);
+      try {
+        n.player.unsync();
+        n.player.stop();
+        n.player.sync().start(startSec);
+      } catch { /* mid-load */ }
+    }
+    // Nudge the transport so synced players re-evaluate their start offset.
+    if (wasPlaying) {
+      const t = Tone.getTransport();
+      const pos = t.seconds;
+      t.pause(); t.seconds = pos; t.start();
+    }
+  }, []);
+
   // Schedule clip fade-in/out + clip gain envelopes on the per-track fadeGain.
   // Called whenever transport (re)starts or fades change. Uses the AudioParam
   // automation relative to the clip's arrangement position.
@@ -222,7 +283,6 @@ export function useDawEngine(): DawEngine {
       if (!n) continue;
       const g = n.fadeGain.gain;
       try { g.cancelScheduledValues(0); } catch {}
-      // Single-clip model (one clip per stem track for now). Build the envelope.
       const clip = track.clips[0];
       if (!clip) { g.value = 1; continue; }
       const base = clip.gain ?? 1;
@@ -230,7 +290,6 @@ export function useDawEngine(): DawEngine {
       const end = clip.startSec + clip.durationSec;
       const fi = clip.fadeInSec ?? 0;
       const fo = clip.fadeOutSec ?? 0;
-      // Tone Transport schedules via transport-time. We set ramps along the timeline.
       try {
         if (fi > 0) {
           g.setValueAtTime(0, start);
@@ -262,30 +321,38 @@ export function useDawEngine(): DawEngine {
       const volPts = auto?.volume;
       try {
         const vp = n.channel.volume;
-        vp.cancelScheduledValues(0);
         if (volPts && volPts.length) {
+          // has automation — schedule ramps through Tone
+          vp.cancelScheduledValues(0);
           const sorted = [...volPts].sort((a, b) => a.sec - b.sec);
           vp.setValueAtTime(toDb(sorted[0].value), Math.max(0, sorted[0].sec));
           for (const pt of sorted) vp.linearRampToValueAtTime(toDb(Math.max(0.0001, pt.value)), pt.sec);
         } else {
-          vp.value = toDb(track.volume);
+          // no automation — hold the track's static volume via the dB API
+          vp.cancelScheduledValues(0);
+          vp.value = track.volume <= 0 ? -Infinity : toDb(track.volume);
         }
       } catch {}
       // pan lane → channel.pan (-1..1)
       const panPts = auto?.pan;
       try {
         const pp = n.channel.pan;
-        pp.cancelScheduledValues(0);
         if (panPts && panPts.length) {
+          pp.cancelScheduledValues(0);
           const sorted = [...panPts].sort((a, b) => a.sec - b.sec);
           pp.setValueAtTime(sorted[0].value, Math.max(0, sorted[0].sec));
           for (const pt of sorted) pp.linearRampToValueAtTime(pt.value, pt.sec);
         } else {
+          pp.cancelScheduledValues(0);
           pp.value = track.pan;
         }
       } catch {}
     }
   }, []);
+
+  // No-op in the single-player-per-track model (kept so callers don't break).
+  // Splitting clips is a visual edit only; the engine plays the whole stem buffer.
+  const rebuildClips = useCallback(async (_track: DawTrack) => { /* single-clip model */ }, []);
 
   // Rebuild the whole fx chain for a track (add/remove/reorder/toggle effect).
   const rebuildEffects = useCallback((track: DawTrack) => {
@@ -359,11 +426,49 @@ export function useDawEngine(): DawEngine {
   const seekTo = useCallback(async (sec: number) => {
     const Tone = await getTone();
     const t = Tone.getTransport();
+    const target = Math.max(0, sec);
     const wasPlaying = t.state === "started";
-    t.pause();
-    t.seconds = Math.max(0, sec);
+
+    // Stop the transport before moving its clock. A synced Tone.Player scheduled
+    // with `.start(0)` does NOT re-seek its buffer when the transport position
+    // jumps mid-playback — the clock moves (so the playhead appears to jump) but
+    // each player keeps streaming from where it already was, which is why a
+    // ruler-drag looked cosmetic. We re-arm the players so their buffer offset
+    // matches the new position.
+    t.stop();
+    t.seconds = target;
+
+    // Re-arm each synced player so its buffer offset matches the new position.
+    nodesRef.current.forEach(n => {
+      const p = n.player;
+      if (!p) return;
+      try {
+        p.unsync();
+        p.stop();
+        p.sync().start(0);
+      } catch { /* player may be mid-load */ }
+    });
+
     if (wasPlaying) t.start();
   }, [getTone]);
+
+  // Lightweight position move for an in-progress ruler drag. Moves the transport
+  // clock (and silences the synced players if currently playing) WITHOUT the full
+  // stop/re-arm/start cycle — calling that on every mousemove thrashes the
+  // transport so playback never settles. The real re-arm happens once on release
+  // via seekTo(). We pause during the drag so the old audio doesn't keep playing
+  // from the pre-drag spot while you scrub.
+  // Synchronous on purpose: a ruler drag fires this many times per second, and
+  // awaiting getTone() each call let the updates resolve out of order, leaving the
+  // clock at a stale time. Tone is always loaded by the time the UI is interactive,
+  // so read toneRef directly and bail if (somehow) not ready yet.
+  const scrubTo = useCallback((sec: number) => {
+    const Tone = toneRef.current;
+    if (!Tone) return;
+    const t = Tone.getTransport();
+    if (t.state === "started") t.pause();
+    t.seconds = Math.max(0, sec);
+  }, []);
 
   const setBpm = useCallback(async (bpm: number) => {
     const Tone = await getTone();
@@ -404,26 +509,126 @@ export function useDawEngine(): DawEngine {
     }
   }, [getTone]);
 
-  // Microphone recording via Tone.UserMedia -> Tone.Recorder. Returns false if
-  // mic permission is denied. stopRecording returns a blob URL + duration.
-  const startRecording = useCallback(async (): Promise<boolean> => {
+  // Enumerate available audio input devices (microphones). Requires that the
+  // user has granted mic permission at least once for labels to be populated.
+  const listInputDevices = useCallback(async (): Promise<{ id: string; label: string }[]> => {
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) return [];
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices
+        .filter(d => d.kind === "audioinput")
+        .map((d, i) => ({ id: d.deviceId, label: d.label || `Microphone ${i + 1}` }));
+    } catch (e) {
+      console.warn("[daw] enumerateDevices failed:", e);
+      return [];
+    }
+  }, []);
+
+  // Open the mic and build the persistent chain: mic -> meter (for input level),
+  // and mic -> monitorGain (muted by default) -> destination for live monitoring.
+  // Returns a detailed result so the UI can give the right fix instructions.
+  //   reason: "system"  = OS (macOS Privacy) blocked it
+  //           "denied"  = browser permission blocked/dismissed
+  //           "nodevice"= no mic present
+  //           "other"   = anything else
+  const openMicDetailed = useCallback(async (deviceId?: string): Promise<{ ok: boolean; reason?: string }> => {
     const Tone = await getTone();
     try {
       const ctx = Tone.getContext();
       if (ctx.state === "suspended") await ctx.resume();
+      // Already open on the same device — reuse.
+      if (micRef.current && micRef.current.deviceId === (deviceId ?? "")) return { ok: true };
+      // Different device — tear down the old one.
+      if (micRef.current) {
+        try { micRef.current.mic.close(); micRef.current.meter.dispose(); micRef.current.monitorGain.dispose(); } catch {}
+        micRef.current = null;
+      }
       const mic = new Tone.UserMedia();
-      await mic.open();              // prompts for permission
-      const recorder = new Tone.Recorder();
-      mic.connect(recorder);
-      recorder.start();
-      recRef.current = { mic, recorder, startedAt: Date.now() };
-      return true;
-    } catch (e) {
-      console.warn("[daw] mic recording failed:", e);
-      if (recRef.current) { try { recRef.current.mic.close(); } catch {} recRef.current = null; }
-      return false;
+      await mic.open(deviceId || undefined);   // prompts for permission first time
+      const meter = new Tone.Meter({ smoothing: 0.6 });
+      const monitorGain = new Tone.Gain(0);    // 0 = muted monitoring by default
+      mic.connect(meter);
+      mic.connect(monitorGain);
+      monitorGain.toDestination();
+      micRef.current = { mic, meter, monitorGain, deviceId: deviceId ?? "" };
+      return { ok: true };
+    } catch (e: any) {
+      console.warn("[daw] openMic failed:", e);
+      if (micRef.current) { try { micRef.current.mic.close(); } catch {} micRef.current = null; }
+      const name = e?.name || "";
+      const msg = String(e?.message || e || "");
+      let reason = "other";
+      if (name === "NotAllowedError") {
+        // macOS surfaces OS-level block as "Permission denied by system".
+        reason = /system/i.test(msg) ? "system" : "denied";
+      } else if (name === "NotFoundError" || name === "OverconstrainedError" || /not found/i.test(msg)) {
+        reason = "nodevice";
+      }
+      return { ok: false, reason };
     }
   }, [getTone]);
+
+  // Back-compat boolean wrapper.
+  const openMic = useCallback(async (deviceId?: string): Promise<boolean> => {
+    return (await openMicDetailed(deviceId)).ok;
+  }, [openMicDetailed]);
+
+  const closeMic = useCallback(() => {
+    if (!micRef.current) return;
+    try {
+      micRef.current.mic.close();
+      micRef.current.meter.dispose();
+      micRef.current.monitorGain.dispose();
+    } catch {}
+    micRef.current = null;
+  }, []);
+
+  // Toggle live monitoring — route the mic to the speakers so the singer hears
+  // themselves. Off by default to avoid feedback howl on laptop speakers.
+  const setMonitoring = useCallback((on: boolean) => {
+    const m = micRef.current;
+    if (!m) return;
+    try { m.monitorGain.gain.rampTo(on ? 1 : 0, 0.05); } catch {}
+  }, []);
+
+  const getInputLevel = useCallback((): number => {
+    const m = micRef.current;
+    if (!m) return 0;
+    try {
+      const db = m.meter.getValue();
+      const v = typeof db === "number" ? db : -Infinity;
+      return v <= -60 ? 0 : Math.min(1, (v + 60) / 60);
+    } catch { return 0; }
+  }, []);
+
+  // Start capturing from the (already-open) mic. If alongTransport is true the
+  // transport keeps playing so vocals are recorded over the beat. We tap the
+  // mic into a fresh Recorder; the persistent meter/monitor chain stays intact.
+  const startRecording = useCallback(async (opts?: { deviceId?: string; alongTransport?: boolean }): Promise<boolean> => {
+    const Tone = await getTone();
+    try {
+      const ctx = Tone.getContext();
+      if (ctx.state === "suspended") await ctx.resume();
+      // Make sure the mic is open (opens default if not already).
+      if (!micRef.current || (opts?.deviceId !== undefined && micRef.current.deviceId !== opts.deviceId)) {
+        const ok = await openMic(opts?.deviceId);
+        if (!ok) return false;
+      }
+      const recorder = new Tone.Recorder();
+      micRef.current.mic.connect(recorder);
+      recorder.start();
+      // record over the beat: start transport if asked and not already running
+      if (opts?.alongTransport) {
+        const t = Tone.getTransport();
+        if (t.state !== "started") t.start();
+      }
+      recRef.current = { recorder, startedAt: Date.now() };
+      return true;
+    } catch (e) {
+      console.warn("[daw] startRecording failed:", e);
+      return false;
+    }
+  }, [getTone, openMic]);
 
   const stopRecording = useCallback(async (): Promise<{ url: string; duration: number } | null> => {
     const r = recRef.current;
@@ -431,13 +636,14 @@ export function useDawEngine(): DawEngine {
     recRef.current = null;
     try {
       const blob = await r.recorder.stop();
-      try { r.mic.close(); r.recorder.dispose(); } catch {}
+      // disconnect this recorder from the mic but keep the mic chain alive
+      try { if (micRef.current) micRef.current.mic.disconnect(r.recorder); } catch {}
+      try { r.recorder.dispose(); } catch {}
       const url = URL.createObjectURL(blob);
       const duration = (Date.now() - r.startedAt) / 1000;
       return { url, duration };
     } catch (e) {
       console.warn("[daw] stopRecording failed:", e);
-      try { r.mic.close(); } catch {}
       return null;
     }
   }, []);
@@ -445,19 +651,28 @@ export function useDawEngine(): DawEngine {
   const setMasterVolume = useCallback((vol: number) => {
     if (!toneRef.current) return;
     try {
-      // Tone.Destination exposes a volume param in dB
-      toneRef.current.getDestination().volume.value = toDb(Math.max(0.0001, vol));
+      const vp = toneRef.current.getDestination().volume;
+      vp.cancelScheduledValues(0);
+      vp.value = vol <= 0 ? -Infinity : toDb(vol);
     } catch {}
   }, []);
 
   const setTrackVolume = useCallback((id: string, vol: number) => {
     const n = nodesRef.current.get(id);
-    if (n) n.channel.volume.value = toDb(vol);
+    if (!n) return;
+    try {
+      n.channel.volume.cancelScheduledValues(0);
+      n.channel.volume.value = vol <= 0 ? -Infinity : toDb(vol);
+    } catch {}
   }, []);
 
   const setTrackPan = useCallback((id: string, pan: number) => {
     const n = nodesRef.current.get(id);
-    if (n) n.channel.pan.value = pan;
+    if (!n) return;
+    try {
+      n.channel.pan.cancelScheduledValues(0);
+      n.channel.pan.value = pan;
+    } catch {}
   }, []);
 
   const setTrackMute = useCallback((id: string, muted: boolean) => {
@@ -465,17 +680,27 @@ export function useDawEngine(): DawEngine {
     if (n) n.channel.mute = muted;
   }, []);
 
-  const setTrackSolo = useCallback((id: string, soloed: boolean) => {
-    // Tone.js Channel.solo isolates automatically when channels share Destination.
-    // We set it on the target track, then sync all others so Tone's solo bus
-    // correctly silences non-soloed tracks.
+  // Legacy single-track entry point. Superseded by applySolo (DAWStudio now passes
+  // the full soloed/muted set). Kept so any stray caller doesn't crash.
+  const setTrackSolo = useCallback((_id: string, _soloed: boolean) => {
+    // no-op: solo is applied coherently via applySolo
+  }, []);
+
+  // Apply solo across ALL tracks explicitly, instead of relying on Tone's
+  // Channel.solo bus (which didn't actually silence other channels in our routing —
+  // every channel connects straight to Destination, so a single .solo had no effect).
+  //
+  // Rule: if ANY track is soloed, every non-soloed track is silenced; tracks the
+  // user explicitly muted stay muted regardless. We drive channel.mute directly so
+  // the result is deterministic.
+  const applySolo = useCallback((soloedIds: string[], mutedIds: string[]) => {
+    const soloSet = new Set(soloedIds);
+    const muteSet = new Set(mutedIds);
+    const anySolo = soloSet.size > 0;
     nodesRef.current.forEach((n, tid) => {
-      if (tid === id) {
-        n.channel.solo = soloed;
-      } else if (!soloed) {
-        // un-solo: restore each channel to its own solo state (not force-soloed)
-        n.channel.solo = n.channel.solo;
-      }
+      const userMuted = muteSet.has(tid);
+      const soloSilenced = anySolo && !soloSet.has(tid);
+      try { n.channel.mute = userMuted || soloSilenced; } catch {}
     });
   }, []);
 
@@ -506,17 +731,19 @@ export function useDawEngine(): DawEngine {
   // useCallback-stable or primitive state, so we only rebuild when isLoaded /
   // loadError actually change.
   return useMemo(() => ({
-    play, pause, stop, seekTo, setBpm, setLoop, setMetronome,
+    play, pause, stop, seekTo, scrubTo, setBpm, setLoop, setMetronome,
+    listInputDevices, openMic, openMicDetailed, closeMic, setMonitoring, getInputLevel,
     startRecording, stopRecording,
-    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo, setMasterVolume,
-    loadTracks, scheduleFades, scheduleAutomation, rebuildEffects, applyEffectParams, applyClipOps,
+    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo, applySolo, setMasterVolume,
+    loadTracks, scheduleFades, rescheduleClips, scheduleAutomation, rebuildEffects, rebuildClips, applyEffectParams, applyClipOps,
     getPosition, getLevels, getAnalyser,
     isLoaded, loadError,
   }), [
-    play, pause, stop, seekTo, setBpm, setLoop, setMetronome,
+    play, pause, stop, seekTo, scrubTo, setBpm, setLoop, setMetronome,
+    listInputDevices, openMic, openMicDetailed, closeMic, setMonitoring, getInputLevel,
     startRecording, stopRecording,
-    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo, setMasterVolume,
-    loadTracks, scheduleFades, scheduleAutomation, rebuildEffects, applyEffectParams, applyClipOps,
+    setTrackVolume, setTrackPan, setTrackMute, setTrackSolo, applySolo, setMasterVolume,
+    loadTracks, scheduleFades, rescheduleClips, scheduleAutomation, rebuildEffects, rebuildClips, applyEffectParams, applyClipOps,
     getPosition, getLevels, getAnalyser,
     isLoaded, loadError,
   ]);

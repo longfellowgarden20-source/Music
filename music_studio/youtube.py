@@ -2,7 +2,7 @@
 YouTube → strip → revamp pipeline.
 
 Flow:
-  1. download(url)          — yt-dlp → WAV in music_output/
+  1. download(url)          — yt-dlp → WAV in library.AUDIO_DIR
   2. strip_vocals(track_id) — Demucs separate, mute vocals, bake instrumental
   3. revamp(track_id, cfg)  — apply FX rack + optional AI re-generation on each stem
 """
@@ -15,7 +15,10 @@ import soundfile as sf
 
 from . import library, engine, stem_fx
 
-OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "music_output")
+
+def _out_dir() -> str:
+    """Always write alongside the real library — survives packaging and moves."""
+    return library.AUDIO_DIR
 
 
 # ─── 1. Download ────────────────────────────────────────────────────────────
@@ -27,8 +30,9 @@ def download(url: str) -> dict:
     """
     import yt_dlp
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    tmp = tempfile.mktemp(suffix=".%(ext)s", dir=OUT_DIR)
+    out = _out_dir()
+    os.makedirs(out, exist_ok=True)
+    tmp = tempfile.mktemp(suffix=".%(ext)s", dir=out)
 
     ydl_opts = {
         "format": "bestaudio/best",
@@ -89,7 +93,7 @@ def strip_vocals(track_id: int, *, out_dir: str | None = None) -> dict:
     if not t:
         raise ValueError(f"Track {track_id} not found")
 
-    out = out_dir or os.path.join(OUT_DIR, f"stems_{track_id}")
+    out = out_dir or os.path.join(_out_dir(), f"stems_{track_id}")
     os.makedirs(out, exist_ok=True)
 
     # reuse engine's Demucs separation
@@ -120,7 +124,7 @@ def strip_vocals(track_id: int, *, out_dir: str | None = None) -> dict:
     title = (t.get("title") or t.get("prompt") or f"Track #{track_id}")
     instr_title = f"{title} (instrumental)"
 
-    instr_path = os.path.join(OUT_DIR, f"instrumental_{track_id}.wav")
+    instr_path = os.path.join(_out_dir(), f"instrumental_{track_id}.wav")
     sf.write(instr_path, mix, sr_out)
 
     meta = engine.analyze(np.ascontiguousarray(mix), sr_out)
@@ -158,7 +162,7 @@ def revamp(track_id: int, mixer: dict | None = None) -> dict:
     if not t:
         raise ValueError(f"Track {track_id} not found")
 
-    stem_dir = os.path.join(OUT_DIR, f"stems_{track_id}")
+    stem_dir = os.path.join(_out_dir(), f"stems_{track_id}")
     if not os.path.exists(stem_dir):
         raise ValueError(f"Stems not split for track {track_id} — run strip_vocals first")
 
@@ -187,7 +191,7 @@ def revamp(track_id: int, mixer: dict | None = None) -> dict:
     title = (t.get("title") or t.get("prompt") or f"Track #{track_id}")
     revamp_title = f"{title} (revamped)"
 
-    revamp_path = os.path.join(OUT_DIR, f"revamp_{track_id}.wav")
+    revamp_path = os.path.join(_out_dir(), f"revamp_{track_id}.wav")
     sf.write(revamp_path, mix, sr_out)
 
     mono = mix.mean(axis=1) if mix.ndim > 1 else mix

@@ -51,6 +51,7 @@ export const OP_META: Record<RegionOpType, { name: string; icon: string; group: 
   stutter:        { name: "Stutter",     icon: "⋮", group: "Time", amount: { min: 2, max: 16, step: 1, default: 4, unit: "×" } },
   "tape-stop":    { name: "Tape Stop",   icon: "◖", group: "Time" },
   "pitch-scale":  { name: "Pitch→Scale", icon: "𝄞", group: "Time", amount: { min: 0, max: 11, step: 1, default: 0, unit: "key" } },
+  autotune:       { name: "Auto-Tune",   icon: "✺", group: "Time" },
   // AI
   "ai-replace":   { name: "AI Regen",    icon: "✦", group: "AI" },
 };
@@ -93,19 +94,29 @@ function detectPitch(buf: Float32Array, sr: number): number {
   return 0;
 }
 
-// Major-scale semitone offsets from the root.
-const MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11];
+// Scale interval tables (semitone offsets from the root). Index = SCALE id.
+export const SCALES: { id: number; name: string; degrees: number[] }[] = [
+  { id: 0, name: "Major",       degrees: [0, 2, 4, 5, 7, 9, 11] },
+  { id: 1, name: "Minor",       degrees: [0, 2, 3, 5, 7, 8, 10] },
+  { id: 2, name: "Chromatic",   degrees: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] },
+  { id: 3, name: "Pentatonic",  degrees: [0, 2, 4, 7, 9] },
+  { id: 4, name: "Min Penta",   degrees: [0, 3, 5, 7, 10] },
+  { id: 5, name: "Dorian",      degrees: [0, 2, 3, 5, 7, 9, 10] },
+  { id: 6, name: "Harmonic Min",degrees: [0, 2, 3, 5, 7, 8, 11] },
+  { id: 7, name: "Blues",       degrees: [0, 3, 5, 6, 7, 10] },
+];
+export const KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-// Nearest in-scale frequency to f0, given a root pitch class (0=C..11=B).
-function snapToScale(f0: number, root: number): number {
+// Nearest in-scale frequency to f0, given a root pitch class + scale id.
+function snapToScale(f0: number, root: number, scaleId: number): number {
   if (f0 <= 0) return f0;
+  const degrees = (SCALES[scaleId] ?? SCALES[0]).degrees;
   const midi = 69 + 12 * Math.log2(f0 / 440);
   const pc = ((Math.round(midi) % 12) + 12) % 12;
   const octBase = Math.round(midi) - pc;
-  // candidate scale pitch classes (root + major scale), find closest to this midi
   let bestMidi = Math.round(midi), bestDist = Infinity;
   for (let oct = -1; oct <= 1; oct++) {
-    for (const deg of MAJOR_SCALE) {
+    for (const deg of degrees) {
       const cand = octBase + oct * 12 + ((root + deg) % 12);
       const d = Math.abs(cand - midi);
       if (d < bestDist) { bestDist = d; bestMidi = cand; }
@@ -114,24 +125,36 @@ function snapToScale(f0: number, root: number): number {
   return 440 * Math.pow(2, (bestMidi - 69) / 12);
 }
 
-// Apply pitch correction across [i0,i1): window the region, detect each window's
-// pitch, resample it to the nearest in-scale note. Length-preserving (overlap-add
-// of corrected grains). root = key root pitch class (0=C).
-function applyPitchScale(data: Float32Array, sr: number, i0: number, i1: number, root: number) {
-  const win = Math.floor(sr * 0.06);     // 60ms analysis windows
+// Premium pitch correction across [i0,i1).
+//   root     = key root pitch class (0=C..11=B)
+//   scaleId  = index into SCALES
+//   strength = 0..1 (0 = no correction, 1 = full hard snap)
+//   speed    = 0..1 retune SPEED (1 = instant/robotic, lower = gliding/natural).
+// Length-preserving windowed resampling (PSOLA-lite), overlap-add of grains.
+function applyAutotune(data: Float32Array, sr: number, i0: number, i1: number,
+                       root: number, scaleId: number, strength: number, speed: number) {
+  const win = Math.floor(sr * 0.05);       // 50ms analysis windows
   if (i1 - i0 < win) return;
+  const hop = Math.floor(win / 4);          // 75% overlap = smoother
   const out = new Float32Array(i1 - i0);
   const env = new Float32Array(i1 - i0);
-  for (let start = i0; start < i1 - win; start += Math.floor(win / 2)) {
+  // Smoothed correction ratio carried across windows for "retune speed".
+  let smoothedRatio = 1;
+  const smooth = clamp(speed, 0, 1);        // 1 = snap instantly, <1 = glide
+  for (let start = i0; start < i1 - win; start += hop) {
     const seg = data.subarray(start, start + win);
     const f0 = detectPitch(seg, sr);
-    let ratio = 1;
+    let targetRatio = 1;
     if (f0 > 0) {
-      const target = snapToScale(f0, root);
-      ratio = f0 / target;   // resample factor to shift detected→target
-      ratio = clamp(ratio, 0.5, 2);
+      const snapped = snapToScale(f0, root, scaleId);
+      const fullRatio = f0 / snapped;       // resample factor for full correction
+      // Apply STRENGTH: interpolate (in log space) between no-shift (1) and full.
+      targetRatio = Math.pow(fullRatio, clamp(strength, 0, 1));
+      targetRatio = clamp(targetRatio, 0.5, 2);
     }
-    // resample this grain with a Hann window, overlap-add
+    // retune-speed smoothing: glide the ratio toward the target
+    smoothedRatio = f0 > 0 ? smoothedRatio + (targetRatio - smoothedRatio) * smooth : 1;
+    const ratio = f0 > 0 ? smoothedRatio : 1;
     for (let i = 0; i < win; i++) {
       const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / win);
       const srcPos = i * ratio;
@@ -217,9 +240,18 @@ function applyInPlace(data: Float32Array, sr: number, op: RegionOp) {
       break;
     }
     case "pitch-scale": {
-      // real pitch correction — snap detected pitch to nearest note in key.
-      // op.amount = root pitch class (0=C, 1=C#, … 11=B); major scale.
-      applyPitchScale(data, sr, i0, i1, Math.round(op.amount) % 12);
+      // legacy: snap detected pitch to nearest note in key (major, full strength).
+      applyAutotune(data, sr, i0, i1, Math.round(op.amount) % 12, 0, 1, 1);
+      break;
+    }
+    case "autotune": {
+      // premium pitch correction with key / scale / strength / speed.
+      const p = op.params ?? {};
+      const root = Math.round(p.key ?? 0) % 12;
+      const scaleId = Math.round(p.scale ?? 0);
+      const strength = p.strength ?? 1;
+      const speed = p.speed ?? 1;
+      applyAutotune(data, sr, i0, i1, root, scaleId, strength, speed);
       break;
     }
     case "compress": {

@@ -108,6 +108,24 @@ def init_db():
         # index after the column is guaranteed to exist
         c.execute("create index if not exists idx_project on tracks(project_id)")
 
+        # ── Playlists (many-to-many, ordered) ──────────────────────────────
+        c.execute("""
+        create table if not exists playlists (
+            id          integer primary key autoincrement,
+            name        text not null,
+            created_at  text not null
+        )
+        """)
+        c.execute("""
+        create table if not exists playlist_tracks (
+            playlist_id integer not null,
+            track_id    integer not null,
+            position    integer not null default 0,
+            primary key (playlist_id, track_id)
+        )
+        """)
+        c.execute("create index if not exists idx_pl_tracks on playlist_tracks(playlist_id, position)")
+
 
 def _rel(path: str) -> str:
     """Store only the filename, not the full path. Survives username/machine changes."""
@@ -309,6 +327,91 @@ def list_collections() -> list[str]:
     if "All Tracks" not in cols:
         cols.insert(0, "All Tracks")
     return cols
+
+
+# ── Playlists ────────────────────────────────────────────────────────────────
+def create_playlist(name: str) -> int:
+    name = (name or "Untitled Playlist").strip()[:120]
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "insert into playlists (name, created_at) values (?, ?)",
+            (name, datetime.now(timezone.utc).isoformat()))
+        return cur.lastrowid
+
+
+def rename_playlist(playlist_id: int, name: str) -> None:
+    name = (name or "Untitled Playlist").strip()[:120]
+    with _lock, _conn() as c:
+        c.execute("update playlists set name=? where id=?", (name, playlist_id))
+
+
+def delete_playlist(playlist_id: int) -> None:
+    with _lock, _conn() as c:
+        c.execute("delete from playlist_tracks where playlist_id=?", (playlist_id,))
+        c.execute("delete from playlists where id=?", (playlist_id,))
+
+
+def list_playlists() -> list[dict]:
+    """All playlists with track count + total duration."""
+    with _lock, _conn() as c:
+        rows = c.execute("""
+            select p.id, p.name, p.created_at,
+                   count(pt.track_id) as track_count,
+                   coalesce(sum(t.duration), 0) as total_seconds
+            from playlists p
+            left join playlist_tracks pt on pt.playlist_id = p.id
+            left join tracks t on t.id = pt.track_id
+            group by p.id
+            order by p.created_at desc
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_playlist(playlist_id: int) -> dict | None:
+    """One playlist with its tracks in order."""
+    with _lock, _conn() as c:
+        pl = c.execute("select * from playlists where id=?", (playlist_id,)).fetchone()
+        if not pl:
+            return None
+        rows = c.execute("""
+            select t.*, pt.position
+            from playlist_tracks pt
+            join tracks t on t.id = pt.track_id
+            where pt.playlist_id = ?
+            order by pt.position asc, pt.rowid asc
+        """, (playlist_id,)).fetchall()
+    return {**dict(pl), "tracks": [_resolve(dict(r)) for r in rows]}
+
+
+def add_to_playlist(playlist_id: int, track_id: int) -> None:
+    """Append a track to the end of a playlist (no-op if already present)."""
+    with _lock, _conn() as c:
+        exists = c.execute(
+            "select 1 from playlist_tracks where playlist_id=? and track_id=?",
+            (playlist_id, track_id)).fetchone()
+        if exists:
+            return
+        nxt = c.execute(
+            "select coalesce(max(position), -1) + 1 as p from playlist_tracks where playlist_id=?",
+            (playlist_id,)).fetchone()["p"]
+        c.execute(
+            "insert into playlist_tracks (playlist_id, track_id, position) values (?, ?, ?)",
+            (playlist_id, track_id, nxt))
+
+
+def remove_from_playlist(playlist_id: int, track_id: int) -> None:
+    with _lock, _conn() as c:
+        c.execute("delete from playlist_tracks where playlist_id=? and track_id=?",
+                  (playlist_id, track_id))
+
+
+def reorder_playlist(playlist_id: int, track_ids: list[int]) -> None:
+    """Set the order of a playlist from a full list of track ids."""
+    with _lock, _conn() as c:
+        for pos, tid in enumerate(track_ids):
+            c.execute(
+                "update playlist_tracks set position=? where playlist_id=? and track_id=?",
+                (pos, playlist_id, tid))
 
 
 def stats() -> dict:

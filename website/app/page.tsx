@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect } from "react";
 import Image from "next/image";
-import { T, Logo, BeatPlayer, Reveal } from "./_shared/ui";
+import { T, Logo, BeatPlayer, Reveal, SectionHead, FAQ, Comparison, Testimonials, ProofStrip, HAS_REAL_DEMOS } from "./_shared/ui";
 
 // animated waveform band that drifts across the hero
 function WaveBand() {
@@ -34,7 +34,7 @@ function Nav() {
     <nav style={{ position: "fixed", inset: "0 0 auto 0", zIndex: 100, height: 68, padding: "0 max(24px,5vw)", display: "flex", alignItems: "center", justifyContent: "space-between",
       background: s ? "rgba(10,10,10,.85)" : "transparent", backdropFilter: s ? "blur(14px)" : "none", borderBottom: `1px solid ${s ? T.line : "transparent"}`, transition: "all .25s" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 9 }}><Logo /><span style={{ fontSize: 18, fontWeight: 800, letterSpacing: -0.4 }}>StemAI</span></div>
-      <a href="#pricing" style={{ fontSize: 14, fontWeight: 700, color: "#000", background: T.green, padding: "9px 22px", borderRadius: 500, textDecoration: "none" }}
+      <a href="/buy" style={{ fontSize: 14, fontWeight: 700, color: "#000", background: T.green, padding: "9px 22px", borderRadius: 500, textDecoration: "none" }}
         onMouseEnter={e => { e.currentTarget.style.background = T.greenBright; }} onMouseLeave={e => { e.currentTarget.style.background = T.green; }}>Get StemAI</a>
     </nav>
   );
@@ -190,7 +190,7 @@ export default function Home() {
             </Reveal>
             <Reveal delay={180}>
               <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
-                <a href="#pricing" style={{ background: T.green, color: "#000", fontSize: 16, fontWeight: 800, padding: "16px 38px", borderRadius: 500, textDecoration: "none" }}
+                <a href="/buy" style={{ background: T.green, color: "#000", fontSize: 16, fontWeight: 800, padding: "16px 38px", borderRadius: 500, textDecoration: "none" }}
                   onMouseEnter={e => { e.currentTarget.style.background = T.greenBright; e.currentTarget.style.transform = "scale(1.03)"; }} onMouseLeave={e => { e.currentTarget.style.background = T.green; e.currentTarget.style.transform = "scale(1)"; }}>Get StemAI — $49</a>
                 <a href="#demo" style={{ color: "#fff", fontSize: 16, fontWeight: 600, padding: "16px 30px", borderRadius: 500, textDecoration: "none", border: `1px solid ${T.line}` }}
                   onMouseEnter={e => { e.currentTarget.style.background = T.bg3; }} onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}>Hear a demo ↓</a>
@@ -201,7 +201,9 @@ export default function Home() {
           <Reveal delay={160}>
             <div id="demo" style={{ scrollMarginTop: 90 }}>
               <BeatPlayer compact />
-              <div style={{ fontSize: 12, color: T.faint, marginTop: 12, textAlign: "center" }}>↑ Real beats StemAI generated — tap a style</div>
+              <div style={{ fontSize: 12, color: T.faint, marginTop: 12, textAlign: "center" }}>
+                {HAS_REAL_DEMOS ? "↑ Real beats StemAI generated — tap a style" : "↑ Tap a style to preview the kind of beats StemAI makes"}
+              </div>
             </div>
           </Reveal>
         </div>
@@ -222,6 +224,11 @@ export default function Home() {
             </div>
           ))}
         </div>
+      </section>
+
+      {/* social proof strip — quick stats */}
+      <section style={{ padding: "56px max(24px,5vw)", borderBottom: `1px solid ${T.line}`, background: T.bg }}>
+        <Reveal><ProofStrip /></Reveal>
       </section>
 
       {/* alternating feature rows — each paired with a real product mockup */}
@@ -318,6 +325,22 @@ export default function Home() {
         </div>
       </section>
 
+      {/* COMPARISON */}
+      <section style={{ padding: "100px max(24px,5vw)", borderTop: `1px solid ${T.line}` }}>
+        <Reveal>
+          <SectionHead eyebrow="Why StemAI" title="Own it, don't rent it" sub="The other AI music tools bill you every month and put a meter on your exports. StemAI is a one-time purchase that runs on your own machine." />
+        </Reveal>
+        <Reveal delay={80}><Comparison /></Reveal>
+      </section>
+
+      {/* TESTIMONIALS */}
+      <section style={{ padding: "100px max(24px,5vw)", background: T.bg1, borderTop: `1px solid ${T.line}` }}>
+        <Reveal>
+          <SectionHead eyebrow="Loved by makers" title="What people are saying" />
+        </Reveal>
+        <Reveal delay={80}><Testimonials /></Reveal>
+      </section>
+
       {/* PRICING */}
       <section id="pricing" style={{ padding: "110px 24px 130px", textAlign: "center", background: T.bg1, borderTop: `1px solid ${T.line}`, position: "relative", overflow: "hidden" }}>
         <div style={{ position: "absolute", top: "30%", left: "50%", transform: "translateX(-50%)", width: 700, height: 500, background: `radial-gradient(ellipse,${T.green}0c 0%,transparent 65%)`, pointerEvents: "none" }} />
@@ -352,22 +375,37 @@ export default function Home() {
                 </div>
               ))}
             </div>
-            <a href="#" style={{ display: "block", background: T.green, color: "#000", fontSize: 16, fontWeight: 800, padding: "18px 0", borderRadius: 500, textDecoration: "none", transition: "all .15s" }}
+            <a href="/buy" style={{ display: "block", background: T.green, color: "#000", fontSize: 16, fontWeight: 800, padding: "18px 0", borderRadius: 500, textDecoration: "none", transition: "all .15s" }}
               onMouseEnter={e => { e.currentTarget.style.background = T.greenBright; e.currentTarget.style.transform = "scale(1.02)"; }} onMouseLeave={e => { e.currentTarget.style.background = T.green; e.currentTarget.style.transform = "scale(1)"; }}>Get StemAI — $49</a>
             <div style={{ marginTop: 16, display: "flex", justifyContent: "center", gap: 16, flexWrap: "wrap", fontSize: 12, color: T.faint }}>
-              <span>🔒 Secure Gumroad checkout</span>
+              <span>🔒 Secure checkout</span>
               <span>↓ Instant download</span>
               <span>↩ 14-day refund</span>
+            </div>
+            {/* system requirements */}
+            <div style={{ marginTop: 22, paddingTop: 18, borderTop: `1px solid ${T.line}`, fontSize: 12, color: T.faint, lineHeight: 1.6, textAlign: "center" }}>
+              <span style={{ fontWeight: 700, color: T.muted }}>System requirements:</span> macOS 12+, Windows 10+, or Linux · 8GB RAM (16GB recommended) · ~4GB disk for models
             </div>
           </div>
         </div></Reveal>
       </section>
 
+      {/* FAQ */}
+      <section id="faq" style={{ padding: "100px max(24px,5vw)", borderTop: `1px solid ${T.line}`, background: T.bg }}>
+        <Reveal>
+          <SectionHead eyebrow="FAQ" title="Questions, answered" />
+        </Reveal>
+        <Reveal delay={80}><FAQ /></Reveal>
+        <div style={{ textAlign: "center", marginTop: 40, fontSize: 14, color: T.muted }}>
+          Still curious? <a href="/support" style={{ color: T.green, textDecoration: "none", fontWeight: 700 }}>Get in touch →</a>
+        </div>
+      </section>
+
       <footer style={{ borderTop: `1px solid ${T.line}`, padding: "36px max(24px,5vw)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}><Logo size={22} /><span style={{ fontWeight: 800 }}>StemAI</span></div>
         <div style={{ fontSize: 12, color: T.muted }}>© 2026 StemAI. All rights reserved.</div>
-        <div style={{ display: "flex", gap: 22 }}>{["Privacy", "Terms", "Support"].map(l => (
-          <a key={l} href="#" style={{ fontSize: 12, color: T.muted, textDecoration: "none" }} onMouseEnter={e => (e.currentTarget.style.color = "#fff")} onMouseLeave={e => (e.currentTarget.style.color = T.muted)}>{l}</a>
+        <div style={{ display: "flex", gap: 22 }}>{[["Privacy", "/privacy"], ["Terms", "/terms"], ["Support", "/support"]].map(([l, href]) => (
+          <a key={l} href={href} style={{ fontSize: 12, color: T.muted, textDecoration: "none" }} onMouseEnter={e => (e.currentTarget.style.color = "#fff")} onMouseLeave={e => (e.currentTarget.style.color = T.muted)}>{l}</a>
         ))}</div>
       </footer>
 
@@ -380,6 +418,10 @@ export default function Home() {
           .v2strip{ grid-template-columns:1fr !important; }
           .v2stripcol{ border-left:none !important; border-top:1px solid ${T.line} !important; }
           .v2stripcol:first-child{ border-top:none !important; }
+          .v2quotes{ grid-template-columns:1fr !important; }
+        }
+        @media (max-width: 640px){
+          .v2proof{ grid-template-columns:repeat(2,1fr) !important; row-gap:32px !important; }
         }
       `}</style>
     </div>

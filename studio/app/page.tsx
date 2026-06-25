@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { api, API, fmtTime, fmtDate, type Track, type Stats } from "./lib/api";
+import { api, API, fmtTime, fmtDate, type Track, type Stats, type Playlist } from "./lib/api";
 import { usePlayer } from "./components/PlayerProvider";
 import Waveform from "./components/Waveform";
 
@@ -268,7 +268,7 @@ export default function LibraryPage() {
                     background: isSel ? "rgba(34,197,94,0.12)" : "transparent",
                   }}>{isSel ? "✓" : ""}</div>
                 ) : (
-                  <button onClick={() => isCurrent ? toggle() : play(t)} style={{
+                  <button onClick={() => isCurrent ? toggle() : play(t, visible, visible.findIndex(x => x.id === t.id))} style={{
                     width: 38, height: 38, borderRadius: "50%", border: "none", flexShrink: 0,
                     background: "linear-gradient(95deg,var(--accent),var(--accent2))",
                     color: "#fff", fontSize: 14, cursor: "pointer"
@@ -338,8 +338,8 @@ export default function LibraryPage() {
 
               {/* actions */}
               {!selectMode && (
-                <div style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={e => e.stopPropagation()}>
-                  <button className="btn btn-primary" style={{ flex: 1, padding: "6px 0", fontSize: 12, fontWeight: 700 }}
+                <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }} onClick={e => e.stopPropagation()}>
+                  <button className="btn btn-primary" style={{ flex: "1 1 100%", padding: "6px 0", fontSize: 12, fontWeight: 700 }}
                     onClick={() => router.push(`/daw?id=${t.id}`)}>Open in DAW</button>
                   <button className="btn" style={{ padding: "6px 10px", fontSize: 12, color: "var(--muted)" }}
                     onClick={() => router.push(`/edit?id=${t.id}`)}>Edit</button>
@@ -347,6 +347,7 @@ export default function LibraryPage() {
                     title="Generation details" onClick={() => setDetailTrack(t)}>ⓘ</button>
                   <button className="btn" style={{ padding: "6px 12px", fontSize: 12, color: "var(--accent)" }}
                     onClick={() => router.push(`/vocals?track=${t.id}`)}>🎤</button>
+                  <AddToPlaylistButton track={t} />
                   <ExportMenu track={t} />
                   <button className="btn" style={{ padding: "6px 8px", fontSize: 11, color: "#fa2d55" }}
                     title="Add to Apple Music"
@@ -368,6 +369,93 @@ export default function LibraryPage() {
       </div>
 
       {detailTrack && <TrackDetailModal track={detailTrack} onClose={() => setDetailTrack(null)} />}
+    </div>
+  );
+}
+
+// ── add-to-playlist popover ──────────────────────────────────────────────────
+function AddToPlaylistButton({ track }: { track: Track }) {
+  const [open, setOpen] = useState(false);
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [done, setDone] = useState<string>("");
+
+  const openMenu = async () => {
+    setOpen(o => !o);
+    if (!open) {
+      setLoading(true);
+      try { setPlaylists(await api.playlists()); } catch {} finally { setLoading(false); }
+    }
+  };
+
+  const addTo = async (pid: number, name: string) => {
+    try {
+      await api.addToPlaylist(pid, track.id);
+      setDone(`Added to ${name}`);
+      setTimeout(() => { setDone(""); setOpen(false); }, 900);
+    } catch { setDone("Failed"); }
+  };
+
+  const createAndAdd = async () => {
+    const name = newName.trim() || "Untitled Playlist";
+    try {
+      const { id } = await api.createPlaylist(name);
+      await api.addToPlaylist(id, track.id);
+      setNewName("");
+      setDone(`Added to ${name}`);
+      setTimeout(() => { setDone(""); setOpen(false); }, 900);
+    } catch { setDone("Failed"); }
+  };
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button className="btn" style={{ padding: "6px 10px", fontSize: 12, color: "var(--accent)" }}
+        title="Add to playlist" onClick={openMenu}>＋♫</button>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
+          <div style={{
+            position: "absolute", bottom: "calc(100% + 6px)", right: 0, zIndex: 41,
+            background: "var(--bg2)", border: "1px solid var(--line)", borderRadius: 10,
+            boxShadow: "0 10px 28px rgba(0,0,0,0.5)", padding: 6, width: 220,
+          }}>
+            {done ? (
+              <div style={{ fontSize: 12, color: "var(--accent,#1db954)", fontWeight: 700, padding: "8px 10px", textAlign: "center" }}>✓ {done}</div>
+            ) : (
+              <>
+                <div style={{ fontSize: 9, fontWeight: 800, letterSpacing: 1, color: "var(--muted2,#888)", padding: "4px 8px 6px" }}>ADD TO PLAYLIST</div>
+                {loading && <div style={{ fontSize: 12, color: "var(--muted)", padding: "6px 10px" }}>Loading…</div>}
+                {!loading && playlists.length === 0 && (
+                  <div style={{ fontSize: 12, color: "var(--muted)", padding: "6px 10px" }}>No playlists yet.</div>
+                )}
+                <div style={{ maxHeight: 180, overflowY: "auto" }}>
+                  {playlists.map(p => (
+                    <button key={p.id} onClick={() => addTo(p.id, p.name)} style={{
+                      display: "flex", justifyContent: "space-between", width: "100%", gap: 8,
+                      padding: "8px 10px", borderRadius: 6, border: "none", cursor: "pointer",
+                      background: "transparent", color: "var(--text)", fontSize: 12, textAlign: "left",
+                    }}
+                      onMouseEnter={e => (e.currentTarget.style.background = "var(--bg3)")}
+                      onMouseLeave={e => (e.currentTarget.style.background = "transparent")}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                      <span style={{ color: "var(--muted2,#888)", fontSize: 11 }}>{p.track_count}</span>
+                    </button>
+                  ))}
+                </div>
+                <div style={{ height: 1, background: "var(--line)", margin: "5px 6px" }} />
+                <div style={{ display: "flex", gap: 5, padding: "2px 4px" }}>
+                  <input value={newName} onChange={e => setNewName(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") createAndAdd(); }}
+                    placeholder="New playlist…"
+                    style={{ flex: 1, minWidth: 0, background: "var(--bg0,#111)", border: "1px solid var(--line)", borderRadius: 6, padding: "5px 8px", color: "var(--text)", fontSize: 11, outline: "none" }} />
+                  <button onClick={createAndAdd} style={{ background: "var(--accent,#1db954)", color: "#000", border: "none", borderRadius: 6, padding: "0 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+</button>
+                </div>
+              </>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -630,6 +718,7 @@ function ExportMenu({ track }: { track: Track }) {
           <div style={{ fontSize: 10, color: "var(--muted2)", padding: "4px 8px", fontWeight: 700, letterSpacing: 1 }}>MIDI / STEMS</div>
           <button onClick={() => dl(api.midiUrl(track.id, "master"))} style={menuItem}>🎹 MIDI (.mid)</button>
           <button onClick={() => dl(`${API}/api/daw/${track.id}/export-zip`)} style={menuItem}>📦 Stems (.zip)</button>
+          <button onClick={() => dl(`${API}/api/loop-pack/${track.id}?bars=4`)} style={menuItem}>🔁 Loop pack (.zip)</button>
           <div style={{ height: 1, background: "var(--line, #2a2f3a)", margin: "4px 0" }} />
           <button onClick={showChords} style={menuItem}>
             {loadingChords ? "Detecting…" : "🎼 Chords"}

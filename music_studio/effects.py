@@ -112,6 +112,47 @@ def streaming_master(audio, sr, target_lufs=-14.0):
     return measure_and_gain(out, sr, target_lufs)
 
 
+# Platform mastering targets. Each tunes loudness (LUFS) + a voicing chain for
+# where the track will be heard. Streaming services normalize to ~-14; clubs want
+# it hot and punchy; podcasts target speech-friendly -16; lo-fi stays soft + warm.
+MASTER_PLATFORMS = {
+    "spotify":  {"lufs": -14.0, "label": "Spotify / YouTube",
+                 "chain": [HighpassFilter(30),
+                           Compressor(threshold_db=-16, ratio=2.5, attack_ms=10, release_ms=150),
+                           HighShelfFilter(cutoff_frequency_hz=8000, gain_db=1.5),
+                           Limiter(threshold_db=-1.0, release_ms=120)]},
+    "apple":    {"lufs": -16.0, "label": "Apple Music",
+                 "chain": [HighpassFilter(30),
+                           Compressor(threshold_db=-18, ratio=2.0, attack_ms=15, release_ms=180),
+                           HighShelfFilter(cutoff_frequency_hz=10000, gain_db=1.0),
+                           Limiter(threshold_db=-1.0, release_ms=140)]},
+    "club":     {"lufs": -8.0,  "label": "Club / DJ (loud)",
+                 "chain": [HighpassFilter(35),
+                           Compressor(threshold_db=-12, ratio=4.0, attack_ms=5, release_ms=90),
+                           LowShelfFilter(cutoff_frequency_hz=80, gain_db=2.5),
+                           HighShelfFilter(cutoff_frequency_hz=9000, gain_db=2.0),
+                           Limiter(threshold_db=-0.5, release_ms=80)]},
+    "podcast":  {"lufs": -16.0, "label": "Podcast / Voice",
+                 "chain": [HighpassFilter(70),
+                           Compressor(threshold_db=-20, ratio=3.0, attack_ms=8, release_ms=160),
+                           HighShelfFilter(cutoff_frequency_hz=6000, gain_db=1.0),
+                           Limiter(threshold_db=-1.5, release_ms=150)]},
+    "lofi":     {"lufs": -18.0, "label": "Lo-Fi / Chill (soft)",
+                 "chain": [HighpassFilter(40),
+                           LowShelfFilter(cutoff_frequency_hz=120, gain_db=1.5),
+                           HighShelfFilter(cutoff_frequency_hz=7000, gain_db=-2.0),
+                           Compressor(threshold_db=-22, ratio=2.0, attack_ms=20, release_ms=200),
+                           Limiter(threshold_db=-2.0, release_ms=180)]},
+}
+
+
+def master_for_platform(audio, sr, platform: str = "spotify"):
+    """Master a track for a specific destination (see MASTER_PLATFORMS)."""
+    cfg = MASTER_PLATFORMS.get(platform) or MASTER_PLATFORMS["spotify"]
+    out = _run(Pedalboard(list(cfg["chain"])), audio, sr)
+    return measure_and_gain(out, sr, cfg["lufs"])
+
+
 # ── Loudness measurement (simple LUFS-ish) ─────────────────────────────────────────
 def measure_lufs(audio, sr) -> float:
     """Approximate integrated loudness (LUFS). Good enough for guidance."""

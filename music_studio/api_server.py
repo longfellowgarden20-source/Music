@@ -51,10 +51,10 @@ import os
 import threading
 import numpy as np
 import asyncio
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 try:
@@ -166,6 +166,39 @@ def _save_version(audio, sr, t, edit_label, title=None, collection=None):
     return new_id
 
 
+def _decode_upload_bytes(raw: bytes, filename: str):
+    """Decode uploaded audio bytes → (mono float32 array, sr). Handles WAV/FLAC/
+    OGG/AIFF natively (soundfile) and MP3/M4A/AAC via ffmpeg. Raises HTTPException."""
+    import tempfile, soundfile as sf
+    suffix = os.path.splitext(filename or "")[1].lower() or ".audio"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+    try:
+        try:
+            audio, sr = sf.read(tmp_path, dtype="float32")
+        except Exception:
+            import subprocess
+            wav_tmp = tmp_path + "_conv.wav"
+            try:
+                result = subprocess.run(
+                    [_ffmpeg_exe(), "-y", "-i", tmp_path, "-ac", "1", "-ar", "44100",
+                     "-sample_fmt", "flt", wav_tmp], capture_output=True, timeout=120)
+            except FileNotFoundError:
+                raise HTTPException(415, "ffmpeg not found — needed for MP3/M4A/AAC")
+            if result.returncode != 0:
+                raise HTTPException(415, f"Could not decode audio: {result.stderr.decode()[-200:]}")
+            audio, sr = sf.read(wav_tmp, dtype="float32")
+            try: os.unlink(wav_tmp)
+            except Exception: pass
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        return audio, sr
+    finally:
+        try: os.unlink(tmp_path)
+        except Exception: pass
+
+
 def _ffmpeg_exe() -> str:
     """Resolve an ffmpeg binary — prefer the bundled one (works on packaged app),
     fall back to a system install."""
@@ -206,6 +239,22 @@ def get_versions(track_id: int):
     return [_track_json(r) for r in rows]
 
 
+@app.delete("/api/track/{track_id}/version/{version_id}")
+def delete_version(track_id: int, version_id: int):
+    """Delete one version (take) from a track's project. Refuses to delete the
+    last remaining version so a project can never be left empty."""
+    t = _require(track_id)
+    pid = t.get("project_id") or track_id
+    rows = library.list_versions(pid)
+    if len(rows) <= 1:
+        raise HTTPException(400, "Can't delete the only version of a track.")
+    if not any(r["id"] == version_id for r in rows):
+        raise HTTPException(404, "That version isn't part of this track.")
+    library.delete_track(version_id, remove_file=True)
+    remaining = library.list_versions(pid)
+    return {"ok": True, "versions": [_track_json(r) for r in remaining]}
+
+
 @app.get("/api/audio/{track_id}")
 def get_audio(track_id: int):
     t = _require(track_id)
@@ -236,8 +285,14 @@ def add_to_apple_music(track_id: int):
     if not t["filepath"] or not os.path.exists(t["filepath"]):
         raise HTTPException(404, "Audio file not found")
     abs_path = os.path.abspath(t["filepath"])
-    script = f'tell application "Music" to add POSIX file "{abs_path}"'
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    # Pass the path as an argv item (read via `item 1 of argv`) instead of
+    # interpolating it into the script string, so a path containing quotes or
+    # other AppleScript metacharacters can't break out and inject commands.
+    script = ('on run argv\n'
+              '  tell application "Music" to add POSIX file (item 1 of argv)\n'
+              'end run')
+    result = subprocess.run(["osascript", "-e", script, abs_path],
+                            capture_output=True, text=True, timeout=15)
     if result.returncode != 0:
         raise HTTPException(500, f"Apple Music import failed: {result.stderr.strip()}")
     return {"ok": True, "message": "Added to Apple Music library"}
@@ -277,6 +332,62 @@ def get_collections():
 @app.get("/api/stats")
 def get_stats():
     return library.stats()
+
+
+# ── playlists ───────────────────────────────────────────────────────────────
+class PlaylistCreateBody(BaseModel): name: str
+class PlaylistRenameBody(BaseModel): name: str
+class PlaylistReorderBody(BaseModel): track_ids: list[int]
+
+
+@app.get("/api/playlists")
+def get_playlists():
+    return library.list_playlists()
+
+
+@app.post("/api/playlists")
+def create_playlist(body: PlaylistCreateBody):
+    pid = library.create_playlist(body.name)
+    return {"id": pid}
+
+
+@app.get("/api/playlists/{playlist_id}")
+def get_playlist(playlist_id: int):
+    pl = library.get_playlist(playlist_id)
+    if not pl:
+        raise HTTPException(404, "playlist not found")
+    return pl
+
+
+@app.post("/api/playlists/{playlist_id}/rename")
+def rename_playlist(playlist_id: int, body: PlaylistRenameBody):
+    library.rename_playlist(playlist_id, body.name)
+    return {"ok": True}
+
+
+@app.delete("/api/playlists/{playlist_id}")
+def delete_playlist(playlist_id: int):
+    library.delete_playlist(playlist_id)
+    return {"ok": True}
+
+
+@app.post("/api/playlists/{playlist_id}/add/{track_id}")
+def add_to_playlist(playlist_id: int, track_id: int):
+    _require(track_id)
+    library.add_to_playlist(playlist_id, track_id)
+    return {"ok": True}
+
+
+@app.post("/api/playlists/{playlist_id}/remove/{track_id}")
+def remove_from_playlist(playlist_id: int, track_id: int):
+    library.remove_from_playlist(playlist_id, track_id)
+    return {"ok": True}
+
+
+@app.post("/api/playlists/{playlist_id}/reorder")
+def reorder_playlist(playlist_id: int, body: PlaylistReorderBody):
+    library.reorder_playlist(playlist_id, body.track_ids)
+    return {"ok": True}
 
 
 # ── library management ────────────────────────────────────────────────────────
@@ -403,7 +514,7 @@ async def import_audio(file: UploadFile = File(...)):
                 import subprocess
                 wav_tmp = tmp_path + "_conv.wav"
                 result = subprocess.run(
-                    ["ffmpeg", "-y", "-i", tmp_path, "-ac", "1", "-ar", "44100",
+                    [_ffmpeg_exe(), "-y", "-i", tmp_path, "-ac", "1", "-ar", "44100",
                      "-sample_fmt", "flt", wav_tmp],
                     capture_output=True, timeout=120
                 )
@@ -512,37 +623,99 @@ def license_deactivate():
     return {"activated": False}
 
 
+# ── AI settings: user's own Groq key(s) (Producer-mode language understanding) ──
+class GroqKeyBody(BaseModel):
+    key: str
+
+def _gh():
+    try:
+        from . import groq_helper as g
+    except Exception:
+        from music_studio import groq_helper as g
+    return g
+
+def _masked_keys():
+    """Saved keys, masked for display (env-var key shown as a fixed entry)."""
+    g = _gh()
+    import os as _os
+    out = []
+    env = (_os.environ.get("GROQ_API_KEY") or "").strip()
+    if env:
+        out.append({"masked": "env: " + env[:6] + "…" + env[-4:], "removable": False, "raw": None})
+    for k in g._saved_keys_only():
+        out.append({"masked": k[:6] + "…" + k[-4:], "removable": True, "raw": k})
+    return out
+
+@app.get("/api/settings/groq")
+def groq_key_status():
+    """List configured Groq keys (masked). Producer chat works without any key via
+    keyword matching; a key unlocks full natural-language understanding."""
+    g = _gh()
+    return {"configured": g.available(), "keys": _masked_keys()}
+
+@app.post("/api/settings/groq")
+def groq_key_add(body: GroqKeyBody):
+    """Validate a key with a real test call, then add it. Reports whether it works
+    so the UI never claims 'smart mode on' for a dead key."""
+    g = _gh()
+    key = (body.key or "").strip()
+    if not key:
+        raise HTTPException(400, "Paste a key first.")
+    if not g.validate_key(key):
+        raise HTTPException(400, "That key didn't work — check it's a valid Groq key (starts with gsk_).")
+    g.add_key(key)
+    return {"ok": True, "configured": g.available(), "keys": _masked_keys()}
+
+@app.delete("/api/settings/groq")
+def groq_key_remove(body: GroqKeyBody):
+    g = _gh()
+    g.remove_key(body.key)
+    return {"ok": True, "configured": g.available(), "keys": _masked_keys()}
+
+
 # ── generation ────────────────────────────────────────────────────────────────
 class GenerateBody(BaseModel):
-    prompt: str
-    negative: str = ""
-    duration: float = 12
+    # Length/range caps keep a runaway request from OOM-ing the user's own
+    # machine (the engine only ever serves localhost, so this is the only abuse
+    # vector worth guarding). Out-of-range values yield a clean 422.
+    prompt: str = Field(min_length=1, max_length=2000)
+    negative: str = Field(default="", max_length=2000)
+    duration: float = Field(default=12, ge=1, le=300)
     model_size: str = "small"
-    guidance: float = 3.0
-    temperature: float = 1.0
+    guidance: float = Field(default=3.0, ge=0, le=30)
+    temperature: float = Field(default=0.85, ge=0, le=2)
     seed: Optional[int] = None
     master: bool = True
-    collection: str = "All Tracks"
-    title: str = ""
+    collection: str = Field(default="All Tracks", max_length=120)
+    title: str = Field(default="", max_length=120)
+    # Stable Audio 3 diffusion-step quality dial (8 fast … 25 higher quality).
+    # Ignored by the MusicGen engine. Capped so a huge value can't hang the machine.
+    steps: int = Field(default=8, ge=4, le=50)
+    # SA3 sampler: "pingpong" (default) or "euler". Other values fall back safely.
+    sampler: str = Field(default="pingpong", max_length=20)
 
 
-@app.post("/api/generate")
-def generate(body: GenerateBody):
-    require_license()
-    if not body.prompt.strip():
-        raise HTTPException(400, "Enter a prompt")
-    try:
-        with engine.generation_session():
-            sr, audio, used_seed = engine.generate(
-                prompt=body.prompt, negative=body.negative, duration=body.duration,
-                model_size=body.model_size, guidance=body.guidance,
-                temperature=body.temperature, seed=body.seed)
-    except engine._CancelledError:
-        raise HTTPException(499, "Generation cancelled")
-    except MemoryError as e:
-        raise HTTPException(507, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"Generation failed: {e}")
+def _do_generate(body: GenerateBody) -> dict:
+    """Core generation: run the model, master, analyze, save, return the result
+    dict. Shared by the synchronous endpoint and the background-job worker.
+    Caller is responsible for the engine.generation_session() context."""
+    sr, audio, used_seed = engine.generate(
+        prompt=body.prompt, negative=body.negative, duration=body.duration,
+        model_size=body.model_size, guidance=body.guidance,
+        temperature=body.temperature, seed=body.seed, steps=body.steps,
+        sampler=body.sampler)
+
+    # Retry once if quality score is very low (silent/artifact output)
+    first_score = engine.score_take(audio, sr)
+    if first_score < -10:
+        print(f"[generate] Low quality score {first_score:.1f} — retrying once")
+        sr2, audio2, used_seed2 = engine.generate(
+            prompt=body.prompt, negative=body.negative, duration=body.duration,
+            model_size=body.model_size, guidance=body.guidance,
+            temperature=body.temperature, seed=None, steps=body.steps,
+            sampler=body.sampler)
+        if engine.score_take(audio2, sr2) > first_score:
+            sr, audio, used_seed = sr2, audio2, used_seed2
 
     if body.master:
         audio = engine.auto_master(audio, sr)
@@ -553,7 +726,6 @@ def generate(body: GenerateBody):
     path = engine.save_wav(audio, sr, body.prompt, target_dir=library.AUDIO_DIR)
 
     # Auto-backup every generated track to ~/Downloads/StemAI Backups/
-    # so tracks survive even if the app data directory is accidentally deleted.
     try:
         import shutil as _shutil
         _backup_dir = os.path.join(os.path.expanduser("~"), "Downloads", "StemAI Backups")
@@ -583,6 +755,70 @@ def generate(body: GenerateBody):
         pass
     return {"ok": True, "id": track_id, "seed": used_seed,
             "bpm": an["bpm"], "key": an["key"], "track": _track_json(_require(track_id))}
+
+
+@app.post("/api/generate")
+def generate(body: GenerateBody):
+    require_license()
+    if not body.prompt.strip():
+        raise HTTPException(400, "Enter a prompt")
+    try:
+        with engine.generation_session():
+            return _do_generate(body)
+    except engine._CancelledError:
+        raise HTTPException(499, "Generation cancelled")
+    except MemoryError as e:
+        raise HTTPException(507, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Generation failed: {e}")
+
+
+@app.post("/api/generate-start")
+def generate_start(body: GenerateBody):
+    """Background generation: returns a job_id immediately so the user can navigate
+    away while it runs. Poll /api/complete-status/{job_id} for progress + result.
+    Shares the single-generation guard with complete-the-song / add-instrument."""
+    require_license()
+    if not body.prompt.strip():
+        raise HTTPException(400, "Enter a prompt")
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy with another generation — wait for it to finish.")
+        import uuid
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 5, "kind": "generate"}
+
+        def worker():
+            try:
+                with _complete_lock:
+                    _complete_jobs[job_id].update({"state": "running", "pct": 30})
+                with engine.generation_session():
+                    result = _do_generate(body)
+                with _complete_lock:
+                    _complete_jobs[job_id].update({
+                        "state": "done", "pct": 100,
+                        "id": result["id"], "track": result["track"],
+                        "seed": result["seed"], "bpm": result["bpm"], "key": result["key"],
+                    })
+            except engine._CancelledError:
+                with _complete_lock:
+                    _complete_jobs[job_id].update({"state": "cancelled", "error": "Generation cancelled"})
+            except MemoryError as e:
+                with _complete_lock:
+                    _complete_jobs[job_id].update({"state": "error", "error": f"Out of memory: {e}"})
+            except Exception as e:
+                with _complete_lock:
+                    _complete_jobs[job_id].update({"state": "error", "error": f"Generation failed: {e}"})
+            finally:
+                with _complete_lock:
+                    if _active_complete.get("thread") is threading.current_thread():
+                        _active_complete["thread"] = None
+
+        thread = threading.Thread(target=worker, daemon=True)
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id}
 
 
 class TweakBody(BaseModel):
@@ -655,6 +891,43 @@ def tweak(track_id: int, body: TweakBody):
     library.update_track(new_id, prompt=new_prompt)
     return {"ok": True, "id": new_id, "new_prompt": new_prompt,
             "track": _track_json(_require(new_id))}
+
+
+class VariationsBody(BaseModel):
+    count: int = Field(default=3, ge=1, le=5)
+    steps: int = Field(default=8, ge=4, le=50)
+
+
+@app.post("/api/track/{track_id}/variations")
+def make_variations(track_id: int, body: VariationsBody):
+    """Generate N fresh takes of a track from its ORIGINAL prompt, each with a new
+    random seed. The original track is never touched — each variation is saved as a
+    new version of the same project so they sit together in the version history."""
+    t = _require(track_id)
+    prompt = (t.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(400, "This track has no prompt to vary.")
+    dur = max(4, min(float(t.get("duration") or 12), 60))
+
+    made = []
+    try:
+        with engine.generation_session():
+            for i in range(body.count):
+                # seed=None -> fresh random seed per take => genuinely different
+                sr, audio, used_seed = engine.generate(
+                    prompt=prompt, duration=dur, seed=None, steps=body.steps)
+                audio = engine.auto_master(audio, sr)
+                new_id = _save_version(audio, sr, t, f"variation {i + 1}",
+                                       title=t.get("title"), collection="Variations")
+                library.update_track(new_id, prompt=prompt, seed=used_seed)
+                made.append(_track_json(_require(new_id)))
+    except engine._CancelledError:
+        raise HTTPException(499, "Variations cancelled")
+    except MemoryError as e:
+        raise HTTPException(507, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Variations failed: {e}")
+    return {"ok": True, "variations": made, "count": len(made)}
 
 
 class ExtendBody(BaseModel):
@@ -736,7 +1009,7 @@ _active_complete: dict = {"thread": None}
 
 
 def _run_complete_job(job_id: str, track_id: int, prompt: str,
-                      model_size: str, guidance: float):
+                      model_size: str, guidance: float, arrangement=None):
     def on_progress(i: int, n: int, role: str):
         with _complete_lock:
             _complete_jobs[job_id].update({
@@ -748,7 +1021,8 @@ def _run_complete_job(job_id: str, track_id: int, prompt: str,
         with engine.generation_session():
             sr2, full, roles = engine.auto_finish(
                 prompt, audio, sr, model_size=model_size,
-                guidance=guidance, on_progress=on_progress)
+                guidance=guidance, on_progress=on_progress,
+                arrangement=arrangement)
         with _complete_lock:
             _complete_jobs[job_id].update({"state": "mastering", "pct": 95})
         structure = "intro → " + " → ".join(roles)
@@ -801,6 +1075,54 @@ def complete_song_start(track_id: int, body: CompleteBody):
         _active_complete["thread"] = thread
         thread.start()
     return {"ok": True, "job_id": job_id, "total": n_sections}
+
+
+# ── Song structure editor: build a song from a custom arrangement ────────────
+VALID_SECTIONS = ["Intro", "Verse", "Chorus", "Bridge", "Drop", "Outro"]
+
+
+class StructureSection(BaseModel):
+    role: str
+    duration: float = 12
+
+
+class StructureBody(BaseModel):
+    prompt: str = ""
+    model_size: str = "small"
+    guidance: float = 3.0
+    sections: list[StructureSection]
+
+
+@app.post("/api/track/{track_id}/structure-start")
+def structure_start(track_id: int, body: StructureBody):
+    """Build a full song from a USER-DEFINED arrangement (section blocks the user
+    ordered in the structure editor). Same background-job + polling as complete."""
+    import uuid
+    _require(track_id)
+    # sanitize the arrangement: known section names + clamped durations
+    arrangement = []
+    for s in body.sections:
+        role = s.role if s.role in VALID_SECTIONS else "Verse"
+        dur = max(4.0, min(float(s.duration or 12), 24.0))
+        arrangement.append((role, dur))
+    if not arrangement:
+        raise HTTPException(400, "Add at least one section")
+    if len(arrangement) > 12:
+        raise HTTPException(400, "Too many sections (max 12)")
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy — wait for the current job to finish.")
+        prompt = body.prompt.strip() or _require(track_id)["prompt"] or "continue the music"
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 3, "section": 0,
+                                  "total": len(arrangement), "role": "starting"}
+        thread = threading.Thread(target=_run_complete_job, daemon=True,
+                                  args=(job_id, track_id, prompt, body.model_size,
+                                        body.guidance, arrangement))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id, "total": len(arrangement)}
 
 
 @app.get("/api/complete-status/{job_id}")
@@ -884,6 +1206,205 @@ def add_instrument_start(track_id: int, body: AddInstrumentBody):
         _active_complete["thread"] = thread
         thread.start()
     return {"ok": True, "job_id": job_id}
+
+
+# ── Chat "producer mode": one message → parsed action → background job ────────
+class ChatBody(BaseModel):
+    message: str
+    model_size: str = "small"
+
+
+def _run_chat_job(job_id: str, track_id: int, action: dict, model_size: str):
+    def progress(state, pct):
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": state, "pct": pct})
+    try:
+        sr, audio, t = _load_arr(track_id)
+        kind = action.get("action")
+        progress("running", 25)
+        new_id = None
+        reply = ""
+
+        if kind == "chat":
+            # No edit — just an assistant reply, no new track.
+            with _complete_lock:
+                _complete_jobs[job_id].update({
+                    "state": "done", "pct": 100, "reply": action.get("reply") or "Got it.",
+                    "no_change": True,
+                })
+            return
+
+        with engine.generation_session():
+            if kind == "add_instrument":
+                prompt = (action.get("prompt") or "drums").strip()
+                sr2, out, _ = engine.add_layer(audio, sr, instrument_prompt=prompt,
+                                               blend="smart", volume=0.7, model_size=model_size)
+                new_id = _save_version(out, sr2, t, f"+ {prompt[:24]}", title=t["title"])
+                reply = f"Added {prompt}."
+            elif kind == "tweak":
+                tw = (action.get("tweak") or "").strip()
+                new_prompt = _merge_tweak(t["prompt"] or "", tw)
+                dur = max(4, min(int(t["duration"] or 8), 20))
+                s2, out, _ = engine.reference_generate(
+                    audio, sr, prompt=new_prompt, mode="restyle",
+                    duration=dur, model_size=model_size)
+                out = engine.auto_master(out, s2)
+                new_id = _save_version(out, s2, t, f"tweak: {tw[:20]}", title=t["title"])
+                reply = f"Reworked it: {tw}."
+            elif kind == "preset":
+                p = action.get("preset") or "stream-master"
+                if p in ("bass-boost", "bass_boost"):
+                    out = effects.compressor(effects.eq(audio, sr, low_gain=4.0), sr, threshold_db=-20, ratio=3)
+                elif p == "lofi":
+                    out = effects.reverb(effects.eq(effects.bitcrush(audio, sr, bits=10), sr, low_gain=2.0, mid_gain=-1.0, high_gain=-2.0), sr, amount=0.2, room=0.3)
+                else:
+                    out = effects.streaming_master(audio, sr, target_lufs=-14.0)
+                new_id = _save_version(out, sr, t, f"{p} preset", title=t["title"])
+                reply = f"Applied the {p} preset."
+            elif kind == "pitch":
+                st = int(action.get("semitones") or 0)
+                out = engine.pitch_shift(audio, sr, float(st))
+                new_id = _save_version(out, sr, t, f"pitch {st:+d}", title=t["title"])
+                reply = f"Shifted pitch {st:+d} semitones."
+            elif kind == "speed":
+                pct = int(action.get("speed_pct") or 100)
+                _, out = engine.change_speed(audio, sr, pct / 100.0)
+                new_id = _save_version(out, sr, t, f"speed {pct}%", title=t["title"])
+                reply = f"Set speed to {pct}%."
+            else:
+                with _complete_lock:
+                    _complete_jobs[job_id].update({
+                        "state": "done", "pct": 100, "no_change": True,
+                        "reply": "I wasn't sure how to do that — try rephrasing (e.g. 'add drums', 'make it darker').",
+                    })
+                return
+
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "done", "pct": 100, "id": new_id, "reply": reply,
+                "track": _track_json(_require(new_id)),
+            })
+    except engine._CancelledError:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "cancelled", "error": "Cancelled"})
+    except MemoryError as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Out of memory: {e}"})
+    except Exception as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Edit failed: {e}"})
+    finally:
+        with _complete_lock:
+            if _active_complete.get("thread") is threading.current_thread():
+                _active_complete["thread"] = None
+
+
+@app.post("/api/track/{track_id}/chat")
+def chat_producer(track_id: int, body: ChatBody):
+    """Producer-mode chat: parse the message into an action, run it as a background
+    job. Returns job_id + the parsed action (so the UI can show what it's doing).
+    Poll /api/complete-status/{job_id}; the result carries a 'reply' and (usually) a track."""
+    import uuid
+    t = _require(track_id)
+    if not body.message.strip():
+        raise HTTPException(400, "Type a message")
+    try:
+        from .groq_helper import parse_chat
+    except Exception:
+        from music_studio.groq_helper import parse_chat
+    action = parse_chat(body.message, prompt=t.get("prompt") or "",
+                        bpm=t.get("bpm"), key=t.get("musical_key"))
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy — wait for the current job to finish.")
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 5}
+        thread = threading.Thread(target=_run_chat_job, daemon=True,
+                                  args=(job_id, track_id, action, body.model_size))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id, "action": action}
+
+
+# ── Reference track matching: upload a song → generate in its style ──────────
+def _run_reference_job(job_id: str, ref_audio, ref_sr: int, prompt: str,
+                       mode: str, duration: float, model_size: str, title: str):
+    def progress(state, pct):
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": state, "pct": pct})
+    try:
+        progress("running", 25)
+        with engine.generation_session():
+            sr2, out, used_seed = engine.reference_generate(
+                ref_audio, ref_sr, prompt=prompt, mode=mode,
+                duration=duration, model_size=model_size)
+        progress("mastering", 90)
+        out = engine.auto_master(out, sr2)
+        an = engine.analyze(out, sr2)
+        path = engine.save_wav(out, sr2, title or "reference", target_dir=library.AUDIO_DIR)
+        base = os.path.splitext(path)[0]
+        cv = ""
+        try:
+            cv = engine.cover_art(prompt or title or "reference", base + "_cover.png",
+                                  bpm=an["bpm"], key=an["key"]) or ""
+        except Exception:
+            pass
+        new_id = library.add_track(
+            title=(title or "Reference track")[:80],
+            prompt=(prompt or f"in the style of {title}"),
+            negative="", duration=len(out) / sr2, model=model_size,
+            guidance=3.0, temperature=1.0, seed=used_seed, filepath=path,
+            cover_path=cv, sample_rate=sr2, bpm=an["bpm"], musical_key=an["key"],
+            collection="References")
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "done", "pct": 100, "id": new_id,
+                "track": _track_json(_require(new_id)),
+            })
+    except engine._CancelledError:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "cancelled", "error": "Cancelled"})
+    except MemoryError as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Out of memory: {e}"})
+    except Exception as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Reference generation failed: {e}"})
+    finally:
+        with _complete_lock:
+            if _active_complete.get("thread") is threading.current_thread():
+                _active_complete["thread"] = None
+
+
+@app.post("/api/reference-start")
+async def reference_start(file: UploadFile = File(...), prompt: str = Form(""),
+                         mode: str = Form("restyle"), duration: float = Form(12),
+                         model_size: str = Form("small")):
+    """Upload a reference song → generate in its style ('restyle', new original
+    track) or continue from it ('continue', extends the upload). Background job;
+    poll /api/complete-status/{job_id}. Saves to the 'References' collection."""
+    import uuid
+    require_license()
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "No file received")
+    ref_audio, ref_sr = _decode_upload_bytes(raw, file.filename or "reference")
+    title = os.path.splitext(file.filename or "Reference")[0][:60] or "Reference"
+    mode = "continue" if mode == "continue" else "restyle"
+    duration = max(4.0, min(float(duration or 12), 30.0))
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy — wait for the current job to finish.")
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 5}
+        thread = threading.Thread(target=_run_reference_job, daemon=True,
+                                  args=(job_id, ref_audio, ref_sr, prompt.strip(),
+                                        mode, duration, model_size, title))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id, "mode": mode}
 
 
 class SoundsLikeBody(BaseModel):
@@ -1013,6 +1534,31 @@ def preset(track_id: int, body: PresetBody):
         raise HTTPException(400, f"Unknown preset '{p}'")
     new_id = _save_version(out, sr, t, label, title=t["title"])
     return {"ok": True, "id": new_id, "track": _track_json(_require(new_id))}
+
+
+@app.get("/api/master-platforms")
+def master_platforms():
+    """List available mastering destinations for the UI."""
+    return [{"key": k, "label": v["label"], "lufs": v["lufs"]}
+            for k, v in effects.MASTER_PLATFORMS.items()]
+
+
+class MasterBody(BaseModel):
+    platform: str = "spotify"
+
+
+@app.post("/api/track/{track_id}/master")
+def master_track(track_id: int, body: MasterBody):
+    """Master a track for a specific platform (Spotify/Apple/Club/Podcast/Lo-Fi).
+    Fast (pure DSP, no model) → synchronous. Saves a new version."""
+    sr, audio, t = _load_arr(track_id)
+    cfg = effects.MASTER_PLATFORMS.get(body.platform)
+    if not cfg:
+        raise HTTPException(400, f"Unknown platform '{body.platform}'")
+    out = effects.master_for_platform(audio, sr, body.platform)
+    new_id = _save_version(out, sr, t, f"master: {cfg['label']}", title=t["title"])
+    return {"ok": True, "id": new_id, "platform": body.platform,
+            "track": _track_json(_require(new_id))}
 
 
 class ArrangeBody(BaseModel):
@@ -1186,6 +1732,126 @@ def split_stems(track_id: int):
         raise
     except Exception as e:
         raise HTTPException(500, f"Stem separation failed: {e}")
+
+
+# ── Mashup / stem remix across tracks ────────────────────────────────────────
+class MashupSelection(BaseModel):
+    track_id: int
+    stem: str            # one of ALL_STEM_NAMES (or "master" for the full track)
+    volume: float = 1.0
+
+
+class MashupBody(BaseModel):
+    selections: list[MashupSelection]
+    title: str = "Mashup"
+
+
+def _ensure_stems(track_id: int):
+    """Make sure a track is separated; separate on demand. Returns the track dict."""
+    t = _require(track_id)
+    have = [n for n in ALL_STEM_NAMES if os.path.exists(_stem_path(t, n))]
+    if len(have) < 4:
+        engine.separate_stems(t["filepath"], out_dir=_OUT_DIR)
+    return t
+
+
+def _run_mashup_job(job_id: str, selections: list, title: str):
+    import soundfile as sf, numpy as np
+    def progress(state, pct):
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": state, "pct": pct})
+    try:
+        progress("running", 10)
+        layers = []          # (audio, sr, volume)
+        base_bpm = None
+        n = len(selections)
+        for i, sel in enumerate(selections):
+            tid, stem, vol = sel["track_id"], sel["stem"], float(sel.get("volume", 1.0))
+            t = _require(tid)
+            if stem == "master":
+                path = t["filepath"]
+            else:
+                _ensure_stems(tid)                      # separate if needed (slow)
+                path = _stem_path(_require(tid), stem)
+            if not os.path.exists(path):
+                continue
+            a, sr = sf.read(path, dtype="float32")
+            if a.ndim > 1:
+                a = a.mean(axis=1)
+            if base_bpm is None:
+                base_bpm = float(t.get("bpm") or 120.0)
+            # tempo-align this layer to the FIRST track's BPM via time-stretch
+            this_bpm = float(t.get("bpm") or base_bpm)
+            if base_bpm and this_bpm and abs(this_bpm - base_bpm) > 1.0:
+                rate = this_bpm / base_bpm   # >1 speeds up to match a slower base
+                try:
+                    a = engine.time_stretch(a, sr, rate)
+                except Exception:
+                    pass
+            layers.append((a, sr, vol))
+            progress("running", 10 + int((i + 1) / max(1, n) * 70))
+
+        if not layers:
+            raise RuntimeError("No usable stems selected")
+        sr0 = layers[0][1]
+        # resample any mismatched layers to the first layer's sr, then mix to shortest
+        import librosa
+        norm = []
+        for a, sr, vol in layers:
+            if sr != sr0:
+                a = librosa.resample(a, orig_sr=sr, target_sr=sr0)
+            norm.append((a, vol))
+        length = min(len(a) for a, _ in norm)
+        mix = np.zeros(length, dtype=np.float32)
+        for a, vol in norm:
+            mix += a[:length] * vol
+        mix = engine.auto_master(mix, sr0)
+        progress("mastering", 92)
+
+        an = engine.analyze(mix, sr0)
+        path = engine.save_wav(mix, sr0, title, target_dir=library.AUDIO_DIR)
+        new_id = library.add_track(
+            title=title[:80], prompt="mashup", negative="",
+            duration=len(mix) / sr0, model="MASHUP", guidance=0, temperature=0,
+            seed=0, filepath=path, cover_path="", sample_rate=sr0,
+            bpm=an["bpm"], musical_key=an["key"], collection="Mashups")
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "done", "pct": 100, "id": new_id,
+                "track": _track_json(_require(new_id)),
+            })
+    except engine._CancelledError:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "cancelled", "error": "Cancelled"})
+    except Exception as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Mashup failed: {e}"})
+    finally:
+        with _complete_lock:
+            if _active_complete.get("thread") is threading.current_thread():
+                _active_complete["thread"] = None
+
+
+@app.post("/api/mashup-start")
+def mashup_start(body: MashupBody):
+    """Mix stems from different tracks into a new track. Each layer is tempo-aligned
+    to the FIRST selection's BPM. Background job (separation can be slow); poll
+    /api/complete-status/{job_id}. Saves to the 'Mashups' collection."""
+    import uuid
+    if not body.selections:
+        raise HTTPException(400, "Pick at least one stem")
+    sels = [s.model_dump() for s in body.selections]
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy — wait for the current job to finish.")
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 5}
+        thread = threading.Thread(target=_run_mashup_job, daemon=True,
+                                  args=(job_id, sels, body.title or "Mashup"))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id}
 
 
 @app.get("/api/stem-audio/{track_id}/{stem_name}")
@@ -1841,6 +2507,80 @@ def daw_project_save(track_id: int, body: ProjectBody):
     return project.save(track_id, body.state or {})
 
 
+# ── Loop / sample pack export ────────────────────────────────────────────────
+@app.get("/api/loop-pack/{track_id}")
+def loop_pack(track_id: int, bars: int = 4):
+    """Slice a track into beat-aligned loops and bundle them as a producer-ready
+    .zip. If the track is split into stems, each stem gets its own loop (drum loop,
+    bass loop, etc.); otherwise the full mix is looped. BPM + key go in filenames."""
+    import io, zipfile, soundfile as sf, numpy as np
+    t = _require(track_id)
+    if not t["filepath"] or not os.path.exists(t["filepath"]):
+        raise HTTPException(404, "Audio file not found")
+
+    bpm = float(t.get("bpm") or 120.0)
+    key = (t.get("musical_key") or "").replace(" ", "")
+    bars = max(1, min(int(bars), 16))
+    sec_per_beat = 60.0 / bpm
+    loop_sec = sec_per_beat * 4 * bars      # assume 4/4
+
+    base = (t["title"] or t["prompt"] or f"track{track_id}")[:40].strip()
+    base = "".join(c if c.isalnum() or c in " _-" else "_" for c in base).strip().replace(" ", "_") or f"track{track_id}"
+    tag = f"{round(bpm)}bpm" + (f"_{key}" if key else "")
+
+    def make_loop(audio, sr):
+        """Take a clean `bars`-bar slice from a strong point (skip the first beat)."""
+        start = int(sr * sec_per_beat)                  # skip ~1 beat of lead-in
+        n = int(sr * loop_sec)
+        seg = audio[start:start + n]
+        if len(seg) < n:                                 # short track — take from 0, pad
+            seg = audio[:n]
+        if len(seg) == 0:
+            return None
+        # tiny 5ms fades at the seam so the loop is click-free
+        f = min(int(sr * 0.005), len(seg) // 4)
+        if f > 0:
+            ramp = np.linspace(0, 1, f, dtype=np.float32)
+            seg = seg.copy(); seg[:f] *= ramp; seg[-f:] *= ramp[::-1]
+        return seg
+
+    buf = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # per-stem loops if separated
+        stems = {n: _stem_path(t, n) for n in ALL_STEM_NAMES if os.path.exists(_stem_path(t, n))}
+        if stems:
+            for name, p in stems.items():
+                a, sr = sf.read(p, dtype="float32")
+                if a.ndim > 1: a = a.mean(axis=1)
+                loop = make_loop(a, sr)
+                if loop is None or float(np.max(np.abs(loop))) < 0.001:
+                    continue   # skip silent stems
+                wav = io.BytesIO(); sf.write(wav, loop, sr, format="WAV")
+                zf.writestr(f"{base}_{name}_{bars}bar_{tag}.wav", wav.getvalue())
+                count += 1
+        # always include the full-mix loop
+        a, sr = sf.read(t["filepath"], dtype="float32")
+        if a.ndim > 1: a = a.mean(axis=1)
+        loop = make_loop(a, sr)
+        if loop is not None:
+            wav = io.BytesIO(); sf.write(wav, loop, sr, format="WAV")
+            zf.writestr(f"{base}_FULL_{bars}bar_{tag}.wav", wav.getvalue())
+            count += 1
+        # a little README
+        zf.writestr("README.txt",
+                    f"{base} — loop pack\nBPM: {round(bpm)}\nKey: {key or 'unknown'}\n"
+                    f"Loop length: {bars} bars ({loop_sec:.2f}s)\nFiles: {count}\n")
+
+    if count == 0:
+        raise HTTPException(500, "Could not build any loops")
+    buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{base}_loops_{tag}.zip"'})
+
+
 # ── Export in different audio formats (MP3 / FLAC / AIFF / WAV) ──────────────
 _EXPORT_FORMATS = {
     # ext: (ffmpeg args after -i, mime type)
@@ -2260,6 +3000,110 @@ async def vocals_generate(body: VocalsBody):
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Lyrics → full sung song (ACE-Step) ───────────────────────────────────────
+class SongBody(BaseModel):
+    lyrics: str = ""          # the user's own lyrics (blank → AI writes from `theme`)
+    theme: str = ""           # if no lyrics: what the song is about
+    style: str = "pop"        # music style description (e.g. "upbeat pop, female vocal")
+    duration: float = 40      # seconds (ACE-Step clamps 10-120)
+
+
+def _run_song_job(job_id: str, lyrics: str, theme: str, style: str, duration: float):
+    def progress(state, pct):
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": state, "pct": pct})
+    try:
+        import soundfile as sf
+        # 1. Lyrics — use the user's, or have Groq write them from the theme.
+        final_lyrics = lyrics.strip()
+        acestep_prompt = style.strip() or "pop, clear vocals"
+        if not final_lyrics:
+            progress("running", 15)
+            try:
+                final_lyrics, gen_style = vocals.write_lyrics(
+                    theme.strip() or "a song", style="sung", bars=8)
+                # prefer the user's style if they gave one, else Groq's
+                if not style.strip():
+                    acestep_prompt = gen_style
+            except Exception as e:
+                raise RuntimeError(f"Lyric writing failed (check Groq key): {e}")
+        progress("running", 30)
+
+        # 2. ACE-Step generates a FULL song (music + vocals) from lyrics + style.
+        audio, sr = vocals.generate_vocals(
+            lyrics=final_lyrics, acestep_prompt=acestep_prompt,
+            duration=max(10.0, min(120.0, float(duration))))
+        progress("mastering", 88)
+
+        # 3. Normalize, analyze, save to library.
+        import numpy as np
+        peak = float(np.abs(audio).max())
+        if peak > 1e-6:
+            audio = audio / peak * 0.92
+        an = engine.analyze(audio, sr)
+        title = (theme.strip() or final_lyrics.strip().split("\n")[0])[:50] or "AI Song"
+        path = engine.save_wav(audio, sr, title, target_dir=library.AUDIO_DIR)
+        new_id = library.add_track(
+            title=title, prompt=f"song: {style}", negative="",
+            duration=len(audio) / sr, model="ace-step", guidance=0, temperature=0,
+            seed=0, filepath=path, cover_path="", sample_rate=sr,
+            bpm=an["bpm"], musical_key=an["key"], collection="Songs",
+            notes=final_lyrics)
+        with _complete_lock:
+            _complete_jobs[job_id].update({
+                "state": "done", "pct": 100, "id": new_id, "lyrics": final_lyrics,
+                "track": _track_json(_require(new_id)),
+            })
+    except engine._CancelledError:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "cancelled", "error": "Cancelled"})
+    except MemoryError as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Out of memory: {e}"})
+    except Exception as e:
+        with _complete_lock:
+            _complete_jobs[job_id].update({"state": "error", "error": f"Song generation failed: {e}"})
+    finally:
+        with _complete_lock:
+            if _active_complete.get("thread") is threading.current_thread():
+                _active_complete["thread"] = None
+
+
+@app.post("/api/song-start")
+def song_start(body: SongBody):
+    """Lyrics → full sung song. Provide your own lyrics OR a theme (AI writes them),
+    plus a music style. ACE-Step generates music + vocals together. Background job;
+    poll /api/complete-status/{job_id}. Saves to the 'Songs' collection."""
+    import uuid
+    require_license()
+    if not body.lyrics.strip() and not body.theme.strip():
+        raise HTTPException(400, "Enter lyrics, or a theme for the AI to write about")
+    # Hardware guard: ACE-Step (3.5B) OOM-kills the engine on machines with too
+    # little memory. Refuse cleanly instead of crashing. Override with
+    # STEMAI_FORCE_SONG=1 if you know your machine can handle it.
+    if os.environ.get("STEMAI_FORCE_SONG") != "1":
+        try:
+            total_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        except Exception:
+            total_gb = 0
+        if total_gb and total_gb < 30:
+            raise HTTPException(
+                507,
+                "The full-song singer (ACE-Step) needs ~32GB+ RAM and won't run on "
+                f"this machine ({total_gb:.0f}GB). Use Generate + Vocals instead.")
+    with _complete_lock:
+        active = _active_complete.get("thread")
+        if active is not None and active.is_alive():
+            raise HTTPException(409, "The engine is busy — wait for the current job to finish.")
+        job_id = uuid.uuid4().hex[:12]
+        _complete_jobs[job_id] = {"state": "starting", "pct": 5}
+        thread = threading.Thread(target=_run_song_job, daemon=True,
+                                  args=(job_id, body.lyrics, body.theme, body.style, body.duration))
+        _active_complete["thread"] = thread
+        thread.start()
+    return {"ok": True, "job_id": job_id}
 
 
 if __name__ == "__main__":

@@ -8,9 +8,10 @@ interface Props {
   onExportMix: () => void;
   onExportStems: () => void;
   onBounce: (() => void) | null;   // null when no selection
+  onRevert?: () => void;           // discard autosaved session, reload originals
 }
 
-export default function FileMenu({ onSave, onLoad, onExportMix, onExportStems, onBounce }: Props) {
+export default function FileMenu({ onSave, onLoad, onExportMix, onExportStems, onBounce, onRevert }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -56,6 +57,8 @@ export default function FileMenu({ onSave, onLoad, onExportMix, onExportStems, o
           {item("Export Stems", "WAV ×N", onExportStems)}
           <div style={{ height: 1, background: C.line, margin: "4px 8px" }} />
           {item("Bounce Selection", onBounce ? "→ new track" : "select first", onBounce ?? (() => {}), !onBounce)}
+          {onRevert && <div style={{ height: 1, background: C.line, margin: "4px 8px" }} />}
+          {onRevert && item("Revert to Original", "discard edits", onRevert)}
         </div>
       )}
     </div>

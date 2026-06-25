@@ -209,15 +209,25 @@ def _load_acestep():
     import torch
     from acestep.pipeline_ace_step import ACEStepPipeline
 
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"[vocals] loading ACE-Step on {device}…")
+    # ACE-Step is a 3.5B model — on Apple's shared MPS memory it OOMs and HARD-
+    # KILLS the engine process (silent, no traceback) on 16GB Macs. ACE-Step's
+    # constructor force-upgrades CPU→MPS whenever MPS is available, with no arg to
+    # stop it. So to keep it on CPU we temporarily hide MPS from torch during load.
+    # Override with STEMAI_ACESTEP_DEVICE=mps on a big-memory machine to allow GPU.
+    want = os.environ.get("STEMAI_ACESTEP_DEVICE", "cpu").strip().lower()
+    print(f"[vocals] loading ACE-Step on {want}… (this is the heavy one — be patient)")
 
-    # ACE-Step downloads ~4GB of models to ~/.cache/huggingface on first run
-    _acestep_pipeline = ACEStepPipeline(
-        checkpoint_dir=None,   # auto-download from HuggingFace
-        dtype="float32",       # MPS needs float32 (bfloat16 not supported)
-        cpu_offload=False,
-    )
+    _orig_mps_avail = torch.backends.mps.is_available
+    try:
+        if want != "mps":
+            torch.backends.mps.is_available = lambda: False   # force CPU path
+        _acestep_pipeline = ACEStepPipeline(
+            checkpoint_dir=None,   # auto-download from HuggingFace
+            dtype="float32",
+            cpu_offload=True,      # keep peak memory down between diffusion steps
+        )
+    finally:
+        torch.backends.mps.is_available = _orig_mps_avail
     print("[vocals] ACE-Step ready")
     return _acestep_pipeline
 

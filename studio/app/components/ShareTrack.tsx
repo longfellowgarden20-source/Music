@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { API, fmtTime, type Track } from "../lib/api";
 
-const GUMROAD_URL = "https://gumroad.com/l/stemai"; // update when live
+const SOUNDCLOUD_UPLOAD = "https://soundcloud.com/upload"; // user's own upload page
 
 type Status = "idle" | "uploading" | "done" | "error";
 
@@ -37,7 +37,19 @@ export default function ShareTrack({ track }: { track: Track }) {
     setTimeout(() => setCopied(false), 2000);
   }
 
-  const caption = `"${track.title}" — made with StemAI\n${GUMROAD_URL}`;
+  // Seamless SoundCloud upload: download the WAV, then open the user's own
+  // SoundCloud upload page so they just drag the freshly-saved file in.
+  // (SoundCloud closed its upload API, so a true one-click push isn't possible —
+  // this gets them from StemAI to their upload screen in one tap.)
+  function uploadToSoundCloud() {
+    const a = document.createElement("a");
+    a.href = `${API}/api/download/${track.id}`;
+    a.download = `${track.title || "track"}.wav`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => window.open(SOUNDCLOUD_UPLOAD, "_blank", "noreferrer"), 600);
+  }
+
+  const caption = `"${track.title}" — made with StemAI`;
 
   return (
     <div style={{ marginTop: 12 }}>
@@ -102,6 +114,22 @@ export default function ShareTrack({ track }: { track: Track }) {
                   </button>
                 </div>
               </div>
+
+              {/* Seamless SoundCloud upload — downloads the track + opens the
+                  user's own upload page, ready to drag the file in. */}
+              <button onClick={uploadToSoundCloud}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                  border: "none", cursor: "pointer", width: "100%",
+                  fontSize: 13, fontWeight: 700,
+                  background: "linear-gradient(95deg, #ff7700, #ff3300)",
+                  color: "#fff", borderRadius: 8, padding: "11px 0",
+                }}>
+                ☁ Upload to SoundCloud
+              </button>
+              <p style={{ fontSize: 10, color: "var(--muted2)", margin: "-4px 0 0", textAlign: "center" }}>
+                Saves the track, then opens your SoundCloud upload page — just drag the file in.
+              </p>
 
               {/* Caption */}
               <div>

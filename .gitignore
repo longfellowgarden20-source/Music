@@ -6,9 +6,13 @@ __pycache__/
 
 # Virtual environments (the model deps are heavy — never commit)
 music_env/
+sa3_env/
 venv/
 .venv/
 env/
+
+# Local-only test scratch files (may contain tokens/keys)
+sa3_test.py
 
 # Generated audio, art, exports, and the local library DB
 music_output/

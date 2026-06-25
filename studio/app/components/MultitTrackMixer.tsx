@@ -47,17 +47,8 @@ export default function MultitTrackMixer({ track, onMerged }: {
   const pausedAt  = useRef(0);
 
   // ── Load stem info on open ────────────────────────────────────────────────
-  const loadStems = useCallback(async () => {
-    try {
-      const info = await api.stems(track.id);
-      if (info.separated) {
-        setSeparated(true);
-        await loadWaveforms();
-      }
-    } catch {}
-  }, [track.id]);
-
-  const loadWaveforms = async () => {
+  // Declared before loadStems so it can be a clean dependency (CLAUDE.md #3).
+  const loadWaveforms = useCallback(async () => {
     const next: Partial<Record<StemName, StemState>> = {};
     await Promise.all(STEMS.map(async s => {
       try {
@@ -67,7 +58,17 @@ export default function MultitTrackMixer({ track, onMerged }: {
       } catch {}
     }));
     setStems(next);
-  };
+  }, [track.id]);
+
+  const loadStems = useCallback(async () => {
+    try {
+      const info = await api.stems(track.id);
+      if (info.separated) {
+        setSeparated(true);
+        await loadWaveforms();
+      }
+    } catch {}
+  }, [track.id, loadWaveforms]);
 
   useEffect(() => { if (open) loadStems(); }, [open, loadStems]);
 
@@ -97,19 +98,22 @@ export default function MultitTrackMixer({ track, onMerged }: {
     });
   }
 
-  function applyMixToAudio() {
+  function applyMixToAudio(
+    curStems: Partial<Record<StemName, StemState>>,
+    curSoloed: StemName | null,
+  ) {
     STEMS.forEach(s => {
       const el = audioRefs.current[s];
-      const st = stems[s];
+      const st = curStems[s];
       if (!el || !st) return;
-      const isActive = soloed ? s === soloed : !st.muted;
+      const isActive = curSoloed ? s === curSoloed : !st.muted;
       el.volume = isActive ? st.volume : 0;
     });
   }
 
   async function togglePlay() {
     buildAudioElements();
-    applyMixToAudio();
+    applyMixToAudio(stems, soloed);
 
     if (playing) {
       STEMS.forEach(s => audioRefs.current[s]?.pause());
@@ -155,8 +159,41 @@ export default function MultitTrackMixer({ track, onMerged }: {
     STEMS.forEach(s => { const el = audioRefs.current[s]; if (el) el.currentTime = t; });
   }
 
-  // Update volumes live when mix changes
-  useEffect(() => { if (playing || currentTime > 0) applyMixToAudio(); }, [stems, soloed]);
+  // Update volumes live whenever sliders or mute/solo change
+  useEffect(() => { applyMixToAudio(stems, soloed); }, [stems, soloed]);
+
+  // ── Hotkeys (only active when mixer is open + stems loaded) ──────────────
+  useEffect(() => {
+    if (!open || Object.keys(stems).length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tgt = e.target as HTMLElement;
+      if (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA") return;
+
+      // Space — play/pause (don't double-fire with DAW handler)
+      if (e.code === "Space") { e.preventDefault(); e.stopPropagation(); togglePlay(); return; }
+
+      // Arrow keys — seek ±5 seconds
+      if (e.code === "ArrowLeft")  { e.preventDefault(); seek(Math.max(0, (currentTime - 5) / duration)); return; }
+      if (e.code === "ArrowRight") { e.preventDefault(); seek(Math.min(1, (currentTime + 5) / duration)); return; }
+
+      // 1/2/3/4 — mute toggle per stem
+      const stemByKey: Record<string, StemName> = { Digit1: "vocals", Digit2: "drums", Digit3: "bass", Digit4: "other" };
+      if (stemByKey[e.code] && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+        const s = stemByKey[e.code];
+        if (stems[s]) { e.preventDefault(); setStems(prev => ({ ...prev, [s]: { ...prev[s]!, muted: !prev[s]!.muted } })); }
+        return;
+      }
+
+      // Shift+1/2/3/4 — solo toggle per stem
+      if (stemByKey[e.code] && e.shiftKey) {
+        const s = stemByKey[e.code];
+        if (stems[s]) { e.preventDefault(); setSoloed(prev => prev === s ? null : s); }
+        return;
+      }
+    };
+    window.addEventListener("keydown", onKey, true); // capture so we beat the DAW handler
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, stems, soloed, playing, currentTime, duration]);
 
   // Cleanup on unmount
   useEffect(() => () => {
@@ -353,6 +390,25 @@ export default function MultitTrackMixer({ track, onMerged }: {
                 </div>
               );
             })}
+          </div>
+
+          {/* Hotkey legend */}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {[
+              ["Space", "play/pause"],
+              ["← →", "seek 5s"],
+              ["1–4", "mute stem"],
+              ["⇧1–4", "solo stem"],
+            ].map(([key, label]) => (
+              <div key={key} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <kbd style={{
+                  fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3,
+                  background: "var(--bg2)", border: "1px solid var(--line)", color: "var(--muted)",
+                  fontFamily: "'SF Mono', monospace",
+                }}>{key}</kbd>
+                <span style={{ fontSize: 9, color: "var(--muted2)" }}>{label}</span>
+              </div>
+            ))}
           </div>
 
           {/* Bounce */}

@@ -260,10 +260,49 @@ def _set_seed(seed: int | None) -> int:
     return seed
 
 
+def _sa3_engine():
+    """Return the Stable Audio 3 backend if it's selected+available, else None.
+    Used by generate/extend/reference_generate/add_layer/auto_finish so the WHOLE
+    app routes through the commercially-licensed engine when STEMAI_ENGINE=stableaudio3."""
+    try:
+        from . import stableaudio3_engine
+    except Exception:
+        return None
+    return stableaudio3_engine if stableaudio3_engine.is_enabled() else None
+
+
 def generate(prompt: str, duration: float = 8, model_size: str = "small",
-             guidance: float = 3.0, temperature: float = 1.0,
-             seed: int | None = None, negative: str = ""):
-    """Returns (sample_rate, np.float32 audio[mono], used_seed)."""
+             guidance: float = 3.0, temperature: float = 0.85,
+             seed: int | None = None, negative: str = "", steps: int | None = None,
+             sampler: str = "pingpong"):
+    """Returns (sample_rate, np.float32 audio[mono], used_seed).
+
+    `steps` is the Stable Audio 3 diffusion-step count (quality dial: ~8 fast,
+    ~16-25 higher quality). Ignored by the MusicGen path."""
+    # Route core text->music to a commercially-licensed backend when selected via
+    # STEMAI_ENGINE. Everything else (MusicGen path below) is untouched.
+    #   stableaudio3 -> Stable Audio 3 Small (Stability Community License, sellable,
+    #                   ~3s on Apple Silicon; runs in isolated sa3_env via subprocess)
+    #   acestep      -> ACE-Step (Apache-2.0; kept as an alternative)
+    try:
+        from . import stableaudio3_engine
+    except Exception:
+        stableaudio3_engine = None
+    if stableaudio3_engine and stableaudio3_engine.is_enabled():
+        # `guidance` from the UI maps to SA3's cfg_scale (prompt-faithfulness /
+        # variation dial). UI sends ~1-10; SA3 wants ~0.5-2.0, so scale it down.
+        cfg = max(0.3, min(2.5, (guidance or 5) / 5.0))
+        return stableaudio3_engine.generate(prompt, duration=duration, seed=seed,
+                                            steps=(steps or 8), cfg_scale=cfg,
+                                            sampler=sampler)
+
+    try:
+        from . import acestep_engine
+    except Exception:
+        acestep_engine = None
+    if acestep_engine and acestep_engine.is_enabled():
+        return acestep_engine.generate(prompt, duration=duration, seed=seed, guidance=max(1.0, guidance * 2))
+
     duration = safety_check(model_size, duration)   # caps duration / blocks if low RAM
     load_model(model_size)
     used_seed = _set_seed(seed)
@@ -314,12 +353,23 @@ def variations(prompt: str, n: int = 3, **kw):
 
 def extend(prompt: str, prior_audio: np.ndarray, prior_sr: int,
            add_duration: float = 8, model_size: str = "small",
-           guidance: float = 3.0, temperature: float = 1.0,
+           guidance: float = 3.0, temperature: float = 0.85,
            seed: int | None = None):
     """[#2] Continue an existing track — generate audio that flows from the
     tail of `prior_audio`, then concatenate. Uses MusicGen audio conditioning
     via the processor's audio input.
     Returns (sample_rate, combined_audio, used_seed)."""
+    _sa3 = _sa3_engine()
+    if _sa3:
+        # Generate a fresh continuation from the prompt and seam it onto the prior
+        # audio. (SA3 has no audio-priming, so the new part flows by description,
+        # not by literal continuation — but it's all on the sellable engine.)
+        sr2, new_part, used = _sa3.generate(prompt or "continue the music",
+                                            duration=max(4, add_duration), seed=seed)
+        import librosa
+        prior = prior_audio if prior_sr == sr2 else librosa.resample(prior_audio, orig_sr=prior_sr, target_sr=sr2)
+        return sr2, _seam(prior, new_part, sr2, 0.4), used
+
     load_model(model_size)
     used_seed = _set_seed(seed)
 
@@ -499,6 +549,20 @@ def reference_generate(ref_audio: np.ndarray, ref_sr: int, prompt: str = "",
     Note: this conditions on the reference's *style/vibe*, it does not clone the
     exact beat.
     """
+    _sa3 = _sa3_engine()
+    if _sa3:
+        # SA3 is text->audio (no melody conditioning), so we generate fresh audio
+        # from the prompt. For 'continue' we seam it onto the reference; for
+        # 'restyle' we return just the new styled audio. Keeps everything on the
+        # commercially-licensed engine.
+        text = prompt.strip() or "music in the same style as the reference"
+        sr2, styled, used = _sa3.generate(text, duration=duration, seed=seed)
+        if mode == "continue":
+            import librosa
+            ref = ref_audio if ref_sr == sr2 else librosa.resample(ref_audio, orig_sr=ref_sr, target_sr=sr2)
+            return sr2, _seam(ref, styled, sr2, 0.15), used
+        return sr2, styled, used
+
     load_model(model_size)
     used_seed = _set_seed(seed)
     target_sr = _model.config.audio_encoder.sampling_rate
@@ -544,6 +608,20 @@ def add_layer(base_audio: np.ndarray, base_sr: int, instrument_prompt: str,
 
     Returns (sample_rate, mixed_audio, used_seed).
     """
+    _sa3 = _sa3_engine()
+    if _sa3:
+        # Generate the new instrument from its prompt on SA3, then mix it under the
+        # base track (length-matched). SA3 has no melody conditioning, so 'smart'
+        # vs 'simple' both generate from the prompt; tempo/key still come through
+        # the prompt text the caller built.
+        dur = len(base_audio) / base_sr
+        sr2, layer, used = _sa3.generate(instrument_prompt, duration=max(4, dur), seed=seed)
+        import librosa
+        base = base_audio if base_sr == sr2 else librosa.resample(base_audio, orig_sr=base_sr, target_sr=sr2)
+        n = min(len(base), len(layer))
+        mix = base[:n] + layer[:n] * float(volume)
+        return sr2, normalize(mix), used
+
     load_model(model_size)
     used_seed = _set_seed(seed)
     target_sr = _model.config.audio_encoder.sampling_rate
@@ -569,7 +647,7 @@ def add_layer(base_audio: np.ndarray, base_sr: int, instrument_prompt: str,
 
     with torch.no_grad():
         out = _generate_tokens(**inputs, max_new_tokens=max_tokens,
-                              guidance_scale=guidance, do_sample=True, temperature=1.0)
+                              guidance_scale=guidance, do_sample=True, temperature=0.85)
     layer = out[0, 0].cpu().numpy().astype(np.float32)
     # smart mode echoes the prime at the head — drop it so the layer aligns to t=0
     if prime_len and len(layer) > prime_len:
@@ -618,16 +696,66 @@ def _biquad(audio, sr, kind, freq, q=0.707, gain_db=0.0):
     return lfilter(b, a, a0).astype(np.float32)
 
 
+def screech_guard(audio: np.ndarray, sr: int) -> np.ndarray:
+    """Detect and suppress high-frequency artifact screeching from MusicGen.
+
+    MusicGen token sampling at high temperatures can produce spurious tokens
+    that decode into brief 6–12kHz bursts. We detect by measuring HF RMS
+    in 50ms windows and soft-limit any window that spikes > 4× the median.
+    Much gentler than a brickwall filter — musical highs are left untouched.
+    """
+    from scipy.signal import lfilter
+    a = audio.astype(np.float32)
+
+    # rough 5kHz highpass to isolate the screechy band
+    try:
+        w0 = 2 * 3.14159265 * 5000 / sr
+        cw = np.cos(w0); sw = np.sin(w0); alpha = sw / (2 * 0.707)
+        b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = (1 + cw) / 2
+        a0c = 1 + alpha; a1 = -2 * cw; a2 = 1 - alpha
+        b = np.array([b0, b1, b2]) / a0c
+        ac = np.array([1.0, a1 / a0c, a2 / a0c])
+        hf = lfilter(b, ac, a).astype(np.float32)
+    except Exception:
+        return a
+
+    win = max(1, int(sr * 0.05))  # 50ms windows
+    hf_rms = np.array([np.sqrt(np.mean(hf[i:i+win]**2)) for i in range(0, len(hf), win)])
+    if hf_rms.size == 0:
+        return a
+    median_hf = float(np.median(hf_rms)) + 1e-9
+    threshold = max(median_hf * 4.0, 0.08)  # spike must be at least 4× median AND 8% peak
+
+    has_artifact = bool(np.any(hf_rms > threshold))
+    if not has_artifact:
+        return a
+
+    # Gentle 8kHz lowpass to tame the screech without killing air/brightness
+    try:
+        w0 = 2 * 3.14159265 * 8000 / sr
+        cw = np.cos(w0); sw = np.sin(w0); alpha = sw / (2 * 0.707)
+        b0 = (1 - cw) / 2; b1 = 1 - cw; b2 = (1 - cw) / 2
+        a0c = 1 + alpha; a1 = -2 * cw; a2 = 1 - alpha
+        b = np.array([b0, b1, b2]) / a0c
+        ac = np.array([1.0, a1 / a0c, a2 / a0c])
+        a = lfilter(b, ac, a).astype(np.float32)
+        print("[engine] screech_guard: HF artifact detected and suppressed")
+    except Exception as e:
+        print(f"[engine] screech_guard lowpass failed: {e}")
+    return a
+
+
 def auto_master(audio: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray:
     """Make raw model output sound 'produced':
-      1. high-pass to remove sub-bass mud/rumble
-      2. gentle low-mid cut (clears boxiness)
-      3. presence + air boost (clarity, sheen)
-      4. soft-knee compression (glue + loudness)
-      5. peak normalize
+      1. screech guard — suppress MusicGen HF artifacts before any processing
+      2. high-pass to remove sub-bass mud/rumble
+      3. gentle low-mid cut (clears boxiness)
+      4. presence + air boost (clarity, sheen)
+      5. soft-knee compression (glue + loudness)
+      6. peak normalize
     strength scales the EQ/compression amount (0..1.5).
     """
-    a = audio.astype(np.float32)
+    a = screech_guard(audio, sr)
     s = float(strength)
     try:
         a = _biquad(a, sr, "highpass", 35)                    # kill rumble
@@ -636,8 +764,8 @@ def auto_master(audio: np.ndarray, sr: int, strength: float = 1.0) -> np.ndarray
         a = _biquad(a, sr, "highshelf", 8000, gain_db=2.5 * s)     # air
     except Exception as e:
         print(f"[engine] EQ skipped: {e}")
-    # soft compression: tanh waveshaper acts as a smooth limiter/glue
-    drive = 1.0 + 1.3 * s
+    # soft compression: tanh waveshaper — drive capped at 1.8 to avoid distortion
+    drive = min(1.0 + 1.3 * s, 1.8)
     a = np.tanh(a * drive) / np.tanh(drive)
     return normalize(a, 0.97)
 
@@ -788,14 +916,23 @@ def region_replace(audio: np.ndarray, sr: int,
                    model_size: str = "small",
                    guidance: float = 4.0,
                    temperature: float = 0.95,
-                   xfade: float = 0.15,
+                   xfade: float = 0.25,
                    seed: int | None = None) -> tuple[np.ndarray, int]:
-    """Replace the audio between start_s and end_s with freshly generated music
-    that is conditioned on the audio just before the region (so it flows
-    naturally).  The joints are crossfaded.
+    """Replace the audio between start_s and end_s with freshly generated music.
+
+    When SA3 is active, uses native inpainting: the full track + a time-range mask
+    are passed to SA3 so it generates content that blends with the surrounding audio.
+    Falls back to the MusicGen prompt-conditioned approach when SA3 is off.
 
     Returns (new_full_audio, used_seed).
     """
+    _sa3 = _sa3_engine()
+    if _sa3:
+        new_audio, used_seed = _sa3.inpaint_region(
+            audio, sr, start_s, end_s, prompt,
+            steps=8, cfg_scale=1.0, seed=seed, xfade=xfade)
+        return new_audio, used_seed
+
     duration = end_s - start_s
     if duration <= 0:
         raise ValueError(f"end ({end_s}s) must be after start ({start_s}s)")
@@ -953,6 +1090,26 @@ def separate_stems(filepath: str, out_dir: str = None) -> dict:
     # M-series shared MPS limit (6.4 GB). Always run on CPU to avoid OOM.
     demucs_device = "cpu"
     print(f"[engine] Demucs running on {demucs_device} (forced; MPS OOMs on long tracks)")
+    # Resample to Demucs model rate (44100) if source differs. apply_model
+    # resamples internally and outputs at model.samplerate — writing stems back
+    # at the original `sr` when sr != model.samplerate stamps wrong header on
+    # the file (44100-Hz samples tagged as 32000 Hz), making every stem play
+    # ~37% too fast and cut off early in the DAW.
+    demucs_sr = _demucs.samplerate
+    if sr != demucs_sr:
+        try:
+            import librosa
+            resampled = librosa.resample(data.T, orig_sr=sr, target_sr=demucs_sr)
+            wav = torch.from_numpy(resampled)
+        except Exception:
+            pass  # fall through with original wav; slight pitch-shift but won't truncate
+        if wav.shape[0] == 1:
+            wav = wav.repeat(2, 1)
+        elif wav.shape[0] > 2:
+            wav = wav[:2]
+        ref = wav.mean(0)
+        wav = (wav - ref.mean()) / (ref.std() + 1e-8)
+
     with torch.no_grad():
         sources = apply_model(_demucs, wav[None], device=demucs_device,
                               progress=True)[0]
@@ -968,7 +1125,7 @@ def separate_stems(filepath: str, out_dir: str = None) -> dict:
     for name, src in zip(names, sources):
         mono = src.mean(0).cpu().numpy().astype(np.float32)
         path = os.path.join(out_dir, f"{base}_{name}.wav")
-        sf.write(path, mono, sr)
+        sf.write(path, mono, demucs_sr)  # always write at Demucs output rate (44100)
         out[name] = path
     return out
 

@@ -26,6 +26,8 @@ export default function EditStudio() {
   const [busy, setBusy] = useState<Busy>(null);
   const [status, setStatus] = useState("");
   const [notes, setNotes] = useState("");
+  // producer-mode chat history (user + assistant turns)
+  const [chatLog, setChatLog] = useState<{ role: "you" | "ai"; text: string }[]>([]);
 
   const loadTrack = useCallback((id: number) => {
     api.track(id).then(t => {
@@ -98,6 +100,30 @@ export default function EditStudio() {
     }
   };
 
+  // Build a song from a custom arrangement (structure editor).
+  const runStructure = async (sections: { role: string; duration: number }[], prompt: string) => {
+    if (!track || !sections.length) return;
+    setBusy("structure");
+    setStatus("Building your structure…");
+    progress.set(3, "Structure…");
+    try {
+      const r = await api.structure(track.id, sections, prompt, (p) =>
+        progress.set(p.pct, p.role === "starting" ? "Structure · warming up…" : `Structure · ${p.role} (${p.section}/${p.total})`));
+      setStatus(`✅ Built → #${r.id}`);
+      router.replace(`/edit?id=${r.id}`);
+      setTrack(r.track);
+      setNotes(r.track.notes || "");
+      api.versions(r.id).then(setVersions).catch(() => {});
+      play(r.track);
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      setStatus(/cancel/i.test(msg) ? "🛑 Stopped" : `❌ ${msg}`);
+    } finally {
+      setBusy(null);
+      progress.finish();
+    }
+  };
+
   // Add an AI instrument layer (drums/bass/keys/custom). Same poll pattern.
   const runAddInstrument = async (prompt: string, label: string) => {
     if (!track) return;
@@ -119,6 +145,34 @@ export default function EditStudio() {
     } catch (e) {
       const msg = (e as Error).message || "";
       setStatus(/cancel/i.test(msg) ? "🛑 Stopped" : `❌ ${msg}`);
+    } finally {
+      setBusy(null);
+      progress.finish();
+    }
+  };
+
+  // Producer-mode chat: send a message, AI edits the track, switch to the result.
+  const runChat = async (message: string) => {
+    if (!track || !message.trim()) return;
+    setChatLog(l => [...l, { role: "you", text: message }]);
+    setBusy("chat");
+    progress.set(8, "Producer…");
+    try {
+      const r = await api.chat(track.id, message, (p) => progress.set(p.pct, "Producer…"));
+      setChatLog(l => [...l, { role: "ai", text: r.reply }]);
+      if (r.track && r.id && !r.no_change) {
+        router.replace(`/edit?id=${r.id}`);
+        setTrack(r.track);
+        setNotes(r.track.notes || "");
+        api.versions(r.id).then(setVersions).catch(() => {});
+        play(r.track);
+        setStatus(`✅ ${r.reply}`);
+      } else {
+        setStatus("");
+      }
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      setChatLog(l => [...l, { role: "ai", text: /cancel/i.test(msg) ? "Stopped." : `Couldn't do that: ${msg}` }]);
     } finally {
       setBusy(null);
       progress.finish();
@@ -183,7 +237,7 @@ export default function EditStudio() {
           alignItems: "center", gap: 10,
           color: status.startsWith("✅") ? "var(--green)" : status.startsWith("❌") ? "var(--red)" : "var(--muted)" }}>
           <span style={{ flex: 1 }}>{status}</span>
-          {["tweak", "region", "extend", "complete", "add_instrument"].includes(busy || "") && (
+          {["tweak", "region", "extend", "complete", "add_instrument", "chat", "structure"].includes(busy || "") && (
             <button onClick={onStop} title="Stop now"
               style={{ padding: "5px 12px", fontSize: 12, fontWeight: 700, borderRadius: 6,
                 background: "var(--red, #ef4444)", color: "#fff", border: "none", cursor: "pointer" }}>
@@ -192,6 +246,11 @@ export default function EditStudio() {
         </div>}
 
         {/* AI TWEAK */}
+        {/* PRODUCER CHAT */}
+        <Panel title="💬 Producer — tell the AI what to change">
+          <ChatBox busy={busy} log={chatLog} onSend={runChat} />
+        </Panel>
+
         <Panel title="🤖 AI Tweak — describe a change">
           <TweakBox track={track} busy={busy} run={run} />
         </Panel>
@@ -209,6 +268,11 @@ export default function EditStudio() {
         {/* COMPLETE THE SONG */}
         <Panel title="🎼 Complete the song — build a full arrangement">
           <CompleteBox track={track} busy={busy} onRun={runComplete} />
+        </Panel>
+
+        {/* SONG STRUCTURE EDITOR */}
+        <Panel title="🧱 Song structure — arrange the sections yourself">
+          <StructureBox busy={busy} onRun={runStructure} />
         </Panel>
 
         {/* ADD INSTRUMENT */}
@@ -238,6 +302,11 @@ export default function EditStudio() {
           </div>
         </Panel>
 
+        {/* MASTER FOR PLATFORM */}
+        <Panel title="🎚 Master for a platform">
+          <MasterBox track={track} busy={busy} run={run} />
+        </Panel>
+
         {/* PITCH / SPEED / FADE */}
         <Panel title="🎛 Pitch · Speed · Fade">
           <PitchSpeedFade track={track} busy={busy} run={run} />
@@ -259,23 +328,12 @@ export default function EditStudio() {
         <button className="btn" onClick={() => router.push("/")}>← Back to Library</button>
 
         {/* version history */}
-        <div className="card" style={{ padding: 16 }}>
-          <div className="label" style={{ marginBottom: 10 }}>Version history</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 280, overflowY: "auto" }}>
-            {versions.length === 0 && <div style={{ fontSize: 12, color: "var(--muted2)" }}>No versions yet.</div>}
-            {versions.slice().reverse().map(v => (
-              <button key={v.id} onClick={() => { router.replace(`/edit?id=${v.id}`); loadTrack(v.id); }}
-                style={{
-                  textAlign: "left", background: v.id === track.id ? "var(--bg3)" : "transparent",
-                  border: `1px solid ${v.id === track.id ? "var(--accent)" : "var(--line)"}`,
-                  borderRadius: 8, padding: "7px 10px", cursor: "pointer", color: "var(--text)"
-                }}>
-                <div style={{ fontSize: 12, fontWeight: 700 }}>v{v.version} · #{v.id}</div>
-                <div style={{ fontSize: 11, color: "var(--muted)" }}>{v.edit_label || "original"}</div>
-              </button>
-            ))}
-          </div>
-        </div>
+        <VersionsPanel
+          versions={versions}
+          currentId={track.id}
+          onOpen={(id) => { router.replace(`/edit?id=${id}`); loadTrack(id); }}
+          onDeleted={(remaining) => setVersions(remaining)}
+        />
 
         {/* duplicate */}
         <button className="btn" disabled={!!busy}
@@ -329,6 +387,183 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
     <div className="card" style={{ padding: 16 }}>
       <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>{title}</div>
       {children}
+    </div>
+  );
+}
+
+// Short "2h ago" style timestamp from an ISO / sqlite date string.
+function timeAgo(iso?: string): string {
+  if (!iso) return "";
+  const then = new Date(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z").getTime();
+  if (isNaN(then)) return "";
+  const s = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (s < 45) return "just now";
+  if (s < 90) return "1 min ago";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  if (d < 7) return `${d}d ago`;
+  return new Date(then).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function VersionsPanel({ versions, currentId, onOpen, onDeleted }: {
+  versions: Track[];
+  currentId: number;
+  onOpen: (id: number) => void;
+  onDeleted: (remaining: Track[]) => void;
+}) {
+  const { play, toggle, current, playing } = usePlayer();
+  const [confirmId, setConfirmId] = useState<number | null>(null);
+  const [deleting, setDeleting] = useState<number | null>(null);
+
+  // newest at the top
+  const ordered = versions.slice().sort((a, b) => b.version - a.version);
+  const latestVersion = ordered.length ? ordered[0].version : 1;
+
+  const del = async (v: Track) => {
+    setDeleting(v.id);
+    try {
+      const r = await api.deleteVersion(currentId, v.id);
+      onDeleted(r.versions);
+      // if we deleted the one we're editing, jump to the newest remaining
+      if (v.id === currentId && r.versions.length) {
+        const newest = r.versions.slice().sort((a, b) => b.version - a.version)[0];
+        onOpen(newest.id);
+      }
+    } catch {
+      /* guarded server-side; ignore */
+    } finally {
+      setDeleting(null);
+      setConfirmId(null);
+    }
+  };
+
+  return (
+    <div className="card" style={{ padding: 16 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+        <div className="label">Versions</div>
+        <div style={{ fontSize: 11, color: "var(--muted2)" }}>
+          {versions.length} take{versions.length === 1 ? "" : "s"}
+        </div>
+      </div>
+      <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 12, lineHeight: 1.4 }}>
+        Every edit is saved as a new take — nothing is lost. Play any one to compare.
+      </div>
+
+      {ordered.length === 0 && (
+        <div style={{ fontSize: 12, color: "var(--muted2)" }}>No versions yet.</div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", maxHeight: 420, overflowY: "auto", margin: "0 -4px", padding: "0 4px" }}>
+        {ordered.map((v, i) => {
+          const isCurrent = v.id === currentId;
+          const isPlaying = current?.id === v.id && playing;
+          const isOriginal = v.version === 1;
+          const isLatest = v.version === latestVersion;
+          return (
+            <div key={v.id} style={{ display: "flex", gap: 10, position: "relative" }}>
+              {/* timeline rail + dot */}
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", width: 14, flexShrink: 0 }}>
+                <div style={{
+                  width: 10, height: 10, borderRadius: "50%", marginTop: 16, zIndex: 1,
+                  background: isCurrent ? "var(--accent)" : "var(--bg3)",
+                  border: `2px solid ${isCurrent ? "var(--accent)" : "var(--line)"}`,
+                  boxShadow: isCurrent ? "0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent)" : "none",
+                }} />
+                {i < ordered.length - 1 && (
+                  <div style={{ flex: 1, width: 2, background: "var(--line)", marginTop: 2 }} />
+                )}
+              </div>
+
+              {/* card */}
+              <div
+                onClick={() => !isCurrent && onOpen(v.id)}
+                style={{
+                  flex: 1, marginBottom: 10, borderRadius: 10, padding: "9px 11px",
+                  cursor: isCurrent ? "default" : "pointer",
+                  background: isCurrent ? "color-mix(in srgb, var(--accent) 10%, var(--bg2))" : "var(--bg2)",
+                  border: `1px solid ${isCurrent ? "var(--accent)" : "var(--line)"}`,
+                  transition: "border-color .15s, background .15s",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {/* play / pause this version */}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); current?.id === v.id ? toggle() : play(v); }}
+                    title={isPlaying ? "Pause" : "Play this version"}
+                    style={{
+                      width: 30, height: 30, borderRadius: "50%", flexShrink: 0, border: "none", cursor: "pointer",
+                      background: isPlaying ? "var(--accent)" : "var(--bg3)",
+                      color: isPlaying ? "#06210f" : "var(--text)", fontSize: 12, lineHeight: 1,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                    }}
+                  >{isPlaying ? "⏸" : "▶"}</button>
+
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 13, fontWeight: 800 }}>v{v.version}</span>
+                      {isCurrent && (
+                        <span style={{ fontSize: 9, fontWeight: 800, letterSpacing: 0.5, color: "#06210f",
+                          background: "var(--accent)", borderRadius: 4, padding: "1px 5px" }}>NOW EDITING</span>
+                      )}
+                      {!isCurrent && isLatest && (
+                        <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, color: "var(--accent)",
+                          border: "1px solid var(--accent)", borderRadius: 4, padding: "0 5px" }}>LATEST</span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--muted)", whiteSpace: "nowrap",
+                      overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {isOriginal ? "🌱 Original" : (v.edit_label || "edit")}
+                    </div>
+                  </div>
+
+                  <span style={{ fontSize: 10, color: "var(--muted2)", flexShrink: 0 }}>{timeAgo(v.created_at)}</span>
+                </div>
+
+                {/* actions row */}
+                {confirmId === v.id ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}
+                    onClick={(e) => e.stopPropagation()}>
+                    <span style={{ fontSize: 11, color: "var(--muted)", flex: 1 }}>Delete this take?</span>
+                    <button onClick={() => del(v)} disabled={deleting === v.id}
+                      style={{ fontSize: 11, fontWeight: 700, border: "none", borderRadius: 6, cursor: "pointer",
+                        padding: "4px 10px", background: "var(--red, #ef4444)", color: "#fff" }}>
+                      {deleting === v.id ? "…" : "Delete"}
+                    </button>
+                    <button onClick={() => setConfirmId(null)}
+                      style={{ fontSize: 11, border: "1px solid var(--line)", borderRadius: 6, cursor: "pointer",
+                        padding: "4px 10px", background: "transparent", color: "var(--muted)" }}>
+                      Keep
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}
+                    onClick={(e) => e.stopPropagation()}>
+                    {!isCurrent && (
+                      <button onClick={() => onOpen(v.id)}
+                        style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", background: "none",
+                          border: "none", cursor: "pointer", padding: 0 }}>
+                        ✎ Edit this take
+                      </button>
+                    )}
+                    <a href={api.downloadUrl(v.id)} onClick={(e) => e.stopPropagation()}
+                      style={{ fontSize: 11, color: "var(--muted)", textDecoration: "none" }}>⬇ Download</a>
+                    {versions.length > 1 && (
+                      <button onClick={() => setConfirmId(v.id)} title="Delete this take"
+                        style={{ fontSize: 11, color: "var(--muted2)", background: "none", border: "none",
+                          cursor: "pointer", padding: 0, marginLeft: "auto" }}>
+                        🗑
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -412,6 +647,212 @@ const INSTRUMENT_PRESETS: { key: string; label: string; emoji: string; prompt: s
   { key: "bass",  label: "Bass",  emoji: "🎸", prompt: "add a bass line that follows this track's groove and key" },
   { key: "keys",  label: "Keys",  emoji: "🎹", prompt: "add a complementary piano / keys part that fits this track's chords and mood" },
 ];
+
+const CHAT_SUGGESTIONS = ["make it darker", "add drums", "more energy", "make it slower", "add a piano", "master it for streaming"];
+
+function ChatBox({ busy, log, onSend }: {
+  busy: Busy; log: { role: "you" | "ai"; text: string }[]; onSend: (m: string) => void;
+}) {
+  const [msg, setMsg] = useState("");
+  const disabled = !!busy;
+  const send = () => { if (msg.trim() && !disabled) { onSend(msg.trim()); setMsg(""); } };
+
+  // AI mode: optional user-supplied Groq key unlocks full natural-language
+  // understanding. Without it, Producer still works via keyword matching.
+  const [aiOn, setAiOn] = useState<boolean | null>(null);
+  const [keyOpen, setKeyOpen] = useState(false);
+  const [keyVal, setKeyVal] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+  const [keyErr, setKeyErr] = useState("");
+  useEffect(() => { api.groqKeyStatus().then(r => setAiOn(r.configured)).catch(() => setAiOn(false)); }, []);
+  const saveKey = async () => {
+    if (!keyVal.trim()) return;
+    setSavingKey(true); setKeyErr("");
+    try { const r = await api.addGroqKey(keyVal.trim()); setAiOn(r.configured); setKeyOpen(false); setKeyVal(""); }
+    catch (e) { setKeyErr((e as Error).message || "That key didn't work."); }
+    setSavingKey(false);
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ fontSize: 12, color: "var(--muted)" }}>
+        Talk to it like a producer. Each message edits the track and becomes the new
+        version — keep going to refine it.
+      </div>
+
+      {/* conversation */}
+      {log.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto",
+          background: "var(--bg, #0b0e13)", border: "1px solid var(--bg3)", borderRadius: 8, padding: 10 }}>
+          {log.map((m, i) => (
+            <div key={i} style={{ alignSelf: m.role === "you" ? "flex-end" : "flex-start", maxWidth: "85%" }}>
+              <div style={{
+                fontSize: 12.5, lineHeight: 1.45, padding: "6px 11px", borderRadius: 12,
+                background: m.role === "you" ? "linear-gradient(95deg,var(--accent),var(--accent2))" : "var(--bg3)",
+                color: m.role === "you" ? "#06210f" : "var(--text, #e8e8ec)",
+                fontWeight: m.role === "you" ? 600 : 400,
+              }}>{m.text}</div>
+            </div>
+          ))}
+          {busy === "chat" && (
+            <div style={{ alignSelf: "flex-start", fontSize: 12, color: "var(--muted)", display: "flex", gap: 6, alignItems: "center" }}>
+              <span className="spinner" /> working on it…
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* suggestion chips (only before the first message) */}
+      {log.length === 0 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {CHAT_SUGGESTIONS.map(s => (
+            <button key={s} className="btn" disabled={disabled} style={{ fontSize: 11, padding: "4px 10px", color: "var(--muted)" }}
+              onClick={() => onSend(s)}>{s}</button>
+          ))}
+        </div>
+      )}
+
+      {/* input */}
+      <div style={{ display: "flex", gap: 8 }}>
+        <input className="input" value={msg} onChange={e => setMsg(e.target.value)}
+          placeholder='e.g. "make the drums punchier", "add a breakdown", "warmer and slower"'
+          onKeyDown={e => { if (e.key === "Enter") send(); }} />
+        <button className="btn btn-primary" disabled={disabled || !msg.trim()} onClick={send}>
+          {busy === "chat" ? <span className="spinner" /> : "Send"}
+        </button>
+      </div>
+
+      {/* AI mode footer — smart understanding via the user's own (optional) Groq key */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "var(--muted)" }}>
+        <span style={{
+          width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
+          background: aiOn ? "#4fd1a5" : "#6c6c78",
+        }} />
+        {aiOn === null ? "Checking AI mode…"
+          : aiOn ? "Smart AI mode on — full natural language."
+          : "Basic mode — understands common commands."}
+        <button className="btn" style={{ marginLeft: "auto", fontSize: 10, padding: "3px 9px" }}
+          onClick={() => setKeyOpen(o => !o)}>
+          {aiOn ? "Change key" : "Add AI key"}
+        </button>
+      </div>
+      {keyOpen && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 10, background: "var(--bg, #0b0e13)", border: "1px solid var(--bg3)", borderRadius: 8 }}>
+          <div style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.5 }}>
+            Adding your free Groq key enhances Producer — it understands nuanced, multi-part
+            requests ("make it dreamier and more spacious with a half-time groove") instead of
+            just common commands. Free, stored locally, add as many as you like. Get one at{" "}
+            <a href="https://console.groq.com/keys" target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>console.groq.com/keys</a>.
+            Manage all keys in <a href="/settings" style={{ color: "var(--accent)" }}>Settings</a>.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input className="input" type="password" value={keyVal} placeholder="gsk_…"
+              onChange={e => setKeyVal(e.target.value)} onKeyDown={e => { if (e.key === "Enter") saveKey(); }} />
+            <button className="btn btn-primary" disabled={savingKey || !keyVal.trim()} onClick={saveKey}>
+              {savingKey ? <span className="spinner" /> : "Verify & add"}
+            </button>
+          </div>
+          {keyErr && <div style={{ fontSize: 11, color: "#e0564e" }}>{keyErr}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const SECTION_TYPES = ["Intro", "Verse", "Chorus", "Bridge", "Drop", "Outro"];
+const SECTION_COLOR: Record<string, string> = {
+  Intro: "#5b9bd5", Verse: "#4fd1a5", Chorus: "#e0954f",
+  Bridge: "#b06ec4", Drop: "#d56b8a", Outro: "#7a8ad5",
+};
+
+function StructureBox({ busy, onRun }: { busy: Busy; onRun: (sections: { role: string; duration: number }[], prompt: string) => void }) {
+  const [sections, setSections] = useState<{ role: string; duration: number }[]>([
+    { role: "Verse", duration: 12 }, { role: "Chorus", duration: 14 },
+    { role: "Verse", duration: 12 }, { role: "Outro", duration: 10 },
+  ]);
+  const [prompt, setPrompt] = useState("");
+  const disabled = !!busy;
+  const total = sections.reduce((s, x) => s + x.duration, 0);
+
+  const move = (i: number, dir: -1 | 1) => setSections(s => {
+    const j = i + dir; if (j < 0 || j >= s.length) return s;
+    const n = [...s]; [n[i], n[j]] = [n[j], n[i]]; return n;
+  });
+  const remove = (i: number) => setSections(s => s.filter((_, k) => k !== i));
+  const setLen = (i: number, d: number) => setSections(s => s.map((x, k) => k === i ? { ...x, duration: d } : x));
+  const setRole = (i: number, r: string) => setSections(s => s.map((x, k) => k === i ? { ...x, role: r } : x));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ fontSize: 12, color: "var(--muted)" }}>
+        Lay out the song your way — order the sections, set each length, then build.
+        Total: <b style={{ color: "var(--text, #e8e8ec)" }}>~{total}s</b>.
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {sections.map((s, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg, #0b0e13)",
+            border: `1px solid ${SECTION_COLOR[s.role] || "var(--bg3)"}55`, borderRadius: 8, padding: "6px 8px" }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: SECTION_COLOR[s.role], flexShrink: 0 }} />
+            <select className="input" style={{ width: "auto", fontSize: 12 }} value={s.role} onChange={e => setRole(i, e.target.value)}>
+              {SECTION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <input type="range" min={4} max={24} step={1} value={s.duration}
+              onChange={e => setLen(i, parseInt(e.target.value))} style={{ flex: 1, accentColor: "var(--accent)" }} />
+            <span style={{ fontSize: 11, color: "var(--muted)", minWidth: 28, fontFamily: "var(--mono, monospace)" }}>{s.duration}s</span>
+            <button className="btn" style={{ padding: "2px 7px", fontSize: 10 }} disabled={i === 0} onClick={() => move(i, -1)}>▲</button>
+            <button className="btn" style={{ padding: "2px 7px", fontSize: 10 }} disabled={i === sections.length - 1} onClick={() => move(i, 1)}>▼</button>
+            <button className="btn" style={{ padding: "2px 7px", fontSize: 11, color: "var(--red)" }} onClick={() => remove(i)}>✕</button>
+          </div>
+        ))}
+      </div>
+
+      {/* add section chips */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {SECTION_TYPES.map(t => (
+          <button key={t} className="btn" disabled={disabled || sections.length >= 12} style={{ fontSize: 11, padding: "4px 10px", color: SECTION_COLOR[t] }}
+            onClick={() => setSections(s => [...s, { role: t, duration: t === "Chorus" ? 14 : 12 }])}>+ {t}</button>
+        ))}
+      </div>
+
+      <input className="input" value={prompt} onChange={e => setPrompt(e.target.value)}
+        placeholder="overall direction? (blank = same vibe as this track)" />
+      <button className="btn btn-primary" disabled={disabled || !sections.length}
+        onClick={() => onRun(sections, prompt)}>
+        {busy === "structure" ? <span className="spinner" /> : `🧱 Build this structure (${sections.length} sections)`}
+      </button>
+      <div style={{ fontSize: 11, color: "var(--muted)", opacity: .8 }}>
+        Each section is generated to flow from the last — takes a few minutes. Saves to “Full Songs”.
+      </div>
+    </div>
+  );
+}
+
+function MasterBox({ track, busy, run }: { track: Track; busy: Busy; run: RunFn }) {
+  const [platforms, setPlatforms] = useState<{ key: string; label: string; lufs: number }[]>([]);
+  useEffect(() => { api.masterPlatforms().then(setPlatforms).catch(() => {}); }, []);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ fontSize: 12, color: "var(--muted)" }}>
+        One-click master tuned for where it'll be heard — sets the right loudness
+        (LUFS) and tone for each destination. Saves a new version.
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {platforms.map(p => (
+          <button key={p.key} className="btn" disabled={!!busy}
+            style={{ fontSize: 12, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 1, padding: "8px 12px" }}
+            onClick={() => run(`master-${p.key}`, () => api.master(track.id, p.key), `Mastered for ${p.label}`)}>
+            {busy === `master-${p.key}` ? <span className="spinner" /> : (
+              <>
+                <span style={{ fontWeight: 700 }}>{p.label}</span>
+                <span style={{ fontSize: 10, color: "var(--muted)" }}>{p.lufs} LUFS</span>
+              </>
+            )}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function AddInstrumentBox({ busy, onRun }: { busy: Busy; onRun: (prompt: string, label: string) => void }) {
   const [custom, setCustom] = useState("");

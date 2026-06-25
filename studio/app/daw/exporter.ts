@@ -158,6 +158,107 @@ function buildNativeEffect(oac: OfflineAudioContext, eff: TrackEffect): AudioNod
       entry.connect(dryGain); entry.connect(ws);
       return [entry, merge];
     }
+    case "deesser": {
+      // narrow peaking cut on the sibilance band — exact offline match
+      const f = oac.createBiquadFilter();
+      f.type = "peaking";
+      f.frequency.value = p.freq ?? 6500;
+      f.gain.value = -(p.amount ?? 8);
+      f.Q.value = p.q ?? 3;
+      return [f, f];
+    }
+    case "doubler": {
+      // bake as a short fixed delay + dry mix (thickening). True per-voice detune
+      // needs time-domain modulation OfflineAudioContext can't do, so we use the
+      // same approach as offline chorus.
+      const wet = p.wet ?? 0.5;
+      const time = Math.min(Math.max(p.delay ?? 0.02, 0.005), 0.06);
+      const delay = oac.createDelay(0.1); delay.delayTime.value = time;
+      const dryGain = oac.createGain(); dryGain.gain.value = 1;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet;
+      const merge = oac.createGain();
+      delay.connect(wetGain); wetGain.connect(merge); dryGain.connect(merge);
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(delay);
+      return [entry, merge];
+    }
+    case "pitch": {
+      // OfflineAudioContext has no real-time pitch shifter. A true bake would
+      // resample the whole buffer; the live Tone.PitchShift still applies during
+      // playback. For export we pass through transparently rather than alter pitch
+      // incorrectly. (Documented limitation.)
+      if ((p.pitch ?? 0) !== 0) console.warn("[export] pitch shift not baked offline — preview only");
+      const g = oac.createGain();
+      return [g, g];
+    }
+    case "echo": {
+      // Tempo-synced echo baked as a feedback delay + lowpass on the tail.
+      const wet = p.wet ?? 0.3;
+      const time = Math.min(p.time ?? 0.375, 1.2);
+      const fb = Math.min(p.feedback ?? 0.45, 0.92);
+      const delay = oac.createDelay(2.0); delay.delayTime.value = time;
+      const fbGain = oac.createGain(); fbGain.gain.value = fb;
+      const lp = oac.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = p.tone ?? 4000;
+      const dryGain = oac.createGain(); dryGain.gain.value = 1;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet;
+      const merge = oac.createGain();
+      // delay -> lp -> back to delay (feedback) and out to wet
+      delay.connect(lp); lp.connect(fbGain); fbGain.connect(delay);
+      lp.connect(wetGain); wetGain.connect(merge); dryGain.connect(merge);
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(delay);
+      return [entry, merge];
+    }
+    case "paramEq": {
+      const hpf = oac.createBiquadFilter(); hpf.type = "highpass"; hpf.frequency.value = p.hpf ?? 80; hpf.Q.value = 0.7;
+      const low = oac.createBiquadFilter(); low.type = "peaking"; low.frequency.value = p.lowFreq ?? 250; low.Q.value = 1; low.gain.value = p.lowGain ?? 0;
+      const mid = oac.createBiquadFilter(); mid.type = "peaking"; mid.frequency.value = p.midFreq ?? 1500; mid.Q.value = 1; mid.gain.value = p.midGain ?? 0;
+      const hi  = oac.createBiquadFilter(); hi.type = "highshelf"; hi.frequency.value = p.hiFreq ?? 8000; hi.gain.value = p.hiGain ?? 0;
+      hpf.connect(low); low.connect(mid); mid.connect(hi);
+      return [hpf, hi];
+    }
+    case "gate": {
+      // Web Audio has no native gate. Approximate as a soft expander-ish pass:
+      // a compressor with a low threshold + high ratio doesn't gate, so we just
+      // pass through (the live Tone.Gate applies during playback/monitoring).
+      // Honest pass-through avoids altering the bounce incorrectly.
+      const g = oac.createGain();
+      return [g, g];
+    }
+    case "saturation": {
+      // Tube-style soft saturation via a tanh waveshaper.
+      const drive = p.drive ?? 0.25;
+      const wet = p.wet ?? 0.7;
+      const ws = oac.createWaveShaper();
+      const n = 1024, curve = new Float32Array(n);
+      const k = 1 + drive * 6;
+      for (let i = 0; i < n; i++) {
+        const x = (i * 2) / n - 1;
+        curve[i] = Math.tanh(k * x) / Math.tanh(k);
+      }
+      ws.curve = curve; ws.oversample = "4x";
+      const dryGain = oac.createGain(); dryGain.gain.value = 1 - wet;
+      const wetGain = oac.createGain(); wetGain.gain.value = wet;
+      const merge = oac.createGain();
+      ws.connect(wetGain); wetGain.connect(merge); dryGain.connect(merge);
+      const entry = oac.createGain();
+      entry.connect(dryGain); entry.connect(ws);
+      return [entry, merge];
+    }
+    case "widener": {
+      // Mid/side widening is complex offline; bake as a subtle Haas delay on one
+      // side for perceived width without phase wreckage on mono playback.
+      const width = p.width ?? 0.6;
+      const splitter = oac.createChannelSplitter(2);
+      const merger = oac.createChannelMerger(2);
+      const delayR = oac.createDelay(0.05); delayR.delayTime.value = 0.008 * width;
+      const entry = oac.createGain();
+      entry.connect(splitter);
+      splitter.connect(merger, 0, 0);        // L straight
+      splitter.connect(delayR, 1);           // R delayed
+      delayR.connect(merger, 0, 1);
+      return [entry, merger];
+    }
     default:
       return [];
   }
@@ -173,10 +274,12 @@ export async function renderMixdown(tracks: DawTrack[], masterVolume = 1): Promi
   await decodeCtx.close();
 
   const sr = 44100;
-  const maxDur = Math.max(0.1, ...tracks.map((t, i) => {
-    const b = buffers[i]; const clip = t.clips[0];
-    const start = clip?.startSec ?? 0;
-    return start + (b ? b.duration : 0);
+  // Span = furthest clip end across all tracks (handles splits & moved clips).
+  const maxDur = Math.max(0.1, ...tracks.flatMap((t, i) => {
+    const b = buffers[i];
+    if (!b) return [0];
+    const clips = t.clips.length ? t.clips : [{ startSec: 0, durationSec: b.duration } as any];
+    return clips.map(c => (c.startSec ?? 0) + (c.durationSec || b.duration));
   }));
   const OAC: typeof OfflineAudioContext = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
   const oac = new OAC(2, Math.ceil(maxDur * sr), sr);
@@ -192,13 +295,11 @@ export async function renderMixdown(tracks: DawTrack[], masterVolume = 1): Promi
     const audible = anySolo ? track.soloed : !track.muted;
     if (!audible) return;
 
-    const src = oac.createBufferSource(); src.buffer = buf;
     const gain = oac.createGain(); gain.gain.value = track.volume;
     const panner = oac.createStereoPanner(); panner.pan.value = track.pan;
+    gain.connect(panner);
 
-    src.connect(gain); gain.connect(panner);
-
-    // bake enabled effects into the offline graph
+    // bake enabled effects into the offline graph (shared by all the track's clips)
     let tail: AudioNode = panner;
     for (const eff of track.effects ?? []) {
       if (!eff.enabled) continue;
@@ -207,9 +308,26 @@ export async function renderMixdown(tracks: DawTrack[], masterVolume = 1): Promi
         if (input && output) { tail.connect(input); tail = output; }
       } catch { /* skip bad effect */ }
     }
-
     tail.connect(masterGain);
-    src.start(track.clips[0]?.startSec ?? 0);
+
+    // One source per clip: start at the clip's arrangement time, read offsetSec
+    // for durationSec, and apply the clip's fade in/out + gain on its own gain node.
+    const clips = track.clips.length ? track.clips : [{ startSec: 0, offsetSec: 0, durationSec: buf.duration } as any];
+    for (const clip of clips) {
+      const src = oac.createBufferSource(); src.buffer = buf;
+      const clipGain = oac.createGain();
+      const base = clip.gain ?? 1;
+      const start = clip.startSec ?? 0;
+      const dur = clip.durationSec || buf.duration;
+      const fi = clip.fadeInSec ?? 0;
+      const fo = clip.fadeOutSec ?? 0;
+      const cg = clipGain.gain;
+      if (fi > 0) { cg.setValueAtTime(0, start); cg.linearRampToValueAtTime(base, start + fi); }
+      else { cg.setValueAtTime(base, start); }
+      if (fo > 0) { cg.setValueAtTime(base, Math.max(start + fi, start + dur - fo)); cg.linearRampToValueAtTime(0, start + dur); }
+      src.connect(clipGain); clipGain.connect(gain);
+      src.start(start, Math.max(0, clip.offsetSec ?? 0), dur);
+    }
   });
 
   return await oac.startRendering();

@@ -20,8 +20,12 @@ interface Props {
   selectMode: boolean;
   automationLane: "volume" | "pan" | null;
   onSeek: (sec: number) => void;
+  // ruler-drag scrub: onScrub fires continuously while dragging, onScrubEnd on release
+  onScrub: (sec: number) => void;
+  onScrubEnd: (sec: number) => void;
   onAutomationEdit: (trackId: string, sec: number, value: number) => void;
   onScrollLeft: (v: number) => void;
+  onScrollTop: (v: number) => void;
   onZoom: (z: number) => void;
   onGestureStart: (g: Gesture) => void;
   onGestureMove: (clientX: number, clientY: number) => void;
@@ -31,13 +35,17 @@ interface Props {
   onLoopRange: (start: number, end: number) => void;
   onMarkerClick: (m: Marker) => void;
   onSelectRegion: (sel: TimeSelection | null) => void;
+  // right-click inside the active selection → open the region menu at the cursor
+  onRegionContextMenu: (clientX: number, clientY: number) => void;
+  // right-click on a track lane (no selection) → open the track menu for that track
+  onTrackContextMenu: (clientX: number, clientY: number, trackId: string) => void;
 }
 
 export default function ArrangementCanvas({
   tracks, transport, view, positionSec, gesture, markers, selection, selectMode,
   automationLane, onAutomationEdit,
-  onSeek, onScrollLeft, onZoom, onGestureStart, onGestureMove, onGestureEnd,
-  onClipSplit, onClipGain, onLoopRange, onMarkerClick, onSelectRegion,
+  onSeek, onScrub, onScrubEnd, onScrollLeft, onScrollTop, onZoom, onGestureStart, onGestureMove, onGestureEnd,
+  onClipSplit, onClipGain, onLoopRange, onMarkerClick, onSelectRegion, onRegionContextMenu, onTrackContextMenu,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -49,6 +57,9 @@ export default function ArrangementCanvas({
   const loopDragRef = useRef<{ start: number; end: number } | null>(null);
   // in-progress marquee selection
   const marqueeRef = useRef<TimeSelection | null>(null);
+  // in-progress playhead scrub (plain drag on the ruler) + last scrubbed time
+  const scrubRef = useRef(false);
+  const lastScrubSecRef = useRef(0);
 
   // ── render ──────────────────────────────────────────────────────────────────
   const render = useCallback(() => {
@@ -57,8 +68,8 @@ export default function ArrangementCanvas({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const { tracks, transport, view, positionSec, markers } = stateRef.current;
-    const { zoom, bpm } = transport;
-    const { scrollLeft, trackHeight } = view;
+    const { zoom } = transport;
+    const { scrollLeft, scrollTop, trackHeight } = view;
     // Use CSS pixel dimensions (the DPR transform is already applied to ctx)
     const W = parseFloat(canvas.style.width) || canvas.width;
     const H = parseFloat(canvas.style.height) || canvas.height;
@@ -74,7 +85,7 @@ export default function ArrangementCanvas({
 
     // alternating track rows + bottom separators for depth
     tracks.forEach((_, i) => {
-      const y = RULER_H + i * trackHeight;
+      const y = RULER_H + i * trackHeight - scrollTop;
       ctx.fillStyle = i % 2 === 0 ? C.rowA : C.rowB;
       ctx.fillRect(0, y, W, trackHeight);
       ctx.fillStyle = "rgba(0,0,0,0.25)";
@@ -98,13 +109,12 @@ export default function ArrangementCanvas({
       ctx.fillRect(lx, MARKER_H, lw, 3);
     }
 
-    // grid + ruler
-    const secPerBeat = 60 / bpm;
-    const intervals = [
-      secPerBeat / 4, secPerBeat / 2, secPerBeat,
-      secPerBeat * 2, secPerBeat * 4, 1, 2, 5, 10, 30
-    ];
-    const interval = intervals.find(iv => iv * zoom > 48) ?? 30;
+    // grid + ruler — TIME based (seconds), so the ruler, playhead, and the top
+    // clock always agree. (A BPM-derived bar grid drifts from real time whenever
+    // the auto-detected BPM is wrong — common on ambient/free-tempo tracks — which
+    // made the ruler look compressed and disagree with the seconds clock.)
+    const intervals = [0.25, 0.5, 1, 2, 5, 10, 15, 30, 60];
+    const interval = intervals.find(iv => iv * zoom > 60) ?? 60;
     const startSec = scrollLeft / zoom;
     const endSec = (scrollLeft + W) / zoom;
     let t = Math.floor(startSec / interval) * interval;
@@ -120,30 +130,30 @@ export default function ArrangementCanvas({
 
     while (t <= endSec + interval) {
       const x = Math.round(t * zoom - scrollLeft);
-      const beatNum = Math.round(t / secPerBeat);
-      const isBar = beatNum % 4 === 0;
-      const isBeat = beatNum % 1 === 0;
+      // Major line every 5s (or every interval if interval >= 5), minor otherwise.
+      const major = interval >= 5 ? true : (Math.round(t / interval) % 5 === 0);
 
-      ctx.strokeStyle = isBar ? "rgba(255,255,255,0.09)" : "rgba(255,255,255,0.035)";
+      ctx.strokeStyle = major ? "rgba(255,255,255,0.09)" : "rgba(255,255,255,0.035)";
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(x + 0.5, RULER_H);
       ctx.lineTo(x + 0.5, H);
       ctx.stroke();
 
-      const tickH = isBar ? 12 : isBeat ? 7 : 4;
-      ctx.strokeStyle = isBar ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.18)";
+      const tickH = major ? 12 : 6;
+      ctx.strokeStyle = major ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.18)";
       ctx.beginPath();
       ctx.moveTo(x + 0.5, RULER_H);
       ctx.lineTo(x + 0.5, RULER_H - tickH);
       ctx.stroke();
 
-      if (isBar || (zoom > 60 && isBeat)) {
-        const bars = Math.floor(beatNum / 4) + 1;
-        const beats = (beatNum % 4) + 1;
-        const label = isBar ? `${bars}` : `${bars}.${beats}`;
-        ctx.fillStyle = isBar ? C.text2 : C.text3;
-        ctx.font = `${isBar ? 700 : 500} 10px 'SF Mono', monospace`;
+      if (major) {
+        // mm:ss when over a minute, else whole seconds
+        const m = Math.floor(t / 60);
+        const s = Math.round(t % 60);
+        const label = t >= 60 ? `${m}:${String(s).padStart(2, "0")}` : `${Math.round(t)}s`;
+        ctx.fillStyle = C.text2;
+        ctx.font = "700 10px 'SF Mono', monospace";
         ctx.fillText(label, x + 4, 12);
       }
       t += interval;
@@ -151,7 +161,7 @@ export default function ArrangementCanvas({
 
     // clips + waveforms + fades
     tracks.forEach((track, i) => {
-      const ry = RULER_H + i * trackHeight;
+      const ry = RULER_H + i * trackHeight - scrollTop;
       track.clips.forEach(clip => {
         const cx = clip.startSec * zoom - scrollLeft;
         const cw = clip.durationSec * zoom;
@@ -311,7 +321,7 @@ export default function ArrangementCanvas({
       if (ti >= 0) {
         const sx = sel.startSec * zoom - scrollLeft;
         const sw = (sel.endSec - sel.startSec) * zoom;
-        const sy = RULER_H + ti * trackHeight;
+        const sy = RULER_H + ti * trackHeight - scrollTop;
         ctx.fillStyle = withAlpha(C.accent, 0.18);
         ctx.fillRect(sx, sy, sw, trackHeight);
         ctx.strokeStyle = C.accent;
@@ -331,7 +341,7 @@ export default function ArrangementCanvas({
     if (lane) {
       tracks.forEach((track, i) => {
         const pts = track.automation?.[lane];
-        const y0 = RULER_H + i * trackHeight;
+        const y0 = RULER_H + i * trackHeight - scrollTop;
         const h = trackHeight;
         // value→y: volume 0..1 (1 at top), pan -1..1 (top = +1)
         const valToY = (v: number) => lane === "volume"
@@ -429,46 +439,69 @@ export default function ArrangementCanvas({
     return () => ro.disconnect();
   }, [render]);
 
-  // wheel: ctrl = zoom, shift+over clip = gain, else horizontal scroll the timeline
-  const onWheel = useCallback((e: React.WheelEvent) => {
-    const { tracks, transport, view } = stateRef.current;
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      const delta = -e.deltaY * 0.003;
-      onZoom(Math.max(30, Math.min(600, transport.zoom * (1 + delta))));
-      return;
-    }
-    // gain adjust if hovering a clip and holding shift
-    if (e.shiftKey) {
-      const oy = e.nativeEvent.offsetY;
-      if (oy >= RULER_H) {
-        const ti = Math.floor((oy - RULER_H) / view.trackHeight);
-        const track = tracks[ti];
-        if (track) {
-          const sec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
-          const clip = track.clips.find(c => sec >= c.startSec && sec <= c.startSec + c.durationSec);
-          if (clip) { e.preventDefault(); onClipGain(track.id, clip.id, e.deltaY < 0 ? 0.05 : -0.05); return; }
+  // wheel: must be a non-passive native listener so preventDefault() actually works.
+  // React 17+ attaches synthetic onWheel as passive, silently ignoring preventDefault.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handler = (e: WheelEvent) => {
+      const { tracks, transport, view } = stateRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const delta = -e.deltaY * 0.003;
+        onZoom(Math.max(30, Math.min(600, transport.zoom * (1 + delta))));
+        return;
+      }
+      if (e.shiftKey) {
+        const oy = e.offsetY;
+        if (oy >= RULER_H) {
+          const ti = Math.floor((oy - RULER_H + (view.scrollTop ?? 0)) / view.trackHeight);
+          const track = tracks[ti];
+          if (track) {
+            const sec = (e.offsetX + view.scrollLeft) / transport.zoom;
+            const clip = track.clips.find(c => sec >= c.startSec && sec <= c.startSec + c.durationSec);
+            if (clip) { e.preventDefault(); onClipGain(track.id, clip.id, e.deltaY < 0 ? 0.05 : -0.05); return; }
+          }
         }
       }
-    }
-    // otherwise: pan the timeline. Trackpads give deltaX; mice give deltaY — use
-    // whichever is larger so a vertical wheel also scrolls the (horizontal) song.
-    const container = containerRef.current;
-    const vw = container?.getBoundingClientRect().width ?? 0;
-    const total = Math.max(60, ...stateRef.current.tracks.flatMap(t => t.clips.map(c => c.startSec + c.durationSec)));
-    const cW = total * transport.zoom + 200;
-    const maxS = Math.max(0, cW - vw);
-    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-    if (maxS > 0 && d !== 0) {
-      e.preventDefault();
-      onScrollLeft(Math.max(0, Math.min(maxS, view.scrollLeft + d)));
-    }
-  }, [onZoom, onClipGain, onScrollLeft]);
+      const container = containerRef.current;
+      const vw = container?.getBoundingClientRect().width ?? 0;
+      const vh = container?.getBoundingClientRect().height ?? 0;
+      const total = Math.max(60, ...stateRef.current.tracks.flatMap(t => t.clips.map(c => c.startSec + c.durationSec)));
+      const cW = total * transport.zoom + 200;
+      const maxScrollLeft = Math.max(0, cW - vw);
+      const maxScrollTop  = Math.max(0, tracks.length * view.trackHeight - (vh - RULER_H));
+
+      // Pure horizontal scroll (trackpad two-finger horizontal or Shift+wheel)
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        if (maxScrollLeft > 0) {
+          e.preventDefault();
+          onScrollLeft(Math.max(0, Math.min(maxScrollLeft, view.scrollLeft + e.deltaX)));
+        }
+        return;
+      }
+
+      // Vertical scroll — scroll tracks up/down
+      if (maxScrollTop > 0 && Math.abs(e.deltaY) > 0) {
+        e.preventDefault();
+        onScrollTop(Math.max(0, Math.min(maxScrollTop, (view.scrollTop ?? 0) + e.deltaY)));
+        return;
+      }
+
+      // Fallback: horizontal via vertical scroll when no vertical room
+      if (maxScrollLeft > 0 && e.deltaY !== 0) {
+        e.preventDefault();
+        onScrollLeft(Math.max(0, Math.min(maxScrollLeft, view.scrollLeft + e.deltaY)));
+      }
+    };
+    canvas.addEventListener("wheel", handler, { passive: false });
+    return () => canvas.removeEventListener("wheel", handler);
+  }, [onZoom, onClipGain, onScrollLeft, onScrollTop]);
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const { tracks, transport, view, positionSec } = stateRef.current;
     const { zoom, bpm, snap } = transport;
-    const { scrollLeft, trackHeight } = view;
+    const { scrollLeft, scrollTop, trackHeight } = view;
     const ox = e.nativeEvent.offsetX;
     const oy = e.nativeEvent.offsetY;
     const rawSec = (ox + scrollLeft) / zoom;
@@ -494,11 +527,38 @@ export default function ArrangementCanvas({
         });
         return;
       }
-      onSeek(snapSec(rawSec, snap, bpm));
+      // Plain click/drag on the ruler scrubs the playhead. We drive the drag with
+      // window-level listeners (not the canvas onMouseMove) so it keeps tracking
+      // even when the cursor moves fast or leaves the thin 16px ruler strip — the
+      // same approach the scrollbar uses. This is why the earlier onMouseMove-based
+      // version felt like it "didn't work": those events stop firing off-element.
+      const canvas = canvasRef.current;
+      const rect = canvas?.getBoundingClientRect();
+      const toSec = (clientX: number) => {
+        const { transport, view } = stateRef.current;
+        const ox = clientX - (rect?.left ?? 0);
+        const raw = (ox + view.scrollLeft) / transport.zoom;
+        return snapSec(Math.max(0, raw), transport.snap, transport.bpm);
+      };
+      scrubRef.current = true;
+      lastScrubSecRef.current = snapSec(rawSec, snap, bpm);
+      onScrub(lastScrubSecRef.current);
+      const move = (ev: MouseEvent) => {
+        lastScrubSecRef.current = toSec(ev.clientX);
+        onScrub(lastScrubSecRef.current);
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        scrubRef.current = false;
+        onScrubEnd(lastScrubSecRef.current);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
       return;
     }
 
-    const ti = Math.floor((oy - RULER_H) / trackHeight);
+    const ti = Math.floor((oy - RULER_H + scrollTop) / trackHeight);
     const track = tracks[ti];
     if (!track) { onSeek(snapSec(rawSec, snap, bpm)); return; }
 
@@ -514,8 +574,12 @@ export default function ArrangementCanvas({
       return;
     }
 
-    // right-click = split at playhead
+    // right-click = split at playhead — but if the click lands inside the active
+    // highlighted region, defer to the context menu (handled in onContextMenu)
+    // and don't split.
     if (e.button === 2) {
+      const sel = stateRef.current.selection;
+      if (sel && track.id === sel.trackId && rawSec >= sel.startSec && rawSec <= sel.endSec) return;
       const clip = track.clips.find(c => positionSec > c.startSec && positionSec < c.startSec + c.durationSec);
       if (clip) onClipSplit(track.id, clip.id);
       return;
@@ -560,9 +624,11 @@ export default function ArrangementCanvas({
     else g.type = "dragging";
 
     onGestureStart(g);
-  }, [onSeek, onGestureStart, onClipSplit, onMarkerClick, onSelectRegion, selectMode, onAutomationEdit]);
+  }, [onSeek, onScrub, onScrubEnd, onGestureStart, onClipSplit, onMarkerClick, onSelectRegion, selectMode, onAutomationEdit]);
 
   const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Ruler scrub is driven by window listeners attached in onMouseDown, not here.
+    if (scrubRef.current) return;
     if (gesture?.type === "loop-range") {
       const { transport, view } = stateRef.current;
       const rawSec = (e.nativeEvent.offsetX + view.scrollLeft) / transport.zoom;
@@ -595,6 +661,7 @@ export default function ArrangementCanvas({
   }, [onGestureMove, gesture, render]);
 
   const onMouseUp = useCallback(() => {
+    // Ruler scrub end is handled by the window "up" listener from onMouseDown.
     if (gesture?.type === "loop-range" && loopDragRef.current) {
       const { start, end } = loopDragRef.current;
       if (end - start > 0.05) onLoopRange(start, end);
@@ -606,7 +673,29 @@ export default function ArrangementCanvas({
       onSelectRegion(m && m.endSec - m.startSec > 0.02 ? m : null);
     }
     onGestureEnd();
-  }, [onGestureEnd, gesture, onLoopRange, onSelectRegion]);
+  }, [onGestureEnd, gesture, onLoopRange, onSelectRegion, onScrubEnd]);
+
+  // Right-click: if it lands inside the active highlighted region, open the
+  // region menu at the cursor. Otherwise let the default (split-at-playhead,
+  // handled in onMouseDown) proceed by just suppressing the browser menu.
+  const onContextMenu = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const { transport, view, selection: sel } = stateRef.current;
+    const ox = e.nativeEvent.offsetX;
+    const oy = e.nativeEvent.offsetY;
+    if (oy < RULER_H) return;   // ruler/marker band — no menu
+    const sec = (ox + view.scrollLeft) / transport.zoom;
+    const ti = Math.floor((oy - RULER_H + (view.scrollTop ?? 0)) / view.trackHeight);
+    const track = stateRef.current.tracks[ti];
+
+    // 1) right-click inside the active highlighted region → region ops menu
+    if (sel && track && track.id === sel.trackId && sec >= sel.startSec && sec <= sel.endSec) {
+      onRegionContextMenu(e.clientX, e.clientY);
+      return;
+    }
+    // 2) right-click on a track lane (no selection needed) → track menu
+    if (track) onTrackContextMenu(e.clientX, e.clientY, track.id);
+  }, [onRegionContextMenu, onTrackContextMenu]);
 
   const totalDur = Math.max(60, ...tracks.flatMap(t => t.clips.map(c => c.startSec + c.durationSec)));
   const contentW = totalDur * transport.zoom + 200;
@@ -638,8 +727,7 @@ export default function ArrangementCanvas({
         onMouseMove={onMouseMove}
         onMouseUp={onMouseUp}
         onMouseLeave={onMouseUp}
-        onWheel={onWheel}
-        onContextMenu={e => e.preventDefault()}
+        onContextMenu={onContextMenu}
       />
       {/* custom horizontal scrollbar — only shown when content exceeds the viewport */}
       {maxScroll > 0 && (
